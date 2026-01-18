@@ -18,9 +18,9 @@ make mps       # Apple Silicon (fastest)
 # or: make blas    # Intel Mac / Linux with OpenBLAS
 # or: make generic # Pure C, no dependencies
 
-# Download the model (~16GB)
+# Download the model (~16GB with text encoder)
 pip install huggingface_hub
-python download_model.py
+python download_model.py --include-text-encoder
 
 # Generate an image
 ./flux -d flux-klein-model -p "A woman wearing sunglasses" -o output.png
@@ -152,10 +152,10 @@ The model weights are downloaded from HuggingFace:
 
 ```bash
 pip install huggingface_hub
-python download_model.py
+python download_model.py --include-text-encoder
 ```
 
-This downloads approximately 16GB to `./flux-klein-model`:
+This downloads approximately 16GB to `./flux-klein-model` (use `--include-text-encoder` to get the text encoder):
 - VAE (~300MB)
 - Transformer (~4GB)
 - Qwen3-4B Text Encoder (~8GB)

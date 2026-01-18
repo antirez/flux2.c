@@ -3,7 +3,7 @@
 Download FLUX.2-klein-4B model files from HuggingFace.
 
 Usage:
-    python download_model.py [--output-dir DIR]
+    python download_model.py [--output-dir DIR] [--include-text-encoder]
 
 Requirements:
     pip install huggingface_hub
