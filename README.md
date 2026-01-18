@@ -51,11 +51,17 @@ Options:
 
 All components are implemented in pure C with BLAS acceleration.
 
+## Memory Management
+
+The text encoder (~8GB) is automatically released after encoding, reducing peak memory during diffusion to ~8GB. If you generate multiple images with different prompts, the encoder reloads automatically.
+
+Library users can control this via `flux_release_text_encoder(ctx)`.
+
 ## Current Limitations
 
-**Maximum resolution**: 1024x1024 pixels. Higher resolutions require prohibitive memory for the attention mechanisms (VAE attention alone needs ~17GB for the scores matrix at 2048x2048).
+**Maximum resolution**: 1024x1024 pixels. Higher resolutions require prohibitive memory for the attention mechanisms.
 
-**Memory requirements**: The full model requires ~16GB RAM (transformer ~4GB, VAE ~300MB, text encoder ~8GB).
+**Memory requirements**: ~8GB RAM during diffusion (transformer ~4GB, VAE ~300MB). Text encoding temporarily requires ~8GB additional.
 
 ## License
 
