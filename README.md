@@ -1,6 +1,14 @@
 # FLUX.2-klein-4B Pure C Implementation
 
-Generate images from text prompts using FLUX.2-klein-4B, implemented entirely in C with zero external dependencies beyond the C standard library. BLAS acceleration is optional but recommended.
+This program generates images from text prompts using the FLUX.2-klein-4B model from Black Forest Labs. It can be used as a library as well, and is implemented entirely in C, with zero external dependencies beyond the C standard library. MPS and BLAS acceleration are optional but recommended.
+
+## An experiment in AI code generation and open source software
+
+I (the human here, Salvatore) wanted to test code generation with a more ambitious task, over the weekend. This is the result. It is my first open source project where I wrote zero lines of code. I believe that inference systems not using the Python stack (which I do not appreciate) are a way to free open models usage and make AI more accessible. There is already a project [doing the inference of diffusion models in C / C++](https://github.com/leejet/stable-diffusion.cpp) that supports multiple models, and is based on GGML. I wanted to see if, with the assistance of modern AI, I could reproduce this work in a more concise way, from scratch, in a weekend. Looks like it is possible.
+
+This code base was written with Claude Code, using the Claude Max plan, the small one of ~80 euros per month. I almost reached the limits but this plan was definitely sufficient for such a large task, which was surprising. In order to simplify the usage of this software, no quantization is used, nor do you need to convert the model. It runs directly with the safetensors model as input, using floats.
+
+Even if the code was generated using AI, my help in steering towards the right design, implementation choices, and correctness has been vital during the development. I learned quite a few things about working with non trivial projects and AI.
 
 ## Quick Start
 
