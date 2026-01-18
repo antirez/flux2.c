@@ -5,11 +5,11 @@
  * FLUX.2 klein 4B rectified flow transformer model.
  *
  * Usage:
- *   flux_ctx *ctx = flux_load("flux-klein-4b.bin");
+ *   flux_ctx *ctx = flux_load_dir("path/to/model");
  *   if (!ctx) { handle error }
  *
- *   flux_image *img = flux_generate(ctx, "a cat sitting on a rainbow",
- *                                   1024, 1024, 4, 1.0f, -1);
+ *   flux_params params = FLUX_PARAMS_DEFAULT;
+ *   flux_image *img = flux_generate(ctx, "a cat sitting on a rainbow", &params);
  *   flux_image_save(img, "output.png");
  *   flux_image_free(img);
  *   flux_free(ctx);
@@ -92,12 +92,6 @@ typedef struct {
 /* ========================================================================
  * Core API
  * ======================================================================== */
-
-/*
- * Load model from binary file.
- * Returns NULL on error.
- */
-flux_ctx *flux_load(const char *model_path);
 
 /*
  * Load model from HuggingFace-style directory containing safetensors files.

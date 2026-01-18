@@ -95,8 +95,7 @@ static void cli_finish_progress(void) {
 static void print_usage(const char *prog) {
     fprintf(stderr, "FLUX.2 klein 4B - Pure C Image Generation\n\n");
     fprintf(stderr, "Usage: %s [options]\n\n", prog);
-    fprintf(stderr, "Required (one of -m or -d):\n");
-    fprintf(stderr, "  -m, --model PATH      Path to model file (.bin)\n");
+    fprintf(stderr, "Required:\n");
     fprintf(stderr, "  -d, --dir PATH        Path to model directory (safetensors)\n");
     fprintf(stderr, "  -p, --prompt TEXT     Text prompt for generation\n");
     fprintf(stderr, "  -o, --output PATH     Output image path (.png, .ppm)\n\n");
@@ -114,8 +113,8 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  -v, --verbose         Enable verbose output\n");
     fprintf(stderr, "  -h, --help            Show this help\n\n");
     fprintf(stderr, "Examples:\n");
-    fprintf(stderr, "  %s -m flux.bin -p \"a cat on a rainbow\" -o cat.png\n", prog);
-    fprintf(stderr, "  %s -m flux.bin -p \"oil painting style\" -i photo.png -o art.png -t 0.7\n", prog);
+    fprintf(stderr, "  %s -d model/ -p \"a cat on a rainbow\" -o cat.png\n", prog);
+    fprintf(stderr, "  %s -d model/ -p \"oil painting style\" -i photo.png -o art.png -t 0.7\n", prog);
 }
 
 static void print_version(void) {
@@ -127,7 +126,6 @@ static void print_version(void) {
 int main(int argc, char *argv[]) {
     /* Command line options */
     static struct option long_options[] = {
-        {"model",    required_argument, 0, 'm'},
         {"dir",      required_argument, 0, 'd'},
         {"prompt",   required_argument, 0, 'p'},
         {"output",   required_argument, 0, 'o'},
@@ -147,7 +145,6 @@ int main(int argc, char *argv[]) {
     };
 
     /* Parse arguments */
-    char *model_path = NULL;
     char *model_dir = NULL;
     char *prompt = NULL;
     char *output_path = NULL;
@@ -167,12 +164,9 @@ int main(int argc, char *argv[]) {
     int verbose = 0;
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "m:d:p:o:W:H:s:g:S:i:t:e:n:vhV",
+    while ((opt = getopt_long(argc, argv, "d:p:o:W:H:s:g:S:i:t:e:n:vhV",
                               long_options, NULL)) != -1) {
         switch (opt) {
-            case 'm':
-                model_path = optarg;
-                break;
             case 'd':
                 model_dir = optarg;
                 break;
@@ -225,13 +219,8 @@ int main(int argc, char *argv[]) {
     }
 
     /* Validate required arguments */
-    if (!model_path && !model_dir) {
-        fprintf(stderr, "Error: Model path (-m) or directory (-d) is required\n\n");
-        print_usage(argv[0]);
-        return 1;
-    }
-    if (model_path && model_dir) {
-        fprintf(stderr, "Error: Specify either -m or -d, not both\n\n");
+    if (!model_dir) {
+        fprintf(stderr, "Error: Model directory (-d) is required\n\n");
         print_usage(argv[0]);
         return 1;
     }
@@ -267,7 +256,7 @@ int main(int argc, char *argv[]) {
     if (verbose) {
         fprintf(stderr, "FLUX.2 klein 4B Image Generator\n");
         fprintf(stderr, "================================\n");
-        fprintf(stderr, "Model: %s\n", model_path ? model_path : model_dir);
+        fprintf(stderr, "Model: %s\n", model_dir);
         fprintf(stderr, "Prompt: %s\n", prompt);
         fprintf(stderr, "Output: %s\n", output_path);
         fprintf(stderr, "Size: %dx%d\n", params.width, params.height);
@@ -292,12 +281,7 @@ int main(int argc, char *argv[]) {
 
     clock_t start = clock();
 
-    flux_ctx *ctx = NULL;
-    if (model_path) {
-        ctx = flux_load(model_path);
-    } else {
-        ctx = flux_load_dir(model_dir);
-    }
+    flux_ctx *ctx = flux_load_dir(model_dir);
     if (!ctx) {
         fprintf(stderr, "Error: Failed to load model: %s\n", flux_get_error());
         return 1;
