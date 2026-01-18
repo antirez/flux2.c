@@ -30,6 +30,10 @@
 #include <getopt.h>
 #include <time.h>
 
+#ifdef USE_METAL
+#include "flux_metal.h"
+#endif
+
 /* ========================================================================
  * CLI Progress Callbacks
  * ======================================================================== */
@@ -124,6 +128,11 @@ static void print_version(void) {
 }
 
 int main(int argc, char *argv[]) {
+#ifdef USE_METAL
+    /* Initialize Metal GPU acceleration */
+    flux_metal_init();
+#endif
+
     /* Command line options */
     static struct option long_options[] = {
         {"dir",      required_argument, 0, 'd'},
@@ -467,6 +476,10 @@ int main(int argc, char *argv[]) {
     /* Cleanup */
     flux_image_free(output);
     flux_free(ctx);
+
+#ifdef USE_METAL
+    flux_metal_cleanup();
+#endif
 
     return 0;
 }

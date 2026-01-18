@@ -2,10 +2,17 @@
 
 A dependency-free C implementation of the FLUX.2-klein-4B image generation model. Runs inference using only the C standard library and BLAS (Apple Accelerate on macOS, OpenBLAS on Linux).
 
+On Apple Silicon Macs, Metal GPU acceleration is automatically enabled for faster matrix operations.
+
 ## Building
 
 ```bash
 make
+```
+
+To check build configuration:
+```bash
+make info
 ```
 
 ## Downloading the Model

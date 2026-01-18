@@ -5,19 +5,36 @@ CC = gcc
 CFLAGS = -Wall -Wextra -O3 -march=native -ffast-math
 LDFLAGS = -lm
 
-# Platform-specific BLAS support
+# Platform detection
 UNAME_S := $(shell uname -s)
+UNAME_M := $(shell uname -m)
+
+# macOS configuration
 ifeq ($(UNAME_S),Darwin)
-    # macOS: Use Accelerate framework for BLAS
     CFLAGS += -DACCELERATE_NEW_LAPACK
     LDFLAGS += -framework Accelerate
+
+    # Apple Silicon: Enable Metal GPU acceleration
+    ifeq ($(UNAME_M),arm64)
+        USE_METAL = 1
+    endif
 endif
+
+# Linux configuration
 ifeq ($(UNAME_S),Linux)
-    # Linux: Use OpenBLAS if available (compile with USE_OPENBLAS=1)
     ifdef USE_OPENBLAS
         CFLAGS += -DUSE_OPENBLAS
         LDFLAGS += -lopenblas
     endif
+endif
+
+# Metal GPU acceleration (Apple Silicon only)
+ifdef USE_METAL
+    CFLAGS += -DUSE_METAL
+    OBJCFLAGS = $(CFLAGS) -fobjc-arc
+    LDFLAGS += -framework Metal -framework MetalPerformanceShaders -framework Foundation
+    METAL_SRC = flux_metal.m
+    METAL_OBJ = flux_metal.o
 endif
 
 # Debug build
@@ -34,20 +51,28 @@ TARGET = flux
 # Library
 LIB = libflux.a
 
-.PHONY: all clean debug lib install
+.PHONY: all clean debug lib install info
 
 all: $(TARGET)
 
-$(TARGET): $(OBJS) $(MAIN:.c=.o)
+# Main target
+$(TARGET): $(OBJS) $(METAL_OBJ) $(MAIN:.c=.o)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 lib: $(LIB)
 
-$(LIB): $(OBJS)
+$(LIB): $(OBJS) $(METAL_OBJ)
 	ar rcs $@ $^
 
+# C source compilation
 %.o: %.c flux.h flux_kernels.h
 	$(CC) $(CFLAGS) -c -o $@ $<
+
+# Objective-C compilation (Metal)
+ifdef USE_METAL
+flux_metal.o: flux_metal.m flux_metal.h
+	$(CC) $(OBJCFLAGS) -c -o $@ $<
+endif
 
 debug: CFLAGS = $(DEBUG_CFLAGS)
 debug: LDFLAGS += -fsanitize=address
@@ -64,7 +89,7 @@ install: $(TARGET) $(LIB)
 	install -m 644 flux_kernels.h /usr/local/include/
 
 clean:
-	rm -f $(OBJS) $(MAIN:.c=.o) $(TARGET) $(LIB)
+	rm -f $(OBJS) $(METAL_OBJ) $(MAIN:.c=.o) $(TARGET) $(LIB)
 
 # Dependencies
 flux.o: flux.c flux.h flux_kernels.h flux_safetensors.h
@@ -77,6 +102,19 @@ flux_image.o: flux_image.c flux.h
 flux_safetensors.o: flux_safetensors.c flux_safetensors.h
 main.o: main.c flux.h flux_kernels.h
 
+# Show build configuration
+info:
+	@echo "Build configuration:"
+	@echo "  Platform: $(UNAME_S) $(UNAME_M)"
+	@echo "  Compiler: $(CC)"
+	@echo "  CFLAGS:   $(CFLAGS)"
+	@echo "  LDFLAGS:  $(LDFLAGS)"
+ifdef USE_METAL
+	@echo "  Metal:    ENABLED (GPU acceleration)"
+else
+	@echo "  Metal:    disabled"
+endif
+
 help:
 	@echo "FLUX.2 Makefile targets:"
 	@echo "  all       - Build the flux executable (default)"
@@ -84,6 +122,11 @@ help:
 	@echo "  debug     - Build with debug symbols and sanitizers"
 	@echo "  install   - Install to /usr/local"
 	@echo "  clean     - Remove build artifacts"
+	@echo "  info      - Show build configuration"
 	@echo ""
 	@echo "Usage:"
 	@echo "  ./flux -d model/ -p \"prompt\" -o output.png"
+ifdef USE_METAL
+	@echo ""
+	@echo "Note: Metal GPU acceleration is enabled for Apple Silicon"
+endif

@@ -2,13 +2,18 @@
  * FLUX Math Kernels - Implementation
  *
  * Math operations for FLUX inference.
- * Uses BLAS (Accelerate on macOS, OpenBLAS on Linux) when available.
+ * Uses Metal/MPS on Apple Silicon, BLAS otherwise.
  */
 
 #include "flux_kernels.h"
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
+
+/* Use Metal for GPU acceleration on Apple Silicon */
+#ifdef USE_METAL
+#include "flux_metal.h"
+#endif
 
 /* Use BLAS for matrix operations when available */
 #ifdef __APPLE__
@@ -17,6 +22,9 @@
 #elif defined(USE_OPENBLAS)
 #include <cblas.h>
 #endif
+
+/* Minimum matrix size to use GPU (smaller matrices are faster on CPU) */
+#define MIN_GPU_ELEMENTS (512 * 512)
 
 /* Progress callbacks - set by caller before inference */
 flux_substep_callback_t flux_substep_callback = NULL;
@@ -156,6 +164,28 @@ void flux_axpy(float *a, float scale, const float *b, int n) {
 void flux_matmul(float *C, const float *A, const float *B,
                  int M, int K, int N) {
     /* C[M,N] = A[M,K] @ B[K,N] */
+
+#ifdef USE_METAL
+    size_t matrix_elements = (size_t)M * N;
+    if (flux_metal_available() && matrix_elements >= MIN_GPU_ELEMENTS) {
+        flux_metal_sgemm(0, 0,  /* no transpose */
+                         M, N, K,
+                         1.0f,
+                         A, K,
+                         B, N,
+                         0.0f,
+                         C, N);
+        return;
+    }
+#endif
+
+#if defined(USE_ACCELERATE) || defined(USE_OPENBLAS)
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                M, N, K,
+                1.0f, A, K, B, N,
+                0.0f, C, N);
+#else
+    /* Fallback: naive implementation */
     for (int m = 0; m < M; m++) {
         for (int n = 0; n < N; n++) {
             float sum = 0.0f;
@@ -165,11 +195,34 @@ void flux_matmul(float *C, const float *A, const float *B,
             C[m * N + n] = sum;
         }
     }
+#endif
 }
 
 void flux_matmul_t(float *C, const float *A, const float *B,
                    int M, int K, int N) {
     /* C[M,N] = A[M,K] @ B[N,K]^T */
+
+#ifdef USE_METAL
+    size_t matrix_elements = (size_t)M * N;
+    if (flux_metal_available() && matrix_elements >= MIN_GPU_ELEMENTS) {
+        flux_metal_sgemm(0, 1,  /* no transpose A, transpose B */
+                         M, N, K,
+                         1.0f,
+                         A, K,
+                         B, K,
+                         0.0f,
+                         C, N);
+        return;
+    }
+#endif
+
+#if defined(USE_ACCELERATE) || defined(USE_OPENBLAS)
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                M, N, K,
+                1.0f, A, K, B, K,
+                0.0f, C, N);
+#else
+    /* Fallback: naive implementation */
     for (int m = 0; m < M; m++) {
         for (int n = 0; n < N; n++) {
             float sum = 0.0f;
@@ -179,6 +232,7 @@ void flux_matmul_t(float *C, const float *A, const float *B,
             C[m * N + n] = sum;
         }
     }
+#endif
 }
 
 void flux_batched_matmul(float *C, const float *A, const float *B,
@@ -198,6 +252,36 @@ void flux_batched_matmul(float *C, const float *A, const float *B,
 void flux_linear(float *y, const float *x, const float *W, const float *b,
                  int seq_len, int in_dim, int out_dim) {
     /* y[seq, out] = x[seq, in] @ W[out, in]^T + b[out] */
+
+#ifdef USE_METAL
+    /* Use Metal GPU for large matrices */
+    size_t matrix_elements = (size_t)seq_len * out_dim;
+    if (flux_metal_available() && matrix_elements >= MIN_GPU_ELEMENTS) {
+        /* Metal sgemm: C = alpha * A @ B^T
+         * A[M, K] = x[seq_len, in_dim]
+         * B[N, K] = W[out_dim, in_dim] (transposed)
+         * C[M, N] = y[seq_len, out_dim]
+         */
+        flux_metal_sgemm(0, 1,  /* no transpose A, transpose B */
+                         seq_len, out_dim, in_dim,
+                         1.0f,
+                         x, in_dim,
+                         W, in_dim,
+                         0.0f,
+                         y, out_dim);
+
+        /* Add bias if present */
+        if (b != NULL) {
+            for (int s = 0; s < seq_len; s++) {
+                for (int o = 0; o < out_dim; o++) {
+                    y[s * out_dim + o] += b[o];
+                }
+            }
+        }
+        return;
+    }
+#endif
+
 #if defined(USE_ACCELERATE) || defined(USE_OPENBLAS)
     /* Use BLAS sgemm: C = alpha * A @ B^T + beta * C
      * A[M, K] = x[seq_len, in_dim]
