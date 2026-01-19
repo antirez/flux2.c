@@ -228,6 +228,10 @@ static void print_usage(const char *prog) {
 int main(int argc, char *argv[]) {
 #ifdef USE_METAL
     flux_metal_init();
+#elif defined(USE_BLAS)
+    fprintf(stderr, "BLAS: CPU acceleration enabled (Accelerate/OpenBLAS)\n");
+#else
+    fprintf(stderr, "Generic: Pure C backend (no acceleration)\n");
 #endif
 
     /* Command line options */
