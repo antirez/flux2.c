@@ -124,7 +124,9 @@ flux_ctx *flux_load_dir(const char *model_dir) {
     strncpy(ctx->model_version, "1.0", sizeof(ctx->model_version) - 1);
     strncpy(ctx->model_dir, model_dir, sizeof(ctx->model_dir) - 1);
 
-    /* Load VAE */
+    /* Load VAE only at startup (~300MB).
+     * Transformer and text encoder are loaded on-demand during generation
+     * to support systems with limited RAM (e.g., 16GB). */
     snprintf(path, sizeof(path), "%s/vae/diffusion_pytorch_model.safetensors", model_dir);
     if (file_exists(path)) {
         safetensors_file_t *sf = safetensors_open(path);
@@ -134,33 +136,22 @@ flux_ctx *flux_load_dir(const char *model_dir) {
         }
     }
 
-    /* Load transformer */
-    snprintf(path, sizeof(path), "%s/transformer/diffusion_pytorch_model.safetensors", model_dir);
-    if (file_exists(path)) {
-        safetensors_file_t *sf = safetensors_open(path);
-        if (sf) {
-            ctx->transformer = flux_transformer_load_safetensors(sf);
-            safetensors_close(sf);
-        }
-    }
-
-    /* Load Qwen3 text encoder */
-    ctx->qwen3_encoder = qwen3_encoder_load(model_dir);
-
-    /* Verify required components are loaded */
+    /* Verify VAE is loaded */
     if (!ctx->vae) {
         set_error("Failed to load VAE - cannot generate images");
         flux_free(ctx);
         return NULL;
     }
 
-    if (!ctx->transformer) {
-        set_error("Failed to load transformer - cannot generate images");
+    /* Verify transformer file exists (will be loaded on-demand) */
+    snprintf(path, sizeof(path), "%s/transformer/diffusion_pytorch_model.safetensors", model_dir);
+    if (!file_exists(path)) {
+        set_error("Transformer model file not found");
         flux_free(ctx);
         return NULL;
     }
 
-    /* Note: If text encoder failed to load, images will use empty conditioning */
+    /* Text encoder will also be loaded on-demand */
 
     /* Initialize RNG */
     flux_rng_seed((uint64_t)time(NULL));
@@ -184,6 +175,29 @@ void flux_release_text_encoder(flux_ctx *ctx) {
 
     qwen3_encoder_free(ctx->qwen3_encoder);
     ctx->qwen3_encoder = NULL;
+}
+
+/* Load transformer on-demand if not already loaded */
+static int flux_load_transformer_if_needed(flux_ctx *ctx) {
+    if (ctx->transformer) return 1;  /* Already loaded */
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/transformer/diffusion_pytorch_model.safetensors",
+             ctx->model_dir);
+
+    if (flux_phase_callback) flux_phase_callback("loading transformer", 0);
+    safetensors_file_t *sf = safetensors_open(path);
+    if (sf) {
+        ctx->transformer = flux_transformer_load_safetensors(sf);
+        safetensors_close(sf);
+    }
+    if (flux_phase_callback) flux_phase_callback("loading transformer", 1);
+
+    if (!ctx->transformer) {
+        set_error("Failed to load transformer");
+        return 0;
+    }
+    return 1;
 }
 
 /* Get transformer for debugging */
@@ -265,8 +279,14 @@ flux_image *flux_generate(flux_ctx *ctx, const char *prompt,
         return NULL;
     }
 
-    /* Release text encoder to free ~8GB before diffusion */
+    /* Release text encoder to free ~8GB before loading transformer */
     flux_release_text_encoder(ctx);
+
+    /* Load transformer now (after text encoder is freed to reduce peak memory) */
+    if (!flux_load_transformer_if_needed(ctx)) {
+        free(text_emb);
+        return NULL;
+    }
 
     /* Compute latent dimensions */
     int latent_h = p.height / 16;
@@ -324,6 +344,11 @@ flux_image *flux_generate_with_embeddings(flux_ctx *ctx,
                                            const flux_params *params) {
     if (!ctx || !text_emb) {
         set_error("Invalid context or embeddings");
+        return NULL;
+    }
+
+    /* Load transformer if not already loaded */
+    if (!flux_load_transformer_if_needed(ctx)) {
         return NULL;
     }
 
@@ -399,6 +424,11 @@ flux_image *flux_generate_with_embeddings_and_noise(flux_ctx *ctx,
                                                      const flux_params *params) {
     if (!ctx || !text_emb || !noise) {
         set_error("Invalid context, embeddings, or noise");
+        return NULL;
+    }
+
+    /* Load transformer if not already loaded */
+    if (!flux_load_transformer_if_needed(ctx)) {
         return NULL;
     }
 
@@ -523,8 +553,14 @@ flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
         return NULL;
     }
 
-    /* Release text encoder to free ~8GB before diffusion */
+    /* Release text encoder to free ~8GB before loading transformer */
     flux_release_text_encoder(ctx);
+
+    /* Load transformer now (after text encoder is freed to reduce peak memory) */
+    if (!flux_load_transformer_if_needed(ctx)) {
+        free(text_emb);
+        return NULL;
+    }
 
     /* Encode image to latent */
     float *img_tensor = flux_image_to_tensor(img_to_use);
@@ -675,7 +711,12 @@ flux_image *flux_decode_latent(flux_ctx *ctx, const float *latent,
 float *flux_denoise_step(flux_ctx *ctx, const float *z, float t,
                          const float *text_emb, int text_len,
                          int latent_h, int latent_w) {
-    if (!ctx || !z || !text_emb || !ctx->transformer) return NULL;
+    if (!ctx || !z || !text_emb) return NULL;
+
+    /* Load transformer if not already loaded */
+    if (!flux_load_transformer_if_needed(ctx)) {
+        return NULL;
+    }
 
     return flux_transformer_forward(ctx->transformer,
                                     z, latent_h, latent_w,
