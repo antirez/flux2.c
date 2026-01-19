@@ -157,7 +157,7 @@ debug: clean $(TARGET)
 # Test and utilities
 # =============================================================================
 TEST_PROMPT = "A fluffy orange cat sitting on a windowsill"
-test: $(TARGET)
+test:
 	@echo "Running inference test..."
 	@./$(TARGET) -d flux-klein-model -p $(TEST_PROMPT) --seed 42 --steps 1 -o /tmp/flux_test_output.png -W 64 -H 64
 	@python3 -c "\

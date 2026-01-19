@@ -192,16 +192,13 @@ The text encoder is automatically released after encoding, reducing peak memory 
 
 Benchmarks on **Apple M3 Max** (128GB RAM), generating a 4-step image:
 
-| Size | C (MPS) | C (BLAS) | C (Generic) | PyTorch (MPS) |
-|------|---------|----------|-------------|---------------|
-| 512x512 | 49.6s | 51.9s | - | 5.4s |
-| 256x256 | 32.4s | 29.7s | - | 3.0s |
-| 64x64 | 25.0s | 23.5s | 605.6s | 2.2s |
+| Size | C (MPS) | C (BLAS) | PyTorch (MPS) |
+|------|---------|----------|---------------|
+| 256x256 | 23s | 24s | 2.9s |
 
 **Notes:**
-- The C implementation uses float32 throughout, while PyTorch uses bfloat16 with highly optimized MPS kernels. The next step of this project is likely to implement such an optimization, in order to reach similar speed, or at least try to approach it.
-- The generic (pure C) backend is extremely slow and only practical for testing at small sizes.
-- Times include text encoding, denoising (4 steps), and VAE decode.
+- The C implementation uses float32 throughout, while PyTorch uses bfloat16 with highly optimized MPS kernels. The next step of this project is likely to implement such an optimization, in order to reach similar speed, or at least try to approach it. Notably, we currently don't take activations on the GPU between operations: this is likely going to require some serious refactoring, and it is essential to improve speed significantly.
+- Times include text encoding, denoising (4 steps), and VAE decode (excludes model loading).
 
 ### Resolution Limits
 

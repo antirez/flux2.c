@@ -9,6 +9,7 @@
 #define FLUX_METAL_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -47,6 +48,21 @@ void flux_metal_sgemm(int transpose_a, int transpose_b,
                       float *C, int ldc);
 
 /*
+ * GPU-accelerated matrix multiplication with bf16 weights.
+ * C[M,N] = alpha * A[M,K] @ B[K,N] + beta * C[M,N]
+ *
+ * A is f32, B is bf16 (weights), C is f32
+ * This provides 2x memory bandwidth improvement for weight-bound operations.
+ */
+void flux_metal_sgemm_bf16(int transpose_a, int transpose_b,
+                           int M, int N, int K,
+                           float alpha,
+                           const float *A, int lda,
+                           const uint16_t *B_bf16, int ldb,
+                           float beta,
+                           float *C, int ldc);
+
+/*
  * Batch matrix multiplication on GPU.
  * Performs batch_count independent matrix multiplications.
  */
@@ -65,9 +81,324 @@ void flux_metal_sgemm_batch(int transpose_a, int transpose_b,
 void flux_metal_sync(void);
 
 /*
+ * Begin a batch of GPU operations.
+ * Operations after this call are encoded but not executed until flux_metal_end_batch().
+ * This eliminates per-operation sync overhead.
+ */
+void flux_metal_begin_batch(void);
+
+/*
+ * End a batch of GPU operations.
+ * Commits all encoded operations and waits for completion.
+ */
+void flux_metal_end_batch(void);
+
+/*
+ * Check if currently in batch mode.
+ */
+int flux_metal_in_batch(void);
+
+/*
  * Get GPU memory usage info (for debugging).
  */
 size_t flux_metal_memory_used(void);
+
+/* ========================================================================
+ * GPU Tensor API - Keep activations on GPU between operations
+ * ======================================================================== */
+
+/*
+ * Opaque handle to a GPU-resident tensor.
+ * Tensors are backed by pooled Metal buffers with shared storage mode,
+ * allowing zero-copy access from both CPU and GPU on Apple Silicon.
+ */
+typedef struct flux_gpu_tensor *flux_gpu_tensor_t;
+
+/*
+ * Create a GPU tensor from CPU data.
+ * Data is copied to GPU (or just referenced in shared memory mode).
+ * Returns NULL on failure.
+ */
+flux_gpu_tensor_t flux_gpu_tensor_create(const float *data, size_t num_elements);
+
+/*
+ * Create an uninitialized GPU tensor (for output buffers).
+ */
+flux_gpu_tensor_t flux_gpu_tensor_alloc(size_t num_elements);
+
+/*
+ * Create a persistent GPU tensor that won't be released back to the pool.
+ * Use this for tensors that need to stay on GPU between operations.
+ * Call flux_gpu_tensor_free() when completely done with the tensor.
+ */
+flux_gpu_tensor_t flux_gpu_tensor_alloc_persistent(size_t num_elements);
+
+/*
+ * Mark an existing tensor as persistent (won't return to pool on free).
+ */
+void flux_gpu_tensor_set_persistent(flux_gpu_tensor_t tensor, int persistent);
+
+/*
+ * Copy tensor data back to CPU.
+ * Waits for any pending GPU operations on this tensor.
+ */
+void flux_gpu_tensor_read(flux_gpu_tensor_t tensor, float *out);
+
+/*
+ * Get direct pointer to tensor data (shared memory mode).
+ * WARNING: Caller must ensure no GPU operations are pending on this tensor.
+ * On Apple Silicon unified memory, this provides zero-copy access.
+ */
+float *flux_gpu_tensor_data(flux_gpu_tensor_t tensor);
+
+/*
+ * Release a GPU tensor back to the pool.
+ */
+void flux_gpu_tensor_free(flux_gpu_tensor_t tensor);
+
+/*
+ * Get tensor element count.
+ */
+size_t flux_gpu_tensor_size(flux_gpu_tensor_t tensor);
+
+/* ========================================================================
+ * GPU Operations on Tensors - Operations that keep data on GPU
+ * ======================================================================== */
+
+/*
+ * Linear layer on GPU: out = x @ W^T + b (if b != NULL)
+ * x: [seq_len, in_dim]
+ * W: [out_dim, in_dim]
+ * b: [out_dim] (can be NULL)
+ * out: [seq_len, out_dim]
+ *
+ * Returns a new GPU tensor with the result.
+ * Does NOT sync - GPU operation is queued.
+ */
+flux_gpu_tensor_t flux_gpu_linear(flux_gpu_tensor_t x,
+                                   const float *W, const float *b,
+                                   int seq_len, int in_dim, int out_dim);
+
+/*
+ * Linear layer on GPU with bf16 weights: out = x @ W^T
+ * x: [seq_len, in_dim] (f32 on GPU)
+ * W_bf16: [out_dim, in_dim] (bf16, converted to f16 internally)
+ * out: [seq_len, out_dim] (f32)
+ * Returns a new GPU tensor with the result.
+ */
+flux_gpu_tensor_t flux_gpu_linear_bf16(flux_gpu_tensor_t x,
+                                        const uint16_t *W_bf16,
+                                        int seq_len, int in_dim, int out_dim);
+
+/*
+ * Sync all pending GPU operations.
+ * Call this before reading tensor data or at step boundaries.
+ */
+void flux_gpu_sync(void);
+
+/*
+ * Begin a batch of GPU operations.
+ * Operations are encoded but not executed until flux_gpu_batch_end().
+ */
+void flux_gpu_batch_begin(void);
+
+/*
+ * End batch and execute all queued operations.
+ */
+void flux_gpu_batch_end(void);
+
+/* ========================================================================
+ * GPU Operation Chains - Keep data on GPU between operations
+ * ======================================================================== */
+
+/*
+ * Begin an operation chain. Operations within a chain:
+ * - Share the same command buffer (reduced dispatch overhead)
+ * - Keep intermediate results on GPU (no CPU round-trips)
+ * - Only sync at chain end
+ * Must be ended with flux_gpu_chain_end().
+ */
+void flux_gpu_chain_begin(void);
+
+/*
+ * End an operation chain and execute all queued operations.
+ * Results stay in GPU tensors until explicitly read.
+ */
+void flux_gpu_chain_end(void);
+
+/*
+ * Check if currently in chain mode.
+ */
+int flux_gpu_in_chain(void);
+
+/* ========================================================================
+ * GPU Tensor Operations - Keep data on GPU between operations
+ * These functions operate on GPU tensors and keep data on GPU.
+ * Use flux_gpu_batch_begin/end to batch operations efficiently.
+ * ======================================================================== */
+
+/* AdaLN normalization on GPU: out = (1 + scale) * norm(x) + shift */
+void flux_gpu_adaln_norm(flux_gpu_tensor_t out, flux_gpu_tensor_t x,
+                         const float *shift, const float *scale,
+                         int seq, int hidden, float eps);
+
+/* QK RMSNorm on GPU: applies RMSNorm to Q and K in-place */
+void flux_gpu_qk_rms_norm(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
+                          const float *q_weight, const float *k_weight,
+                          int seq, int heads, int head_dim, float eps);
+
+/* RoPE 2D on GPU: applies rotary position embeddings in-place */
+void flux_gpu_rope_2d(flux_gpu_tensor_t x, const float *cos_freq, const float *sin_freq,
+                      int seq, int heads, int head_dim, int axis_dim);
+
+/* Unified RoPE for text+image: applies different frequencies to text/image portions */
+void flux_gpu_rope_unified(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
+                           const float *txt_cos, const float *txt_sin,
+                           const float *img_cos, const float *img_sin,
+                           int seq, int img_offset, int heads, int head_dim, int axis_dim);
+
+/* SiLU multiply on GPU: gate = silu(gate) * up */
+void flux_gpu_silu_mul(flux_gpu_tensor_t gate, flux_gpu_tensor_t up, int n);
+
+/* Gated add on GPU: out += gate * proj */
+void flux_gpu_gated_add(flux_gpu_tensor_t out, const float *gate,
+                        flux_gpu_tensor_t proj, int seq, int hidden);
+
+/* Split fused QKV+MLP output into separate tensors */
+void flux_gpu_split_qkv_mlp(flux_gpu_tensor_t fused,
+                            flux_gpu_tensor_t q, flux_gpu_tensor_t k, flux_gpu_tensor_t v,
+                            flux_gpu_tensor_t gate, flux_gpu_tensor_t up,
+                            int seq, int hidden, int mlp_hidden);
+
+/* Concatenate attention and MLP outputs */
+void flux_gpu_concat_attn_mlp(flux_gpu_tensor_t attn, flux_gpu_tensor_t mlp,
+                              flux_gpu_tensor_t out, int seq, int hidden, int mlp_hidden);
+
+/* Fused attention on GPU tensors (no transpose needed) */
+int flux_gpu_attention_fused(flux_gpu_tensor_t out,
+                             flux_gpu_tensor_t Q, flux_gpu_tensor_t K, flux_gpu_tensor_t V,
+                             int seq_q, int seq_k, int num_heads, int head_dim, float scale);
+
+/*
+ * GPU-accelerated scaled dot-product attention.
+ * Computes attention for all heads in a single GPU batch.
+ *
+ * Q, K, V are in [heads, seq_q/seq_k, head_dim] layout (already transposed)
+ * scores_scratch must be pre-allocated: [heads * seq_q * seq_k] floats
+ * out will be [heads, seq_q, head_dim]
+ *
+ * This does: out = softmax(Q @ K^T * scale) @ V
+ * Softmax is done on CPU (between two GPU batches).
+ */
+void flux_metal_attention(float *out,
+                          const float *Q, const float *K, const float *V,
+                          float *scores_scratch,
+                          int heads, int seq_q, int seq_k, int head_dim,
+                          float scale);
+
+/*
+ * GPU-accelerated causal attention for text encoder (Qwen3).
+ * Processes all heads in parallel on GPU with causal masking.
+ * Supports GQA (Grouped Query Attention) where Q heads > KV heads.
+ *
+ * Q: [seq, num_q_heads * head_dim] - query tensor
+ * K: [seq, num_kv_heads * head_dim] - key tensor (may have fewer heads)
+ * V: [seq, num_kv_heads * head_dim] - value tensor
+ * out: [seq, num_q_heads * head_dim] - output tensor
+ * attention_mask: [seq] - 1 for valid tokens, 0 for padding (can be NULL)
+ *
+ * This does: out = softmax(Q @ K^T * scale + causal_mask + attn_mask) @ V
+ * All operations are fused in a single GPU kernel.
+ * Returns 1 on success, 0 on failure (falls back to CPU).
+ */
+int flux_metal_causal_attention(float *out,
+                                 const float *Q, const float *K, const float *V,
+                                 const int *attention_mask,
+                                 int seq, int num_q_heads, int num_kv_heads,
+                                 int head_dim, float scale);
+
+/*
+ * Fused non-causal attention for transformer.
+ * Works directly on [seq, hidden] layout without transpose.
+ * Supports different Q and K/V sequence lengths (for joint attention).
+ *
+ * This does: out = softmax(Q @ K^T * scale) @ V
+ * All operations are fused in a single GPU kernel.
+ * Returns 1 on success, 0 on failure (falls back to CPU).
+ */
+int flux_metal_attention_fused(float *out,
+                               const float *Q, const float *K, const float *V,
+                               int seq_q, int seq_k, int num_heads, int head_dim,
+                               float scale);
+
+/* ========================================================================
+ * GPU Compute Shaders - Element-wise operations on GPU
+ * ======================================================================== */
+
+/*
+ * Initialize compute shaders from .metal file.
+ * Called automatically by flux_metal_init() if shader file exists.
+ * Returns 1 on success, 0 on failure.
+ */
+int flux_metal_init_shaders(void);
+
+/*
+ * GPU-accelerated RMSNorm.
+ * out[i] = x[i] * rsqrt(mean(x^2) + eps) * weight[i]
+ * x: [seq_len, hidden], weight: [hidden], out: [seq_len, hidden]
+ */
+void flux_metal_rms_norm(float *out, const float *x, const float *weight,
+                         int seq_len, int hidden, float eps);
+
+/*
+ * GPU-accelerated QK RMSNorm (in-place).
+ * Normalizes Q and K separately for each head.
+ * q, k: [seq, heads*head_dim] (modified in-place)
+ * q_weight, k_weight: [head_dim]
+ */
+void flux_metal_qk_rms_norm(float *q, float *k,
+                            const float *q_weight, const float *k_weight,
+                            int seq, int heads, int head_dim, float eps);
+
+/*
+ * GPU-accelerated LayerNorm + AdaLN modulation.
+ * out = (1 + scale) * layernorm(x) + shift
+ * x: [seq_len, hidden], shift/scale: [hidden]
+ */
+void flux_metal_adaln_norm(float *out, const float *x,
+                           const float *shift, const float *scale,
+                           int seq_len, int hidden, float eps);
+
+/*
+ * GPU-accelerated SiLU activation (in-place).
+ * x = x * sigmoid(x)
+ */
+void flux_metal_silu(float *x, int n);
+
+/*
+ * GPU-accelerated SiLU with multiply (SwiGLU style, in-place).
+ * gate = silu(gate) * up
+ */
+void flux_metal_silu_mul(float *gate, const float *up, int n);
+
+/*
+ * GPU-accelerated softmax (row-wise, in-place).
+ * x: [rows, cols], softmax applied to each row
+ */
+void flux_metal_softmax(float *x, int rows, int cols);
+
+/*
+ * GPU-accelerated 2D RoPE (in-place).
+ * x: [seq, heads*head_dim]
+ * cos_freq, sin_freq: [seq, head_dim]
+ */
+void flux_metal_rope_2d(float *x, const float *cos_freq, const float *sin_freq,
+                        int seq, int heads, int head_dim, int axis_dim);
+
+/*
+ * Check if compute shaders are available.
+ */
+int flux_metal_shaders_available(void);
 
 #ifdef __cplusplus
 }

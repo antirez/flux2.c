@@ -213,31 +213,30 @@ static int attnblock_forward(float *out, const float *x,
 
   float *attn_out = v + batch * ch * spatial;
 
+  /* Allocate attention work buffers once outside the batch loop */
+  float *q_t = (float *)malloc(spatial * ch * sizeof(float));
+  float *k_t = (float *)malloc(spatial * ch * sizeof(float));
+  float *v_t = (float *)malloc(spatial * ch * sizeof(float));
+  float *o_t = (float *)malloc(spatial * ch * sizeof(float));
+  float *scores = (float *)malloc((size_t)spatial * spatial * sizeof(float));
+
+  /* Check for allocation failures */
+  if (!q_t || !k_t || !v_t || !o_t || !scores) {
+    free(q_t);
+    free(k_t);
+    free(v_t);
+    free(o_t);
+    free(scores);
+    return -1; /* OOM */
+  }
+
   for (int b = 0; b < batch; b++) {
     float *qb = q + b * ch * spatial;
     float *kb = k + b * ch * spatial;
     float *vb = v + b * ch * spatial;
     float *ob = attn_out + b * ch * spatial;
 
-    /* Transpose Q, K, V from [C, HW] to [HW, C] for BLAS */
-    float *q_t = (float *)malloc(spatial * ch * sizeof(float));
-    float *k_t = (float *)malloc(spatial * ch * sizeof(float));
-    float *v_t = (float *)malloc(spatial * ch * sizeof(float));
-    float *o_t = (float *)malloc(spatial * ch * sizeof(float));
-    float *scores = (float *)malloc((size_t)spatial * spatial * sizeof(float));
-
-    /* Check for allocation failures */
-    if (!q_t || !k_t || !v_t || !o_t || !scores) {
-      free(q_t);
-      free(k_t);
-      free(v_t);
-      free(o_t);
-      free(scores);
-      return -1; /* OOM */
-    }
-
-/* Transpose [C, HW] -> [HW, C] */
-#pragma omp parallel for
+    /* Transpose [C, HW] -> [HW, C] */
     for (int c = 0; c < ch; c++) {
       for (int i = 0; i < spatial; i++) {
         q_t[i * ch + c] = qb[c * spatial + i] * scale;
@@ -255,20 +254,19 @@ static int attnblock_forward(float *out, const float *x,
     /* scores @ V using BLAS: [HW, HW] @ [HW, C] -> [HW, C] */
     flux_matmul(o_t, scores, v_t, spatial, spatial, ch);
 
-/* Transpose output back [HW, C] -> [C, HW] */
-#pragma omp parallel for
+    /* Transpose output back [HW, C] -> [C, HW] */
     for (int c = 0; c < ch; c++) {
       for (int i = 0; i < spatial; i++) {
         ob[c * spatial + i] = o_t[i * ch + c];
       }
     }
-
-    free(q_t);
-    free(k_t);
-    free(v_t);
-    free(o_t);
-    free(scores);
   }
+
+  free(q_t);
+  free(k_t);
+  free(v_t);
+  free(o_t);
+  free(scores);
 
   /* Project output */
   flux_conv2d(work, attn_out, block->out_weight, block->out_bias, batch, ch, ch,

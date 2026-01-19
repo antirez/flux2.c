@@ -25,6 +25,16 @@
 #endif
 #endif
 
+/* Use Metal for GPU acceleration */
+#ifdef USE_METAL
+#include "flux_metal.h"
+#endif
+
+/* Minimum matrix size for GPU acceleration. Lower threshold to use GPU for more
+ * operations (K/V projections ~262K, output/down ~655K, gate/up ~2.5M).
+ * Note: Very small matrices may have GPU sync overhead > BLAS compute time. */
+#define QWEN3_MIN_GPU_ELEMENTS (256 * 1024)
+
 /* ========================================================================
  * Data Structures
  * ======================================================================== */
@@ -81,6 +91,12 @@ struct qwen3_model {
 
     /* Output layers storage (for extracting layers 9, 18, 27) */
     float *layer_outputs[3];  /* [seq_len, hidden] each */
+
+    /* Pre-allocated attention work buffers (avoid per-call allocation) */
+    float *attn_q_head;       /* [seq_len, head_dim] */
+    float *attn_k_head_t;     /* [head_dim, seq_len] */
+    float *attn_v_head;       /* [seq_len, head_dim] */
+    float *attn_out_head;     /* [seq_len, head_dim] */
 };
 
 /* ========================================================================
@@ -90,6 +106,21 @@ struct qwen3_model {
 static void qwen3_linear(float *y, const float *x, const float *W,
                          int seq_len, int in_dim, int out_dim) {
     /* y[seq, out] = x[seq, in] @ W[out, in]^T */
+#ifdef USE_METAL
+    /* Use GPU for large matrices */
+    size_t matrix_elements = (size_t)seq_len * out_dim;
+    if (flux_metal_available() && matrix_elements >= QWEN3_MIN_GPU_ELEMENTS) {
+        flux_metal_sgemm(0, 1,  /* no transpose A, transpose B */
+                         seq_len, out_dim, in_dim,
+                         1.0f,
+                         x, in_dim,
+                         W, in_dim,
+                         0.0f,
+                         y, out_dim);
+        return;
+    }
+#endif
+
 #ifdef USE_BLAS
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                 seq_len, out_dim, in_dim,
@@ -272,60 +303,114 @@ static void qwen3_attention_forward(qwen3_model_t *model, qwen3_layer_t *layer,
     apply_rope(model->q_buf, model->k_buf, model->rope_cos, model->rope_sin,
                seq_len, num_heads, num_kv_heads, head_dim);
 
-    /* Compute attention for each head with GQA */
-    int heads_per_kv = num_heads / num_kv_heads;
-
-    for (int h = 0; h < num_heads; h++) {
-        int kv_h = h / heads_per_kv;  /* Which KV head to use */
-
-        /* Get pointers for this head */
-        float *scores = model->attn_scores + h * seq_len * seq_len;
-
-        /* Compute Q @ K^T for this head */
-        for (int i = 0; i < seq_len; i++) {
-            const float *q_row = model->q_buf + i * q_dim + h * head_dim;
-            for (int j = 0; j < seq_len; j++) {
-                const float *k_row = model->k_buf + j * kv_dim + kv_h * head_dim;
-
-                float dot = 0.0f;
-                for (int d = 0; d < head_dim; d++) {
-                    dot += q_row[d] * k_row[d];
-                }
-                scores[i * seq_len + j] = dot * scale;
-            }
+#ifdef USE_METAL
+    /* Try GPU-accelerated causal attention for all heads in parallel.
+     * The GPU kernel uses both causal masking and attention mask.
+     * This ensures exact parity with CPU implementation. */
+    if (flux_metal_available()) {
+        if (flux_metal_causal_attention(model->attn_out,
+                                         model->q_buf, model->k_buf, model->v_buf,
+                                         attention_mask,
+                                         seq_len, num_heads, num_kv_heads,
+                                         head_dim, scale)) {
+            /* GPU attention succeeded - skip to output projection */
+            goto output_proj;
         }
+    }
+#endif
 
-        /* Apply causal mask and attention mask */
-        for (int i = 0; i < seq_len; i++) {
-            for (int j = 0; j < seq_len; j++) {
-                if (j > i) {
-                    /* Causal mask: can't attend to future */
-                    scores[i * seq_len + j] = -1e9f;
-                }
-                if (attention_mask && attention_mask[j] == 0) {
-                    /* Padding mask */
-                    scores[i * seq_len + j] = -1e9f;
-                }
-            }
-            qwen3_softmax(scores + i * seq_len, seq_len);
-        }
+    /* CPU fallback: compute attention for each head with GQA
+     * Use BLAS for Q@K^T and scores@V matrix multiplications */
+    {
+        int heads_per_kv = num_heads / num_kv_heads;
 
-        /* Compute attention output: scores @ V */
-        for (int i = 0; i < seq_len; i++) {
-            float *out_row = model->attn_out + i * q_dim + h * head_dim;
-            memset(out_row, 0, head_dim * sizeof(float));
+        /* Use pre-allocated work buffer for K transpose (Q, V, output use strided access) */
+        float *k_head_t = model->attn_k_head_t;
 
-            for (int j = 0; j < seq_len; j++) {
-                float score = scores[i * seq_len + j];
-                const float *v_row = model->v_buf + j * kv_dim + kv_h * head_dim;
+        for (int h = 0; h < num_heads; h++) {
+            int kv_h = h / heads_per_kv;  /* Which KV head to use */
+            float *scores = model->attn_scores + h * seq_len * seq_len;
 
+            /* Q can be accessed directly with strided lda (avoids copy)
+             * Q[s,d] = q_buf[s * q_dim + h * head_dim + d]
+             * Use pointer to head h with lda = q_dim */
+            const float *q_strided = model->q_buf + h * head_dim;
+
+            /* K still needs transpose: K^T[d,s] = K[s,kv_h,d]
+             * This requires explicit transpose since we need [head_dim, seq_len] layout */
+            for (int s = 0; s < seq_len; s++) {
                 for (int d = 0; d < head_dim; d++) {
-                    out_row[d] += score * v_row[d];
+                    k_head_t[d * seq_len + s] = model->k_buf[s * kv_dim + kv_h * head_dim + d];
                 }
             }
+
+            /* scores = scale * Q @ K^T using strided BLAS
+             * Q: [seq_len, head_dim] with lda=q_dim, K^T: [head_dim, seq_len] */
+#ifdef USE_BLAS
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        seq_len, seq_len, head_dim,
+                        scale, q_strided, q_dim, k_head_t, seq_len,
+                        0.0f, scores, seq_len);
+#else
+            /* Fallback: naive matmul with strided Q access */
+            for (int i = 0; i < seq_len; i++) {
+                for (int j = 0; j < seq_len; j++) {
+                    float dot = 0.0f;
+                    for (int d = 0; d < head_dim; d++) {
+                        dot += q_strided[i * q_dim + d] * k_head_t[d * seq_len + j];
+                    }
+                    scores[i * seq_len + j] = dot * scale;
+                }
+            }
+#endif
+
+            /* Apply causal mask and attention mask, then softmax */
+            for (int i = 0; i < seq_len; i++) {
+                for (int j = 0; j < seq_len; j++) {
+                    if (j > i) {
+                        scores[i * seq_len + j] = -1e9f;
+                    }
+                    if (attention_mask && attention_mask[j] == 0) {
+                        scores[i * seq_len + j] = -1e9f;
+                    }
+                }
+                qwen3_softmax(scores + i * seq_len, seq_len);
+            }
+
+            /* V can be accessed directly with strided lda (avoids copy)
+             * V[s,d] = v_buf[s * kv_dim + kv_h * head_dim + d] */
+            const float *v_strided = model->v_buf + kv_h * head_dim;
+
+            /* Output can be written directly with strided ldc (avoids copy)
+             * out[s,d] = attn_out[s * q_dim + h * head_dim + d] */
+            float *out_strided = model->attn_out + h * head_dim;
+
+            /* out = scores @ V using strided BLAS (avoids V copy and output copy)
+             * scores: [seq_len, seq_len], V: [seq_len, head_dim] with ldb=kv_dim */
+#ifdef USE_BLAS
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        seq_len, head_dim, seq_len,
+                        1.0f, scores, seq_len, v_strided, kv_dim,
+                        0.0f, out_strided, q_dim);
+#else
+            for (int i = 0; i < seq_len; i++) {
+                for (int d = 0; d < head_dim; d++) {
+                    float sum = 0.0f;
+                    for (int j = 0; j < seq_len; j++) {
+                        sum += scores[i * seq_len + j] * v_strided[j * kv_dim + d];
+                    }
+                    out_strided[i * q_dim + d] = sum;
+                }
+            }
+#endif
         }
     }
 
+    /* Work buffers are pre-allocated in model, no free needed */
+
+#ifdef USE_METAL
+output_proj:
+#endif
     /* Output projection */
     qwen3_linear(model->hidden_state, model->attn_out, layer->attn.o_proj_weight,
                  seq_len, q_dim, hidden);
@@ -612,6 +697,12 @@ qwen3_model_t *qwen3_model_load(const char *model_dir) {
     model->mlp_out = malloc(seq_len * hidden * sizeof(float));
     model->norm_buf = malloc(seq_len * hidden * sizeof(float));
 
+    /* Pre-allocate attention work buffers */
+    model->attn_q_head = malloc(seq_len * head_dim * sizeof(float));
+    model->attn_k_head_t = malloc(head_dim * seq_len * sizeof(float));
+    model->attn_v_head = malloc(seq_len * head_dim * sizeof(float));
+    model->attn_out_head = malloc(seq_len * head_dim * sizeof(float));
+
     for (int i = 0; i < 3; i++) {
         model->layer_outputs[i] = malloc(seq_len * hidden * sizeof(float));
     }
@@ -662,6 +753,12 @@ void qwen3_model_free(qwen3_model_t *model) {
     free(model->mlp_up);
     free(model->mlp_out);
     free(model->norm_buf);
+
+    /* Free attention work buffers */
+    free(model->attn_q_head);
+    free(model->attn_k_head_t);
+    free(model->attn_v_head);
+    free(model->attn_out_head);
 
     for (int i = 0; i < 3; i++) {
         free(model->layer_outputs[i]);

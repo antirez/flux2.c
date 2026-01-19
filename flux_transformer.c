@@ -20,6 +20,21 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
+#include <sys/time.h>
+
+/* External timing counters from flux_sample.c */
+extern double flux_timing_transformer_total;
+extern double flux_timing_transformer_double;
+extern double flux_timing_transformer_single;
+extern double flux_timing_transformer_final;
+
+/* Helper to get current time in ms (wall-clock) */
+static double tf_get_time_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+}
 
 /* Use BLAS for matrix operations when enabled via Makefile */
 #ifdef USE_BLAS
@@ -29,6 +44,34 @@
 #include <cblas.h>
 #endif
 #endif
+
+/* Use Metal for GPU acceleration when available */
+#ifdef USE_METAL
+#include "flux_metal.h"
+#endif
+
+/* Helper macro for using bf16 linear layer when available
+ * Uses bf16 if w_bf16 is not NULL (GPU), otherwise falls back to f32 */
+#define LINEAR_BF16_OR_F32(out, x, w_f32, w_bf16, seq, in_dim, out_dim) \
+    do { \
+        if ((w_bf16) != NULL) { \
+            flux_linear_nobias_bf16((out), (x), (w_bf16), (seq), (in_dim), (out_dim)); \
+        } else { \
+            flux_linear_nobias((out), (x), (w_f32), (seq), (in_dim), (out_dim)); \
+        } \
+    } while(0)
+
+/* Gated add: out += gate * proj, where gate is [hidden] and proj is [seq, hidden]
+ * Double loop avoids modulo which prevents vectorization.
+ */
+static inline void gated_add(float *out, const float *gate, const float *proj,
+                             int seq, int hidden) {
+    for (int s = 0; s < seq; s++) {
+        for (int i = 0; i < hidden; i++) {
+            out[s * hidden + i] += gate[i] * proj[s * hidden + i];
+        }
+    }
+}
 
 /* ========================================================================
  * Transformer Data Structures
@@ -41,38 +84,54 @@ typedef struct {
 
 /* Double-stream block (MM-DiT style) */
 typedef struct {
-    /* Image stream - separate Q, K, V weights */
-    float *img_q_weight;            /* [hidden, hidden] */
-    float *img_k_weight;            /* [hidden, hidden] */
-    float *img_v_weight;            /* [hidden, hidden] */
-    float *img_norm_q_weight;       /* [head_dim] - QK norm on Q */
-    float *img_norm_k_weight;       /* [head_dim] - QK norm on K */
-    float *img_proj_weight;         /* [hidden, hidden] */
-    float *img_mlp_gate_weight;     /* [mlp_hidden, hidden] */
-    float *img_mlp_up_weight;       /* [mlp_hidden, hidden] */
-    float *img_mlp_down_weight;     /* [hidden, mlp_hidden] */
+    /* Image stream - separate Q, K, V weights (f32 and bf16) */
+    float *img_q_weight;            /* [hidden, hidden] (f32) */
+    float *img_k_weight;            /* [hidden, hidden] (f32) */
+    float *img_v_weight;            /* [hidden, hidden] (f32) */
+    uint16_t *img_q_weight_bf16;    /* [hidden, hidden] (bf16) */
+    uint16_t *img_k_weight_bf16;    /* [hidden, hidden] (bf16) */
+    uint16_t *img_v_weight_bf16;    /* [hidden, hidden] (bf16) */
+    float *img_norm_q_weight;       /* [head_dim] - QK norm on Q (always f32) */
+    float *img_norm_k_weight;       /* [head_dim] - QK norm on K (always f32) */
+    float *img_proj_weight;         /* [hidden, hidden] (f32) */
+    uint16_t *img_proj_weight_bf16; /* [hidden, hidden] (bf16) */
+    float *img_mlp_gate_weight;     /* [mlp_hidden, hidden] (f32) */
+    float *img_mlp_up_weight;       /* [mlp_hidden, hidden] (f32) */
+    float *img_mlp_down_weight;     /* [hidden, mlp_hidden] (f32) */
+    uint16_t *img_mlp_gate_weight_bf16; /* [mlp_hidden, hidden] (bf16) */
+    uint16_t *img_mlp_up_weight_bf16;   /* [mlp_hidden, hidden] (bf16) */
+    uint16_t *img_mlp_down_weight_bf16; /* [hidden, mlp_hidden] (bf16) */
 
-    /* Text stream - separate Q, K, V weights */
-    float *txt_q_weight;            /* [hidden, hidden] */
-    float *txt_k_weight;            /* [hidden, hidden] */
-    float *txt_v_weight;            /* [hidden, hidden] */
-    float *txt_norm_q_weight;       /* [head_dim] - QK norm on Q */
-    float *txt_norm_k_weight;       /* [head_dim] - QK norm on K */
-    float *txt_proj_weight;         /* [hidden, hidden] */
-    float *txt_mlp_gate_weight;     /* [mlp_hidden, hidden] */
-    float *txt_mlp_up_weight;       /* [mlp_hidden, hidden] */
-    float *txt_mlp_down_weight;     /* [hidden, mlp_hidden] */
+    /* Text stream - separate Q, K, V weights (f32 and bf16) */
+    float *txt_q_weight;            /* [hidden, hidden] (f32) */
+    float *txt_k_weight;            /* [hidden, hidden] (f32) */
+    float *txt_v_weight;            /* [hidden, hidden] (f32) */
+    uint16_t *txt_q_weight_bf16;    /* [hidden, hidden] (bf16) */
+    uint16_t *txt_k_weight_bf16;    /* [hidden, hidden] (bf16) */
+    uint16_t *txt_v_weight_bf16;    /* [hidden, hidden] (bf16) */
+    float *txt_norm_q_weight;       /* [head_dim] - QK norm on Q (always f32) */
+    float *txt_norm_k_weight;       /* [head_dim] - QK norm on K (always f32) */
+    float *txt_proj_weight;         /* [hidden, hidden] (f32) */
+    uint16_t *txt_proj_weight_bf16; /* [hidden, hidden] (bf16) */
+    float *txt_mlp_gate_weight;     /* [mlp_hidden, hidden] (f32) */
+    float *txt_mlp_up_weight;       /* [mlp_hidden, hidden] (f32) */
+    float *txt_mlp_down_weight;     /* [hidden, mlp_hidden] (f32) */
+    uint16_t *txt_mlp_gate_weight_bf16; /* [mlp_hidden, hidden] (bf16) */
+    uint16_t *txt_mlp_up_weight_bf16;   /* [mlp_hidden, hidden] (bf16) */
+    uint16_t *txt_mlp_down_weight_bf16; /* [hidden, mlp_hidden] (bf16) */
 } double_block_t;
 
 /* Single-stream block (Parallel DiT style, fused) */
 typedef struct {
-    /* Fused QKV + FFN input projection */
-    float *qkv_mlp_weight;          /* [hidden*3 + mlp_hidden*2, hidden] */
-    /* QK normalization */
+    /* Fused QKV + FFN input projection - bf16 for GPU, f32 as fallback */
+    float *qkv_mlp_weight;          /* [hidden*3 + mlp_hidden*2, hidden] (f32) */
+    uint16_t *qkv_mlp_weight_bf16;  /* [hidden*3 + mlp_hidden*2, hidden] (bf16) */
+    /* QK normalization - always f32 (small) */
     float *norm_q_weight;           /* [head_dim] */
     float *norm_k_weight;           /* [head_dim] */
-    /* Fused attention out + FFN down projection */
-    float *proj_mlp_weight;         /* [hidden, hidden + mlp_hidden] */
+    /* Fused attention out + FFN down projection - bf16 for GPU, f32 as fallback */
+    float *proj_mlp_weight;         /* [hidden, hidden + mlp_hidden] (f32) */
+    uint16_t *proj_mlp_weight_bf16; /* [hidden, hidden + mlp_hidden] (bf16) */
 } single_block_t;
 
 /* Timestep embedding MLP
@@ -99,27 +158,34 @@ typedef struct flux_transformer {
     int latent_channels;    /* 128 */
     float rope_theta;       /* 2000 */
     int rope_dim;           /* 128 */
+    int use_bf16;           /* Use bf16 weights (1) or f32 (0) */
 
     /* Input projections */
     float *img_in_weight;   /* [hidden, latent_channels] */
     float *txt_in_weight;   /* [hidden, text_dim] */
+    uint16_t *img_in_weight_bf16;   /* [hidden, latent_channels] (bf16) */
+    uint16_t *txt_in_weight_bf16;   /* [hidden, text_dim] (bf16) */
 
     /* Timestep embedding */
     time_embed_t time_embed;
     float *time_freq;       /* [hidden/2] - precomputed sinusoidal frequencies */
 
-    /* Shared AdaLN modulation */
+    /* Shared AdaLN modulation (f32 and bf16) */
     float *adaln_double_img_weight;  /* [hidden * 6, hidden] for double block img stream */
     float *adaln_double_txt_weight;  /* [hidden * 6, hidden] for double block txt stream */
     float *adaln_single_weight;      /* [hidden * 3, hidden] for single block */
+    uint16_t *adaln_double_img_weight_bf16;  /* (bf16) */
+    uint16_t *adaln_double_txt_weight_bf16;  /* (bf16) */
+    uint16_t *adaln_single_weight_bf16;      /* (bf16) */
 
     /* Transformer blocks */
     double_block_t *double_blocks;
     single_block_t *single_blocks;
 
     /* Final layer */
-    float *final_norm_weight;       /* [hidden] */
+    float *final_norm_weight;       /* [hidden] (always f32) */
     float *final_proj_weight;       /* [latent_channels, hidden] */
+    uint16_t *final_proj_weight_bf16; /* [latent_channels, hidden] (bf16) */
 
     /* RoPE frequencies (precomputed) */
     float *rope_freqs;              /* [max_seq, head_dim/2, 2] - legacy 1D */
@@ -145,6 +211,26 @@ typedef struct flux_transformer {
     float *attn_scores;             /* [max_seq, max_seq] attention scores */
     float *attn_cat_k;              /* [max_seq, hidden] concatenated K */
     float *attn_cat_v;              /* [max_seq, hidden] concatenated V */
+
+    /* Single-block work buffers (pre-allocated to avoid malloc in hot path) */
+    float *single_q;                /* [max_seq, hidden] */
+    float *single_k;                /* [max_seq, hidden] */
+    float *single_v;                /* [max_seq, hidden] */
+    float *single_mlp_gate;         /* [max_seq, mlp_hidden] */
+    float *single_mlp_up;           /* [max_seq, mlp_hidden] */
+    float *single_attn_out;         /* [max_seq, hidden] */
+    float *single_concat;           /* [max_seq, hidden + mlp_hidden] */
+
+    /* FFN work buffers (shared by double and single blocks) */
+    float *ffn_gate;                /* [max_seq, mlp_hidden] */
+    float *ffn_up;                  /* [max_seq, mlp_hidden] */
+
+    /* Double-block work buffers */
+    float *t_emb_silu;              /* [hidden] */
+    float *double_mod_img;          /* [hidden * 6] */
+    float *double_mod_txt;          /* [hidden * 6] */
+    float *double_img_attn_out;     /* [max_seq, hidden] */
+    float *double_txt_attn_out;     /* [max_seq, hidden] */
 } flux_transformer_t;
 
 /* Forward declarations */
@@ -182,8 +268,8 @@ static void compute_rope_2d(float *cos_out, float *sin_out,
     int seq = patch_h * patch_w;
     (void)seq;  /* Unused but kept for documentation */
 
-    /* Precompute base frequencies: omega = 1 / (theta^(2d/dim)) for d = 0..15 */
-    float *base_freqs = (float *)malloc(half_axis * sizeof(float));
+    /* Precompute base frequencies on stack (axis_dim is always 32, half_axis=16) */
+    float base_freqs[16];
     for (int d = 0; d < half_axis; d++) {
         base_freqs[d] = 1.0f / powf(theta, (float)(2 * d) / (float)axis_dim);
     }
@@ -234,7 +320,6 @@ static void compute_rope_2d(float *cos_out, float *sin_out,
             }
         }
     }
-    free(base_freqs);
 }
 
 /* Apply 2D RoPE to image Q/K: x shape [seq, heads * head_dim]
@@ -275,8 +360,8 @@ static void compute_rope_text(float *cos_out, float *sin_out,
     int half_axis = axis_dim / 2;  /* 16 */
     int head_dim = axis_dim * 4;   /* 128 */
 
-    /* Precompute base frequencies */
-    float *base_freqs = (float *)malloc(half_axis * sizeof(float));
+    /* Precompute base frequencies on stack (axis_dim is always 32, half_axis=16) */
+    float base_freqs[16];
     for (int d = 0; d < half_axis; d++) {
         base_freqs[d] = 1.0f / powf(theta, (float)(2 * d) / (float)axis_dim);
     }
@@ -302,7 +387,6 @@ static void compute_rope_text(float *cos_out, float *sin_out,
             sin_p[axis_dim * 3 + d * 2 + 1] = sin_l;
         }
     }
-    free(base_freqs);
 }
 
 /* ========================================================================
@@ -327,24 +411,22 @@ static void get_timestep_embedding(float *out, float t, int dim, float max_perio
     }
 }
 
-/* Forward through time embedding MLP */
+/* Forward through time embedding MLP
+ * work: pre-allocated buffer of size hidden for intermediate result
+ */
 static void time_embed_forward(float *out, const float *t_sincos,
-                               const time_embed_t *te, int hidden) {
+                               const time_embed_t *te, int hidden, float *work) {
     /* MLP: fc1 (256->hidden) -> SiLU -> fc2 (hidden->hidden) */
     int sincos_dim = te->sincos_dim;
 
-    float *h = (float *)malloc(hidden * sizeof(float));
-
     /* fc1: [sincos_dim] -> [hidden] */
-    flux_linear_nobias(h, t_sincos, te->fc1_weight, 1, sincos_dim, hidden);
+    flux_linear_nobias(work, t_sincos, te->fc1_weight, 1, sincos_dim, hidden);
 
     /* SiLU */
-    flux_silu(h, hidden);
+    flux_silu(work, hidden);
 
     /* fc2: [hidden] -> [hidden] */
-    flux_linear_nobias(out, h, te->fc2_weight, 1, hidden, hidden);
-
-    free(h);
+    flux_linear_nobias(out, work, te->fc2_weight, 1, hidden, hidden);
 }
 
 /* ========================================================================
@@ -360,7 +442,43 @@ static void apply_adaln(float *out, const float *x,
                         int seq, int hidden, float eps) {
     /* Layer Norm (subtract mean, divide by std) + AdaLN modulation
      * Note: Flux2 uses LayerNorm with elementwise_affine=False (no learned weights)
+     * Vectorized using Accelerate framework on Apple platforms.
      */
+#if defined(__APPLE__) && defined(USE_BLAS)
+    /* Vectorized implementation using vDSP */
+    for (int s = 0; s < seq; s++) {
+        const float *x_row = x + s * hidden;
+        float *out_row = out + s * hidden;
+
+        /* Compute mean using vDSP_meanv */
+        float mean;
+        vDSP_meanv(x_row, 1, &mean, hidden);
+
+        /* Compute variance: sum((x - mean)^2) / n */
+        /* First subtract mean: temp = x - mean */
+        vDSP_vsadd(x_row, 1, &(float){-mean}, out_row, 1, hidden);
+
+        /* Then square: temp = temp^2 */
+        vDSP_vsq(out_row, 1, out_row, 1, hidden);
+
+        /* Sum the squares */
+        float var_sum;
+        vDSP_sve(out_row, 1, &var_sum, hidden);
+        float var = var_sum / hidden;
+        float std_inv = 1.0f / sqrtf(var + eps);
+
+        /* Apply normalization: out = (x - mean) * std_inv */
+        vDSP_vsadd(x_row, 1, &(float){-mean}, out_row, 1, hidden);
+        vDSP_vsmul(out_row, 1, &std_inv, out_row, 1, hidden);
+
+        /* Apply modulation: out = (1 + scale) * out + shift
+         * Could use vDSP_vma but need temp buffer; scalar loop is fast enough */
+        for (int i = 0; i < hidden; i++) {
+            out_row[i] = (1.0f + scale[i]) * out_row[i] + shift[i];
+        }
+    }
+#else
+    /* Scalar fallback */
     for (int s = 0; s < seq; s++) {
         const float *x_row = x + s * hidden;
         float *out_row = out + s * hidden;
@@ -387,13 +505,39 @@ static void apply_adaln(float *out, const float *x,
             out_row[i] = (1.0f + scale[i]) * norm + shift[i];
         }
     }
+#endif
 }
 
-/* Apply QK normalization (RMSNorm per head) */
+/* Apply QK normalization (RMSNorm per head)
+ * Vectorized using Accelerate framework on Apple platforms. */
 static void apply_qk_norm(float *q, float *k,
                           const float *q_weight, const float *k_weight,
                           int seq, int heads, int head_dim, float eps) {
-    /* Apply RMSNorm to each head of Q and K */
+#if defined(__APPLE__) && defined(USE_BLAS)
+    /* Vectorized implementation using vDSP */
+    for (int s = 0; s < seq; s++) {
+        for (int h = 0; h < heads; h++) {
+            /* Q normalization: x = x * rsqrt(mean(x^2) + eps) * weight */
+            float *qh = q + s * heads * head_dim + h * head_dim;
+            float sum_sq;
+            vDSP_svesq(qh, 1, &sum_sq, head_dim);
+            float rms_inv = 1.0f / sqrtf(sum_sq / head_dim + eps);
+
+            /* Apply: qh = qh * rms_inv * q_weight */
+            vDSP_vsmul(qh, 1, &rms_inv, qh, 1, head_dim);
+            vDSP_vmul(qh, 1, q_weight, 1, qh, 1, head_dim);
+
+            /* K normalization */
+            float *kh = k + s * heads * head_dim + h * head_dim;
+            vDSP_svesq(kh, 1, &sum_sq, head_dim);
+            rms_inv = 1.0f / sqrtf(sum_sq / head_dim + eps);
+
+            vDSP_vsmul(kh, 1, &rms_inv, kh, 1, head_dim);
+            vDSP_vmul(kh, 1, k_weight, 1, kh, 1, head_dim);
+        }
+    }
+#else
+    /* Scalar fallback */
     for (int s = 0; s < seq; s++) {
         for (int h = 0; h < heads; h++) {
             /* Q normalization */
@@ -419,6 +563,7 @@ static void apply_qk_norm(float *q, float *k,
             }
         }
     }
+#endif
 }
 
 /* ========================================================================
@@ -426,7 +571,10 @@ static void apply_qk_norm(float *q, float *k,
  * ======================================================================== */
 
 /* Multi-head self-attention */
-/* Transpose from [seq, heads, head_dim] to [heads, seq, head_dim] */
+
+#if defined(USE_METAL) || defined(USE_BLAS)
+/* Transpose from [seq, heads, head_dim] to [heads, seq, head_dim]
+ * Needed for batched attention that processes each head separately */
 static void transpose_shd_to_hsd(float *out, const float *in,
                                   int seq, int heads, int head_dim) {
     for (int s = 0; s < seq; s++) {
@@ -449,6 +597,7 @@ static void transpose_hsd_to_shd(float *out, const float *in,
         }
     }
 }
+#endif /* USE_METAL || USE_BLAS */
 
 /* Multi-head attention with BLAS optimization
  * Uses pre-allocated workspace buffers from transformer struct
@@ -458,78 +607,82 @@ static void mha_forward(float *out, const float *q, const float *k, const float 
     float scale = 1.0f / sqrtf((float)head_dim);
     (void)heads; /* hidden = heads * head_dim, but we use tf->hidden_size */
 
-    /* Use pre-allocated buffers from transformer */
-    float *q_t = tf->attn_q_t;
-    float *k_t = tf->attn_k_t;
-    float *v_t = tf->attn_v_t;
-    float *out_t = tf->attn_out_t;
-    float *scores = tf->attn_scores;
-
-    /* Transpose to [heads, seq, head_dim] for efficient BLAS operations */
-    transpose_shd_to_hsd(q_t, q, seq, tf->num_heads, head_dim);
-    transpose_shd_to_hsd(k_t, k, seq, tf->num_heads, head_dim);
-    transpose_shd_to_hsd(v_t, v, seq, tf->num_heads, head_dim);
-
-    /* Process each head with BLAS */
-    for (int h = 0; h < tf->num_heads; h++) {
-        float *qh = q_t + h * seq * head_dim;
-        float *kh = k_t + h * seq * head_dim;
-        float *vh = v_t + h * seq * head_dim;
-        float *oh = out_t + h * seq * head_dim;
-
-        /* scores = Q @ K^T using BLAS */
-        /* Q[seq, head_dim] @ K[seq, head_dim]^T = scores[seq, seq] */
-#ifdef USE_BLAS
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                    seq, seq, head_dim,
-                    scale, qh, head_dim, kh, head_dim,
-                    0.0f, scores, seq);
-#else
-        for (int i = 0; i < seq; i++) {
-            for (int j = 0; j < seq; j++) {
-                float dot = 0.0f;
-                const float *qh_row = qh + i * head_dim;
-                const float *kh_row = kh + j * head_dim;
-                for (int d = 0; d < head_dim; d++) {
-                    dot += qh_row[d] * kh_row[d];
-                }
-                scores[i * seq + j] = dot * scale;
-            }
-        }
-#endif
-
-        /* Softmax */
-        flux_softmax(scores, seq, seq);
-
-        /* out = scores @ V using BLAS */
-        /* scores[seq, seq] @ V[seq, head_dim] = out[seq, head_dim] */
-#ifdef USE_BLAS
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                    seq, head_dim, seq,
-                    1.0f, scores, seq, vh, head_dim,
-                    0.0f, oh, head_dim);
-#else
-        for (int i = 0; i < seq; i++) {
-            float *oh_row = oh + i * head_dim;
-            const float *score_row = scores + i * seq;
-            for (int d = 0; d < head_dim; d++) {
-                oh_row[d] = 0.0f;
-            }
-            for (int j = 0; j < seq; j++) {
-                float s_val = score_row[j];
-                const float *v_row = vh + j * head_dim;
-                for (int d = 0; d < head_dim; d++) {
-                    oh_row[d] += s_val * v_row[d];
-                }
-            }
-        }
-#endif
+#ifdef USE_METAL
+    /* Try fused attention kernel first - operates directly on [seq, hidden] layout
+     * This avoids CPU transpose overhead */
+    if (flux_metal_attention_fused(out, q, k, v, seq, seq, tf->num_heads, head_dim, scale)) {
+        return;  /* Success - no transpose needed */
     }
 
-    /* Transpose output back to [seq, heads, head_dim] */
-    transpose_hsd_to_shd(out, out_t, seq, tf->num_heads, head_dim);
+    /* Try GPU-accelerated batched attention when Metal is available */
+    if (flux_metal_available()) {
+        /* Use pre-allocated buffers from transformer */
+        float *q_t = tf->attn_q_t;
+        float *k_t = tf->attn_k_t;
+        float *v_t = tf->attn_v_t;
+        float *out_t = tf->attn_out_t;
+        float *scores = tf->attn_scores;
 
-    /* No free - using pre-allocated buffers */
+        /* Transpose to [heads, seq, head_dim] for GPU batched attention */
+        transpose_shd_to_hsd(q_t, q, seq, tf->num_heads, head_dim);
+        transpose_shd_to_hsd(k_t, k, seq, tf->num_heads, head_dim);
+        transpose_shd_to_hsd(v_t, v, seq, tf->num_heads, head_dim);
+
+        flux_metal_attention(out_t, q_t, k_t, v_t, scores,
+                             tf->num_heads, seq, seq, head_dim, scale);
+
+        /* Transpose output back to [seq, heads, head_dim] */
+        transpose_hsd_to_shd(out, out_t, seq, tf->num_heads, head_dim);
+        return;
+    }
+#endif
+
+    /* CPU fallback: Use BLAS-optimized attention (faster) or flash attention (memory-efficient) */
+#ifdef USE_BLAS
+    /* BLAS path: transpose + batched matrix multiply per head */
+    {
+        float *q_t = tf->attn_q_t;
+        float *k_t = tf->attn_k_t;
+        float *v_t = tf->attn_v_t;
+        float *out_t = tf->attn_out_t;
+        float *scores = tf->attn_scores;
+
+        /* Transpose to [heads, seq, head_dim] for efficient BLAS operations */
+        transpose_shd_to_hsd(q_t, q, seq, tf->num_heads, head_dim);
+        transpose_shd_to_hsd(k_t, k, seq, tf->num_heads, head_dim);
+        transpose_shd_to_hsd(v_t, v, seq, tf->num_heads, head_dim);
+
+        /* Process each head with BLAS */
+        for (int h = 0; h < tf->num_heads; h++) {
+            float *qh = q_t + h * seq * head_dim;
+            float *kh = k_t + h * seq * head_dim;
+            float *vh = v_t + h * seq * head_dim;
+            float *oh = out_t + h * seq * head_dim;
+            float *sh = scores + h * seq * seq;
+
+            /* scores = Q @ K^T using BLAS */
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        seq, seq, head_dim,
+                        scale, qh, head_dim, kh, head_dim,
+                        0.0f, sh, seq);
+
+            /* Softmax */
+            flux_softmax(sh, seq, seq);
+
+            /* out = scores @ V using BLAS */
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        seq, head_dim, seq,
+                        1.0f, sh, seq, vh, head_dim,
+                        0.0f, oh, head_dim);
+        }
+
+        /* Transpose output back to [seq, heads, head_dim] */
+        transpose_hsd_to_shd(out, out_t, seq, tf->num_heads, head_dim);
+    }
+#else
+    /* Generic fallback: Use flash attention (memory-efficient, no transpose needed) */
+    flux_flash_attention(out, q, k, v, seq, seq, tf->num_heads, head_dim, scale);
+#endif
 }
 
 /* Joint attention (for double blocks) - image and text attend to each other
@@ -556,167 +709,143 @@ static void joint_attention(float *img_out, float *txt_out,
     memcpy(cat_k + txt_seq * hidden, img_k, img_seq * hidden * sizeof(float));
     memcpy(cat_v + txt_seq * hidden, img_v, img_seq * hidden * sizeof(float));
 
-    /* Use pre-allocated buffers for transposed data
-     * Layout: attn_q_t holds [img_q_t, txt_q_t], attn_k_t holds cat_k_t, etc.
-     */
-    float *img_q_t = tf->attn_q_t;
-    float *txt_q_t = tf->attn_q_t + img_seq * hidden;  /* After img_q_t */
-    float *cat_k_t = tf->attn_k_t;
-    float *cat_v_t = tf->attn_v_t;
-    float *img_out_t = tf->attn_out_t;
-    float *txt_out_t = tf->attn_out_t + img_seq * hidden;  /* After img_out_t */
-
-    /* Transpose to [heads, seq, head_dim] for BLAS */
-    transpose_shd_to_hsd(img_q_t, img_q, img_seq, heads, head_dim);
-    transpose_shd_to_hsd(txt_q_t, txt_q, txt_seq, heads, head_dim);
-    transpose_shd_to_hsd(cat_k_t, cat_k, total_seq, heads, head_dim);
-    transpose_shd_to_hsd(cat_v_t, cat_v, total_seq, heads, head_dim);
-
-    /* Use attn_scores buffer, split for img and txt */
-    float *img_scores = tf->attn_scores;
-    float *txt_scores = tf->attn_scores + img_seq * total_seq;
-
-    for (int h = 0; h < heads; h++) {
-        float *qh_img = img_q_t + h * img_seq * head_dim;
-        float *qh_txt = txt_q_t + h * txt_seq * head_dim;
-        float *kh = cat_k_t + h * total_seq * head_dim;
-        float *vh = cat_v_t + h * total_seq * head_dim;
-        float *oh_img = img_out_t + h * img_seq * head_dim;
-        float *oh_txt = txt_out_t + h * txt_seq * head_dim;
-
-        /* Image Q @ K^T */
-#ifdef USE_BLAS
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                    img_seq, total_seq, head_dim,
-                    scale, qh_img, head_dim, kh, head_dim,
-                    0.0f, img_scores, total_seq);
-#else
-        for (int i = 0; i < img_seq; i++) {
-            for (int j = 0; j < total_seq; j++) {
-                float dot = 0.0f;
-                const float *qh_row = qh_img + i * head_dim;
-                const float *kh_row = kh + j * head_dim;
-                for (int d = 0; d < head_dim; d++) {
-                    dot += qh_row[d] * kh_row[d];
-                }
-                img_scores[i * total_seq + j] = dot * scale;
-            }
-        }
-#endif
-
-#ifdef DEBUG_ATTENTION
-        if (h == 0) {
-            fprintf(stderr, "[ATTN] Image query 0, head 0 scores:\n");
-            fprintf(stderr, "  first 5 txt keys: ");
-            for (int j = 0; j < 5; j++) fprintf(stderr, "%.6f ", img_scores[j]);
-            fprintf(stderr, "\n  first 5 img keys (pos %d): ", txt_seq);
-            for (int j = txt_seq; j < txt_seq + 5; j++) fprintf(stderr, "%.6f ", img_scores[j]);
-            fprintf(stderr, "\n");
-        }
-#endif
-
-        flux_softmax(img_scores, img_seq, total_seq);
-
-        /* Image scores @ V */
-#ifdef USE_BLAS
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                    img_seq, head_dim, total_seq,
-                    1.0f, img_scores, total_seq, vh, head_dim,
-                    0.0f, oh_img, head_dim);
-#else
-        for (int i = 0; i < img_seq; i++) {
-            float *oh_row = oh_img + i * head_dim;
-            const float *score_row = img_scores + i * total_seq;
-            for (int d = 0; d < head_dim; d++) {
-                oh_row[d] = 0.0f;
-            }
-            for (int j = 0; j < total_seq; j++) {
-                float s_val = score_row[j];
-                const float *v_row = vh + j * head_dim;
-                for (int d = 0; d < head_dim; d++) {
-                    oh_row[d] += s_val * v_row[d];
-                }
-            }
-        }
-#endif
-
-        /* Text Q @ K^T */
-#ifdef USE_BLAS
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                    txt_seq, total_seq, head_dim,
-                    scale, qh_txt, head_dim, kh, head_dim,
-                    0.0f, txt_scores, total_seq);
-#else
-        for (int i = 0; i < txt_seq; i++) {
-            for (int j = 0; j < total_seq; j++) {
-                float dot = 0.0f;
-                const float *qh_row = qh_txt + i * head_dim;
-                const float *kh_row = kh + j * head_dim;
-                for (int d = 0; d < head_dim; d++) {
-                    dot += qh_row[d] * kh_row[d];
-                }
-                txt_scores[i * total_seq + j] = dot * scale;
-            }
-        }
-#endif
-
-        flux_softmax(txt_scores, txt_seq, total_seq);
-
-        /* Text scores @ V */
-#ifdef USE_BLAS
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                    txt_seq, head_dim, total_seq,
-                    1.0f, txt_scores, total_seq, vh, head_dim,
-                    0.0f, oh_txt, head_dim);
-#else
-        for (int i = 0; i < txt_seq; i++) {
-            float *oh_row = oh_txt + i * head_dim;
-            const float *score_row = txt_scores + i * total_seq;
-            for (int d = 0; d < head_dim; d++) {
-                oh_row[d] = 0.0f;
-            }
-            for (int j = 0; j < total_seq; j++) {
-                float s_val = score_row[j];
-                const float *v_row = vh + j * head_dim;
-                for (int d = 0; d < head_dim; d++) {
-                    oh_row[d] += s_val * v_row[d];
-                }
-            }
-        }
-#endif
+#ifdef USE_METAL
+    /* Try fused attention kernel first - operates directly on [seq, hidden] layout
+     * This avoids CPU transpose overhead */
+    if (flux_metal_attention_fused(img_out, img_q, cat_k, cat_v,
+                                   img_seq, total_seq, heads, head_dim, scale) &&
+        flux_metal_attention_fused(txt_out, txt_q, cat_k, cat_v,
+                                   txt_seq, total_seq, heads, head_dim, scale)) {
+        return;  /* Success - no transpose needed */
     }
 
-    /* Transpose outputs back */
-    transpose_hsd_to_shd(img_out, img_out_t, img_seq, heads, head_dim);
-    transpose_hsd_to_shd(txt_out, txt_out_t, txt_seq, heads, head_dim);
+    /* Try GPU-accelerated batched attention when Metal is available */
+    if (flux_metal_available()) {
+        /* Use pre-allocated buffers for transposed data */
+        float *img_q_t = tf->attn_q_t;
+        float *txt_q_t = tf->attn_q_t + img_seq * hidden;
+        float *cat_k_t = tf->attn_k_t;
+        float *cat_v_t = tf->attn_v_t;
+        float *img_out_t = tf->attn_out_t;
+        float *txt_out_t = tf->attn_out_t + img_seq * hidden;
+        float *scores = tf->attn_scores;
 
-    /* No free - using pre-allocated buffers */
+        /* Transpose to [heads, seq, head_dim] for GPU batched attention */
+        transpose_shd_to_hsd(img_q_t, img_q, img_seq, heads, head_dim);
+        transpose_shd_to_hsd(txt_q_t, txt_q, txt_seq, heads, head_dim);
+        transpose_shd_to_hsd(cat_k_t, cat_k, total_seq, heads, head_dim);
+        transpose_shd_to_hsd(cat_v_t, cat_v, total_seq, heads, head_dim);
+
+        /* Image attention: img_Q @ cat_K^T, softmax, @ cat_V */
+        flux_metal_attention(img_out_t, img_q_t, cat_k_t, cat_v_t, scores,
+                             heads, img_seq, total_seq, head_dim, scale);
+        /* Text attention: txt_Q @ cat_K^T, softmax, @ cat_V */
+        flux_metal_attention(txt_out_t, txt_q_t, cat_k_t, cat_v_t, scores,
+                             heads, txt_seq, total_seq, head_dim, scale);
+
+        /* Transpose outputs back */
+        transpose_hsd_to_shd(img_out, img_out_t, img_seq, heads, head_dim);
+        transpose_hsd_to_shd(txt_out, txt_out_t, txt_seq, heads, head_dim);
+        return;
+    }
+#endif
+
+    /* CPU fallback: Use BLAS-optimized attention (faster) or flash attention (memory-efficient) */
+#ifdef USE_BLAS
+    /* BLAS path: transpose + batched matrix multiply per head */
+    {
+        float *img_q_t = tf->attn_q_t;
+        float *txt_q_t = tf->attn_q_t + img_seq * hidden;
+        float *cat_k_t = tf->attn_k_t;
+        float *cat_v_t = tf->attn_v_t;
+        float *img_out_t = tf->attn_out_t;
+        float *txt_out_t = tf->attn_out_t + img_seq * hidden;
+        float *scores = tf->attn_scores;
+
+        /* Transpose to [heads, seq, head_dim] for efficient BLAS operations */
+        transpose_shd_to_hsd(img_q_t, img_q, img_seq, heads, head_dim);
+        transpose_shd_to_hsd(txt_q_t, txt_q, txt_seq, heads, head_dim);
+        transpose_shd_to_hsd(cat_k_t, cat_k, total_seq, heads, head_dim);
+        transpose_shd_to_hsd(cat_v_t, cat_v, total_seq, heads, head_dim);
+
+        /* Process each head with BLAS */
+        for (int h = 0; h < heads; h++) {
+            float *img_qh = img_q_t + h * img_seq * head_dim;
+            float *txt_qh = txt_q_t + h * txt_seq * head_dim;
+            float *kh = cat_k_t + h * total_seq * head_dim;
+            float *vh = cat_v_t + h * total_seq * head_dim;
+            float *img_oh = img_out_t + h * img_seq * head_dim;
+            float *txt_oh = txt_out_t + h * txt_seq * head_dim;
+            float *img_sh = scores;  /* Reuse scores buffer */
+            float *txt_sh = scores + img_seq * total_seq;
+
+            /* Image attention: img_Q @ cat_K^T */
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        img_seq, total_seq, head_dim,
+                        scale, img_qh, head_dim, kh, head_dim,
+                        0.0f, img_sh, total_seq);
+            flux_softmax(img_sh, img_seq, total_seq);
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        img_seq, head_dim, total_seq,
+                        1.0f, img_sh, total_seq, vh, head_dim,
+                        0.0f, img_oh, head_dim);
+
+            /* Text attention: txt_Q @ cat_K^T */
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        txt_seq, total_seq, head_dim,
+                        scale, txt_qh, head_dim, kh, head_dim,
+                        0.0f, txt_sh, total_seq);
+            flux_softmax(txt_sh, txt_seq, total_seq);
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        txt_seq, head_dim, total_seq,
+                        1.0f, txt_sh, total_seq, vh, head_dim,
+                        0.0f, txt_oh, head_dim);
+        }
+
+        /* Transpose outputs back */
+        transpose_hsd_to_shd(img_out, img_out_t, img_seq, heads, head_dim);
+        transpose_hsd_to_shd(txt_out, txt_out_t, txt_seq, heads, head_dim);
+    }
+#else
+    /* Generic fallback: Use flash attention (memory-efficient, no transpose needed) */
+    flux_flash_attention(img_out, img_q, cat_k, cat_v,
+                         img_seq, total_seq, heads, head_dim, scale);
+    flux_flash_attention(txt_out, txt_q, cat_k, cat_v,
+                         txt_seq, total_seq, heads, head_dim, scale);
+#endif
 }
 
 /* ========================================================================
  * SwiGLU FFN
  * ======================================================================== */
 
-static void swiglu_ffn(float *out, const float *x,
-                       const float *gate_weight, const float *up_weight,
-                       const float *down_weight,
-                       int seq, int hidden, int mlp_hidden) {
-    float *gate = (float *)malloc(seq * mlp_hidden * sizeof(float));
-    float *up = (float *)malloc(seq * mlp_hidden * sizeof(float));
+/* SwiGLU FFN with optional bf16 weights - uses pre-allocated buffers from tf */
+static void swiglu_ffn_bf16(float *out, const float *x,
+                            const float *gate_weight, const float *up_weight,
+                            const float *down_weight,
+                            const uint16_t *gate_weight_bf16,
+                            const uint16_t *up_weight_bf16,
+                            const uint16_t *down_weight_bf16,
+                            int seq, int hidden, int mlp_hidden,
+                            flux_transformer_t *tf) {
+    /* Use pre-allocated FFN work buffers */
+    float *gate = tf->ffn_gate;
+    float *up = tf->ffn_up;
 
-    /* Gate and up projections */
-    flux_linear_nobias(gate, x, gate_weight, seq, hidden, mlp_hidden);
-    flux_linear_nobias(up, x, up_weight, seq, hidden, mlp_hidden);
+    /* Gate and up projections - these are independent, batch them */
+    flux_gpu_begin_batch();
+    LINEAR_BF16_OR_F32(gate, x, gate_weight, gate_weight_bf16, seq, hidden, mlp_hidden);
+    LINEAR_BF16_OR_F32(up, x, up_weight, up_weight_bf16, seq, hidden, mlp_hidden);
+    flux_gpu_end_batch();
 
     /* SiLU(gate) * up */
     flux_silu(gate, seq * mlp_hidden);
     flux_mul_inplace(gate, up, seq * mlp_hidden);
 
     /* Down projection */
-    flux_linear_nobias(out, gate, down_weight, seq, mlp_hidden, hidden);
+    LINEAR_BF16_OR_F32(out, gate, down_weight, down_weight_bf16, seq, mlp_hidden, hidden);
 
-    free(gate);
-    free(up);
+    /* No free - using pre-allocated buffers */
 }
 
 /* ========================================================================
@@ -745,15 +874,15 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
      */
     int mod_size = hidden * 6;
 
-    /* Apply SiLU to t_emb for modulation (FLUX architecture requirement) */
-    float *t_emb_silu = (float *)malloc(hidden * sizeof(float));
+    /* Apply SiLU to t_emb for modulation - use pre-allocated buffer */
+    float *t_emb_silu = tf->t_emb_silu;
     for (int i = 0; i < hidden; i++) {
         float x = t_emb[i];
         t_emb_silu[i] = x / (1.0f + expf(-x));  /* SiLU = x * sigmoid(x) */
     }
 
-    /* Image stream modulation */
-    float *img_mod = (float *)malloc(mod_size * sizeof(float));
+    /* Image stream modulation - use pre-allocated buffer */
+    float *img_mod = tf->double_mod_img;
     flux_linear_nobias(img_mod, t_emb_silu, img_adaln_weight, 1, hidden, mod_size);
 
     float *img_shift1 = img_mod;
@@ -763,11 +892,9 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
     float *img_scale2 = img_mod + hidden * 4;
     float *img_gate2 = img_mod + hidden * 5;
 
-    /* Text stream modulation */
-    float *txt_mod = (float *)malloc(mod_size * sizeof(float));
+    /* Text stream modulation - use pre-allocated buffer */
+    float *txt_mod = tf->double_mod_txt;
     flux_linear_nobias(txt_mod, t_emb_silu, txt_adaln_weight, 1, hidden, mod_size);
-
-    free(t_emb_silu);
 
     float *txt_shift1 = txt_mod;
     float *txt_scale1 = txt_mod + hidden;
@@ -793,14 +920,20 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
     }
 #endif
 
-    /* Separate Q, K, V projections (fixes interleaved output bug) */
+    /* Separate Q, K, V projections (fixes interleaved output bug)
+     * Note: These 3 projections are independent - batch them for GPU efficiency */
     float *img_q = tf->work2;
     float *img_k = img_q + img_seq * hidden;
     float *img_v = img_k + img_seq * hidden;
 
-    flux_linear_nobias(img_q, img_norm, block->img_q_weight, img_seq, hidden, hidden);
-    flux_linear_nobias(img_k, img_norm, block->img_k_weight, img_seq, hidden, hidden);
-    flux_linear_nobias(img_v, img_norm, block->img_v_weight, img_seq, hidden, hidden);
+    flux_gpu_begin_batch();
+    LINEAR_BF16_OR_F32(img_q, img_norm, block->img_q_weight, block->img_q_weight_bf16,
+                       img_seq, hidden, hidden);
+    LINEAR_BF16_OR_F32(img_k, img_norm, block->img_k_weight, block->img_k_weight_bf16,
+                       img_seq, hidden, hidden);
+    LINEAR_BF16_OR_F32(img_v, img_norm, block->img_v_weight, block->img_v_weight_bf16,
+                       img_seq, hidden, hidden);
+    flux_gpu_end_batch();
 
     /* Apply QK normalization (per-head RMSNorm) */
     apply_qk_norm(img_q, img_k, block->img_norm_q_weight, block->img_norm_k_weight,
@@ -825,14 +958,20 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
     float *txt_norm = img_norm + img_seq * hidden;
     apply_adaln(txt_norm, txt_hidden, txt_shift1, txt_scale1, txt_seq, hidden, eps);
 
-    /* Separate Q, K, V projections for text */
+    /* Separate Q, K, V projections for text
+     * Note: These 3 projections are independent - batch them for GPU efficiency */
     float *txt_q = img_v + img_seq * hidden;  /* After img_v */
     float *txt_k = txt_q + txt_seq * hidden;
     float *txt_v = txt_k + txt_seq * hidden;
 
-    flux_linear_nobias(txt_q, txt_norm, block->txt_q_weight, txt_seq, hidden, hidden);
-    flux_linear_nobias(txt_k, txt_norm, block->txt_k_weight, txt_seq, hidden, hidden);
-    flux_linear_nobias(txt_v, txt_norm, block->txt_v_weight, txt_seq, hidden, hidden);
+    flux_gpu_begin_batch();
+    LINEAR_BF16_OR_F32(txt_q, txt_norm, block->txt_q_weight, block->txt_q_weight_bf16,
+                       txt_seq, hidden, hidden);
+    LINEAR_BF16_OR_F32(txt_k, txt_norm, block->txt_k_weight, block->txt_k_weight_bf16,
+                       txt_seq, hidden, hidden);
+    LINEAR_BF16_OR_F32(txt_v, txt_norm, block->txt_v_weight, block->txt_v_weight_bf16,
+                       txt_seq, hidden, hidden);
+    flux_gpu_end_batch();
 
     /* Apply QK normalization */
     apply_qk_norm(txt_q, txt_k, block->txt_norm_q_weight, block->txt_norm_k_weight,
@@ -844,9 +983,9 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
     apply_rope_2d(txt_q, txt_rope_cos, txt_rope_sin, txt_seq, heads, head_dim, axis_dim);
     apply_rope_2d(txt_k, txt_rope_cos, txt_rope_sin, txt_seq, heads, head_dim, axis_dim);
 
-    /* Joint attention */
-    float *img_attn_out = (float *)malloc(img_seq * hidden * sizeof(float));
-    float *txt_attn_out = (float *)malloc(txt_seq * hidden * sizeof(float));
+    /* Joint attention - use pre-allocated buffers */
+    float *img_attn_out = tf->double_img_attn_out;
+    float *txt_attn_out = tf->double_txt_attn_out;
 
     joint_attention(img_attn_out, txt_attn_out,
                     img_q, img_k, img_v,
@@ -861,14 +1000,17 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
     }
 #endif
 
-    /* Project attention output */
+    /* Project attention output
+     * Note: img_proj and txt_proj are independent - batch them for GPU efficiency */
     float *img_proj = tf->work1;
     float *txt_proj = img_proj + img_seq * hidden;
 
-    flux_linear_nobias(img_proj, img_attn_out, block->img_proj_weight,
+    flux_gpu_begin_batch();
+    LINEAR_BF16_OR_F32(img_proj, img_attn_out, block->img_proj_weight, block->img_proj_weight_bf16,
                        img_seq, hidden, hidden);
-    flux_linear_nobias(txt_proj, txt_attn_out, block->txt_proj_weight,
+    LINEAR_BF16_OR_F32(txt_proj, txt_attn_out, block->txt_proj_weight, block->txt_proj_weight_bf16,
                        txt_seq, hidden, hidden);
+    flux_gpu_end_batch();
 
 #ifdef DEBUG_DOUBLE_BLOCK
     if (block_idx == 0) {
@@ -881,13 +1023,9 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
     }
 #endif
 
-    /* Apply gate and add residual */
-    for (int i = 0; i < img_seq * hidden; i++) {
-        img_hidden[i] += img_gate1[i % hidden] * img_proj[i];
-    }
-    for (int i = 0; i < txt_seq * hidden; i++) {
-        txt_hidden[i] += txt_gate1[i % hidden] * txt_proj[i];
-    }
+    /* Apply gate and add residual - use vectorized helper */
+    gated_add(img_hidden, img_gate1, img_proj, img_seq, hidden);
+    gated_add(txt_hidden, txt_gate1, txt_proj, txt_seq, hidden);
 
 #ifdef DEBUG_DOUBLE_BLOCK
     if (block_idx == 0) {
@@ -908,10 +1046,12 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
     }
 #endif
 
-    swiglu_ffn(img_proj, img_norm,
-               block->img_mlp_gate_weight, block->img_mlp_up_weight,
-               block->img_mlp_down_weight,
-               img_seq, hidden, mlp_hidden);
+    swiglu_ffn_bf16(img_proj, img_norm,
+                    block->img_mlp_gate_weight, block->img_mlp_up_weight,
+                    block->img_mlp_down_weight,
+                    block->img_mlp_gate_weight_bf16, block->img_mlp_up_weight_bf16,
+                    block->img_mlp_down_weight_bf16,
+                    img_seq, hidden, mlp_hidden, tf);
 
 #ifdef DEBUG_DOUBLE_BLOCK
     if (block_idx == 0) {
@@ -924,9 +1064,7 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
     }
 #endif
 
-    for (int i = 0; i < img_seq * hidden; i++) {
-        img_hidden[i] += img_gate2[i % hidden] * img_proj[i];
-    }
+    gated_add(img_hidden, img_gate2, img_proj, img_seq, hidden);
 
 #ifdef DEBUG_DOUBLE_BLOCK
     fprintf(stderr, "[DBL%d] After FFN residual img_hidden[0,0,:5]: ", block_idx);
@@ -936,18 +1074,15 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
 
     /* FFN for text */
     apply_adaln(txt_norm, txt_hidden, txt_shift2, txt_scale2, txt_seq, hidden, eps);
-    swiglu_ffn(txt_proj, txt_norm,
-               block->txt_mlp_gate_weight, block->txt_mlp_up_weight,
-               block->txt_mlp_down_weight,
-               txt_seq, hidden, mlp_hidden);
-    for (int i = 0; i < txt_seq * hidden; i++) {
-        txt_hidden[i] += txt_gate2[i % hidden] * txt_proj[i];
-    }
+    swiglu_ffn_bf16(txt_proj, txt_norm,
+                    block->txt_mlp_gate_weight, block->txt_mlp_up_weight,
+                    block->txt_mlp_down_weight,
+                    block->txt_mlp_gate_weight_bf16, block->txt_mlp_up_weight_bf16,
+                    block->txt_mlp_down_weight_bf16,
+                    txt_seq, hidden, mlp_hidden, tf);
+    gated_add(txt_hidden, txt_gate2, txt_proj, txt_seq, hidden);
 
-    free(img_mod);
-    free(txt_mod);
-    free(img_attn_out);
-    free(txt_attn_out);
+    /* No free - using pre-allocated buffers */
 
 #ifdef DEBUG_DOUBLE_BLOCK
     block_idx++;
@@ -957,6 +1092,186 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
 /* ========================================================================
  * Single-Stream Block (Parallel DiT)
  * ======================================================================== */
+
+#ifdef USE_METAL
+/* GPU-optimized single block forward using persistent GPU tensors
+ * Keeps activations on GPU throughout the block to minimize memory transfers.
+ * Returns 1 if GPU path was used, 0 to fall back to CPU path.
+ */
+static int single_block_forward_gpu(float *hidden, const single_block_t *block,
+                                    const float *t_emb, const float *adaln_weight,
+                                    const float *img_rope_cos, const float *img_rope_sin,
+                                    const float *txt_rope_cos, const float *txt_rope_sin,
+                                    int seq, int img_offset, flux_transformer_t *tf) {
+    /* Check if GPU tensors are available */
+    if (!flux_metal_available() || !flux_metal_shaders_available()) return 0;
+    if (block->qkv_mlp_weight_bf16 == NULL) return 0;  /* Need bf16 weights */
+
+    int h_size = tf->hidden_size;
+    int heads = tf->num_heads;
+    int head_dim = tf->head_dim;
+    int mlp_hidden = tf->mlp_hidden;
+    float eps = 1e-6f;
+    int axis_dim = 32;
+
+    /* === Phase 1: AdaLN modulation (small, keep on CPU) === */
+    int mod_size = h_size * 3;
+    float *t_emb_silu = tf->t_emb_silu;
+    for (int i = 0; i < h_size; i++) {
+        float x = t_emb[i];
+        t_emb_silu[i] = x / (1.0f + expf(-x));
+    }
+    float *mod_params = tf->work2 + tf->max_seq_len * h_size * 3;
+    flux_linear_nobias(mod_params, t_emb_silu, adaln_weight, 1, h_size, mod_size);
+
+    float *shift = mod_params;
+    float *scale = mod_params + h_size;
+    float *gate = mod_params + h_size * 2;
+
+    /* === Phase 2: Create GPU tensors and enter batch mode === */
+    flux_gpu_batch_begin();
+
+    /* Create input tensor on GPU */
+    flux_gpu_tensor_t hidden_gpu = flux_gpu_tensor_create(hidden, seq * h_size);
+    if (!hidden_gpu) {
+        flux_gpu_batch_end();
+        return 0;
+    }
+
+    /* Allocate output tensors */
+    flux_gpu_tensor_t norm_gpu = flux_gpu_tensor_alloc(seq * h_size);
+    int fused_dim = h_size * 3 + mlp_hidden * 2;
+    flux_gpu_tensor_t fused_gpu = flux_gpu_tensor_alloc(seq * fused_dim);
+    flux_gpu_tensor_t q_gpu = flux_gpu_tensor_alloc(seq * h_size);
+    flux_gpu_tensor_t k_gpu = flux_gpu_tensor_alloc(seq * h_size);
+    flux_gpu_tensor_t v_gpu = flux_gpu_tensor_alloc(seq * h_size);
+    flux_gpu_tensor_t gate_gpu = flux_gpu_tensor_alloc(seq * mlp_hidden);
+    flux_gpu_tensor_t up_gpu = flux_gpu_tensor_alloc(seq * mlp_hidden);
+    flux_gpu_tensor_t attn_out_gpu = flux_gpu_tensor_alloc(seq * h_size);
+    flux_gpu_tensor_t concat_gpu = flux_gpu_tensor_alloc(seq * (h_size + mlp_hidden));
+    flux_gpu_tensor_t proj_out_gpu = flux_gpu_tensor_alloc(seq * h_size);
+
+    if (!norm_gpu || !fused_gpu || !q_gpu || !k_gpu || !v_gpu ||
+        !gate_gpu || !up_gpu || !attn_out_gpu || !concat_gpu || !proj_out_gpu) {
+        /* Cleanup and fall back */
+        if (hidden_gpu) flux_gpu_tensor_free(hidden_gpu);
+        if (norm_gpu) flux_gpu_tensor_free(norm_gpu);
+        if (fused_gpu) flux_gpu_tensor_free(fused_gpu);
+        if (q_gpu) flux_gpu_tensor_free(q_gpu);
+        if (k_gpu) flux_gpu_tensor_free(k_gpu);
+        if (v_gpu) flux_gpu_tensor_free(v_gpu);
+        if (gate_gpu) flux_gpu_tensor_free(gate_gpu);
+        if (up_gpu) flux_gpu_tensor_free(up_gpu);
+        if (attn_out_gpu) flux_gpu_tensor_free(attn_out_gpu);
+        if (concat_gpu) flux_gpu_tensor_free(concat_gpu);
+        if (proj_out_gpu) flux_gpu_tensor_free(proj_out_gpu);
+        flux_gpu_batch_end();
+        return 0;
+    }
+
+    /* === Phase 3: AdaLN normalization on GPU === */
+    flux_gpu_adaln_norm(norm_gpu, hidden_gpu, shift, scale, seq, h_size, eps);
+
+    /* === Phase 4: Fused QKV + MLP projection on GPU === */
+    flux_gpu_tensor_t fused_result = flux_gpu_linear_bf16(norm_gpu,
+                                                          block->qkv_mlp_weight_bf16,
+                                                          seq, h_size, fused_dim);
+    if (!fused_result) {
+        /* Cleanup and fall back */
+        flux_gpu_tensor_free(hidden_gpu);
+        flux_gpu_tensor_free(norm_gpu);
+        flux_gpu_tensor_free(fused_gpu);
+        flux_gpu_tensor_free(q_gpu);
+        flux_gpu_tensor_free(k_gpu);
+        flux_gpu_tensor_free(v_gpu);
+        flux_gpu_tensor_free(gate_gpu);
+        flux_gpu_tensor_free(up_gpu);
+        flux_gpu_tensor_free(attn_out_gpu);
+        flux_gpu_tensor_free(concat_gpu);
+        flux_gpu_tensor_free(proj_out_gpu);
+        flux_gpu_batch_end();
+        return 0;
+    }
+
+    /* === Phase 5: Split fused output on GPU === */
+    flux_gpu_split_qkv_mlp(fused_result, q_gpu, k_gpu, v_gpu, gate_gpu, up_gpu,
+                           seq, h_size, mlp_hidden);
+
+    /* === Phase 6: QK RMSNorm on GPU === */
+    flux_gpu_qk_rms_norm(q_gpu, k_gpu, block->norm_q_weight, block->norm_k_weight,
+                         seq, heads, head_dim, eps);
+
+    /* === Phase 7: Apply unified RoPE on GPU (handles text+image in one call) === */
+    flux_gpu_rope_unified(q_gpu, k_gpu,
+                          txt_rope_cos, txt_rope_sin,
+                          img_rope_cos, img_rope_sin,
+                          seq, img_offset, heads, head_dim, axis_dim);
+
+    /* === Phase 8: Self-attention on GPU === */
+    float attn_scale = 1.0f / sqrtf((float)head_dim);
+    if (!flux_gpu_attention_fused(attn_out_gpu, q_gpu, k_gpu, v_gpu,
+                                  seq, seq, heads, head_dim, attn_scale)) {
+        /* Fall back to CPU attention - need to sync and copy */
+        flux_gpu_batch_end();
+        float *q_cpu = tf->single_q;
+        float *k_cpu = tf->single_k;
+        float *v_cpu = tf->single_v;
+        flux_gpu_tensor_read(q_gpu, q_cpu);
+        flux_gpu_tensor_read(k_gpu, k_cpu);
+        flux_gpu_tensor_read(v_gpu, v_cpu);
+        float *attn_out_cpu = tf->single_attn_out;
+        mha_forward(attn_out_cpu, q_cpu, k_cpu, v_cpu, seq, heads, head_dim, tf);
+        memcpy(flux_gpu_tensor_data(attn_out_gpu), attn_out_cpu, seq * h_size * sizeof(float));
+        flux_gpu_batch_begin();
+    }
+
+    /* === Phase 9: SwiGLU on GPU === */
+    flux_gpu_silu_mul(gate_gpu, up_gpu, seq * mlp_hidden);
+
+    /* === Phase 10: Concat attention + MLP outputs on GPU === */
+    flux_gpu_concat_attn_mlp(attn_out_gpu, gate_gpu, concat_gpu, seq, h_size, mlp_hidden);
+
+    /* === Phase 11: Final projection on GPU === */
+    /* Free pre-allocated tensor since linear returns a new one */
+    flux_gpu_tensor_free(proj_out_gpu);
+    proj_out_gpu = flux_gpu_linear_bf16(concat_gpu, block->proj_mlp_weight_bf16,
+                                        seq, h_size + mlp_hidden, h_size);
+    if (!proj_out_gpu) {
+        /* Fall back to CPU projection */
+        flux_gpu_batch_end();
+        float *concat_cpu = tf->single_concat;
+        flux_gpu_tensor_read(concat_gpu, concat_cpu);
+        float *proj_out_cpu = tf->work1;
+        flux_linear_nobias_bf16(proj_out_cpu, concat_cpu, block->proj_mlp_weight_bf16,
+                                seq, h_size + mlp_hidden, h_size);
+        gated_add(hidden, gate, proj_out_cpu, seq, h_size);
+        goto cleanup;
+    }
+
+    /* === Phase 12: Gated add residual on GPU === */
+    flux_gpu_gated_add(hidden_gpu, gate, proj_out_gpu, seq, h_size);
+
+    /* === Phase 13: Sync and copy result back === */
+    flux_gpu_batch_end();
+    flux_gpu_tensor_read(hidden_gpu, hidden);
+
+cleanup:
+    /* === Cleanup GPU tensors === */
+    flux_gpu_tensor_free(hidden_gpu);
+    flux_gpu_tensor_free(norm_gpu);
+    flux_gpu_tensor_free(fused_result);
+    flux_gpu_tensor_free(q_gpu);
+    flux_gpu_tensor_free(k_gpu);
+    flux_gpu_tensor_free(v_gpu);
+    flux_gpu_tensor_free(gate_gpu);
+    flux_gpu_tensor_free(up_gpu);
+    flux_gpu_tensor_free(attn_out_gpu);
+    flux_gpu_tensor_free(concat_gpu);
+    flux_gpu_tensor_free(proj_out_gpu);
+
+    return 1;  /* GPU path succeeded */
+}
+#endif /* USE_METAL */
 
 static void single_block_forward(float *hidden, const single_block_t *block,
                                  const float *t_emb, const float *adaln_weight,
@@ -979,16 +1294,16 @@ static void single_block_forward(float *hidden, const single_block_t *block,
      */
     int mod_size = h_size * 3;
 
-    /* Apply SiLU to t_emb for modulation */
-    float *t_emb_silu = (float *)malloc(h_size * sizeof(float));
+    /* Apply SiLU to t_emb for modulation - use pre-allocated buffer */
+    float *t_emb_silu = tf->t_emb_silu;
     for (int i = 0; i < h_size; i++) {
         float x = t_emb[i];
         t_emb_silu[i] = x / (1.0f + expf(-x));
     }
 
-    float *mod_params = (float *)malloc(mod_size * sizeof(float));
+    /* Use end of work2 for mod_params (3*hidden = 9216 floats, work2 has max_seq*hidden*4) */
+    float *mod_params = tf->work2 + tf->max_seq_len * h_size * 3;
     flux_linear_nobias(mod_params, t_emb_silu, adaln_weight, 1, h_size, mod_size);
-    free(t_emb_silu);
 
     float *shift = mod_params;
     float *scale = mod_params + h_size;
@@ -1004,27 +1319,26 @@ static void single_block_forward(float *hidden, const single_block_t *block,
      */
     int fused_dim = h_size * 3 + mlp_hidden * 2;
     float *fused_out = tf->work2;
-    flux_linear_nobias(fused_out, norm, block->qkv_mlp_weight, seq, h_size, fused_dim);
+    LINEAR_BF16_OR_F32(fused_out, norm, block->qkv_mlp_weight, block->qkv_mlp_weight_bf16,
+                       seq, h_size, fused_dim);
 
-    /* Split outputs: need to de-interleave from [seq, fused_dim] format
+    /* Split outputs: use pre-allocated buffers
      * Each position has [Q, K, V, gate, up] concatenated
      */
-    float *q = (float *)malloc(seq * h_size * sizeof(float));
-    float *k = (float *)malloc(seq * h_size * sizeof(float));
-    float *v = (float *)malloc(seq * h_size * sizeof(float));
-    float *mlp_gate_split = (float *)malloc(seq * mlp_hidden * sizeof(float));
-    float *mlp_up_split = (float *)malloc(seq * mlp_hidden * sizeof(float));
+    float *q = tf->single_q;
+    float *k = tf->single_k;
+    float *v = tf->single_v;
+    float *mlp_gate = tf->single_mlp_gate;
+    float *mlp_up = tf->single_mlp_up;
 
     for (int s = 0; s < seq; s++) {
         float *row = fused_out + s * fused_dim;
         memcpy(q + s * h_size, row, h_size * sizeof(float));
         memcpy(k + s * h_size, row + h_size, h_size * sizeof(float));
         memcpy(v + s * h_size, row + h_size * 2, h_size * sizeof(float));
-        memcpy(mlp_gate_split + s * mlp_hidden, row + h_size * 3, mlp_hidden * sizeof(float));
-        memcpy(mlp_up_split + s * mlp_hidden, row + h_size * 3 + mlp_hidden, mlp_hidden * sizeof(float));
+        memcpy(mlp_gate + s * mlp_hidden, row + h_size * 3, mlp_hidden * sizeof(float));
+        memcpy(mlp_up + s * mlp_hidden, row + h_size * 3 + mlp_hidden, mlp_hidden * sizeof(float));
     }
-    float *mlp_gate = mlp_gate_split;
-    float *mlp_up = mlp_up_split;
 
     /* Apply QK normalization */
     apply_qk_norm(q, k, block->norm_q_weight, block->norm_k_weight,
@@ -1047,8 +1361,8 @@ static void single_block_forward(float *hidden, const single_block_t *block,
     apply_rope_2d(img_q, img_rope_cos, img_rope_sin, img_seq, heads, head_dim, axis_dim);
     apply_rope_2d(img_k, img_rope_cos, img_rope_sin, img_seq, heads, head_dim, axis_dim);
 
-    /* Self-attention */
-    float *attn_out = (float *)malloc(seq * h_size * sizeof(float));
+    /* Self-attention - use pre-allocated buffer */
+    float *attn_out = tf->single_attn_out;
     mha_forward(attn_out, q, k, v, seq, heads, head_dim, tf);
 
     /* SwiGLU: silu(gate) * up */
@@ -1057,8 +1371,9 @@ static void single_block_forward(float *hidden, const single_block_t *block,
 
     /* Fused output projection: [attn_out, mlp_out] -> hidden
      * proj_mlp_weight: [hidden, hidden + mlp_hidden]
+     * Use pre-allocated concat buffer
      */
-    float *concat = (float *)malloc(seq * (h_size + mlp_hidden) * sizeof(float));
+    float *concat = tf->single_concat;
     for (int s = 0; s < seq; s++) {
         memcpy(concat + s * (h_size + mlp_hidden),
                attn_out + s * h_size, h_size * sizeof(float));
@@ -1067,22 +1382,13 @@ static void single_block_forward(float *hidden, const single_block_t *block,
     }
 
     float *proj_out = tf->work1;
-    flux_linear_nobias(proj_out, concat, block->proj_mlp_weight,
+    LINEAR_BF16_OR_F32(proj_out, concat, block->proj_mlp_weight, block->proj_mlp_weight_bf16,
                        seq, h_size + mlp_hidden, h_size);
 
-    /* Apply gate and add residual */
-    for (int i = 0; i < seq * h_size; i++) {
-        hidden[i] += gate[i % h_size] * proj_out[i];
-    }
+    /* Apply gate and add residual - use vectorized helper */
+    gated_add(hidden, gate, proj_out, seq, h_size);
 
-    free(mod_params);
-    free(attn_out);
-    free(concat);
-    free(q);
-    free(k);
-    free(v);
-    free(mlp_gate_split);
-    free(mlp_up_split);
+    /* No free - using pre-allocated buffers */
 }
 
 /* ========================================================================
@@ -1100,13 +1406,13 @@ float *flux_transformer_forward(flux_transformer_t *tf,
 
     /* Get timestep embedding
      * FLUX.2-klein uses 256-dim sinusoidal (128 frequencies), not hidden_size
+     * Use t_emb_silu as work buffer (it's not used until double blocks)
      */
     int sincos_dim = tf->time_embed.sincos_dim;
     float *t_emb = (float *)malloc(hidden * sizeof(float));
-    float *t_sincos = (float *)malloc(sincos_dim * sizeof(float));
+    float t_sincos[256];  /* sincos_dim is always 256 */
     get_timestep_embedding(t_sincos, timestep * 1000.0f, sincos_dim, 10000.0f);
-    time_embed_forward(t_emb, t_sincos, &tf->time_embed, hidden);
-    free(t_sincos);
+    time_embed_forward(t_emb, t_sincos, &tf->time_embed, hidden, tf->t_emb_silu);
 
     /* Compute 2D RoPE frequencies for image tokens based on actual dimensions
      * img_h, img_w are the patch grid dimensions (e.g., 4x4 for 64x64 image)
@@ -1137,13 +1443,13 @@ float *flux_transformer_forward(flux_transformer_t *tf,
 
     /* Project image latent to hidden */
     float *img_hidden = tf->img_hidden;
-    flux_linear_nobias(img_hidden, img_transposed, tf->img_in_weight,
+    LINEAR_BF16_OR_F32(img_hidden, img_transposed, tf->img_in_weight, tf->img_in_weight_bf16,
                        img_seq, tf->latent_channels, hidden);
     free(img_transposed);
 
     /* Project text embeddings to hidden */
     float *txt_hidden = tf->txt_hidden;
-    flux_linear_nobias(txt_hidden, txt_emb, tf->txt_in_weight,
+    LINEAR_BF16_OR_F32(txt_hidden, txt_emb, tf->txt_in_weight, tf->txt_in_weight_bf16,
                        txt_seq, tf->text_dim, hidden);
 
 #ifdef DEBUG_TRANSFORMER
@@ -1170,6 +1476,7 @@ float *flux_transformer_forward(flux_transformer_t *tf,
 #endif
 
     /* Double-stream blocks */
+    double double_start = tf_get_time_ms();
     for (int i = 0; i < tf->num_double_layers; i++) {
         double_block_forward(img_hidden, txt_hidden,
                              &tf->double_blocks[i],
@@ -1199,6 +1506,8 @@ float *flux_transformer_forward(flux_transformer_t *tf,
 #endif
     }
 
+    double double_time = tf_get_time_ms() - double_start;
+
     /* Concatenate text and image for single-stream blocks
      * Python uses [txt, img] order for concatenation
      */
@@ -1209,12 +1518,24 @@ float *flux_transformer_forward(flux_transformer_t *tf,
            img_seq * hidden * sizeof(float));
 
     /* Single-stream blocks */
+    double single_start = tf_get_time_ms();
     for (int i = 0; i < tf->num_single_layers; i++) {
-        single_block_forward(concat_hidden, &tf->single_blocks[i],
-                             t_emb, tf->adaln_single_weight,
-                             img_rope_cos, img_rope_sin,
-                             txt_rope_cos, txt_rope_sin,
-                             total_seq, txt_seq, tf);  /* txt_seq is the offset to image */
+#ifdef USE_METAL
+        /* Try GPU-optimized path first */
+        if (!single_block_forward_gpu(concat_hidden, &tf->single_blocks[i],
+                                      t_emb, tf->adaln_single_weight,
+                                      img_rope_cos, img_rope_sin,
+                                      txt_rope_cos, txt_rope_sin,
+                                      total_seq, txt_seq, tf))
+#endif
+        {
+            /* Fall back to CPU path */
+            single_block_forward(concat_hidden, &tf->single_blocks[i],
+                                 t_emb, tf->adaln_single_weight,
+                                 img_rope_cos, img_rope_sin,
+                                 txt_rope_cos, txt_rope_sin,
+                                 total_seq, txt_seq, tf);  /* txt_seq is the offset to image */
+        }
         if (flux_substep_callback)
             flux_substep_callback(FLUX_SUBSTEP_SINGLE_BLOCK, i, tf->num_single_layers);
 
@@ -1228,6 +1549,7 @@ float *flux_transformer_forward(flux_transformer_t *tf,
         }
 #endif
     }
+    double single_time = tf_get_time_ms() - single_start;
 
     /* Extract image hidden states (image is after text) */
     memcpy(img_hidden, concat_hidden + txt_seq * hidden, img_seq * hidden * sizeof(float));
@@ -1243,15 +1565,16 @@ float *flux_transformer_forward(flux_transformer_t *tf,
      * norm_out.linear.weight is [6144, 3072] = [shift, scale] projection
      * Apply SiLU to t_emb before modulation projection (FLUX architecture)
      */
-    float *t_emb_silu = (float *)malloc(hidden * sizeof(float));
+    double final_start = tf_get_time_ms();
+    /* Reuse pre-allocated t_emb_silu buffer */
     for (int i = 0; i < hidden; i++) {
         float x = t_emb[i];
-        t_emb_silu[i] = x / (1.0f + expf(-x));
+        tf->t_emb_silu[i] = x / (1.0f + expf(-x));
     }
 
-    float *final_mod = (float *)malloc(hidden * 2 * sizeof(float));
-    flux_linear_nobias(final_mod, t_emb_silu, tf->final_norm_weight, 1, hidden, hidden * 2);
-    free(t_emb_silu);
+    /* Reuse double_mod_img buffer for final_mod (needs hidden*2, has hidden*6) */
+    float *final_mod = tf->double_mod_img;
+    flux_linear_nobias(final_mod, tf->t_emb_silu, tf->final_norm_weight, 1, hidden, hidden * 2);
 
     /* Python: scale, shift = mod.chunk(2, dim=1) - scale is first half, shift is second half */
     float *final_scale = final_mod;
@@ -1259,10 +1582,9 @@ float *flux_transformer_forward(flux_transformer_t *tf,
 
     float *final_norm = tf->work1;
     apply_adaln(final_norm, img_hidden, final_shift, final_scale, img_seq, hidden, 1e-6f);
-    free(final_mod);
 
     float *output_nlc = (float *)malloc(img_seq * tf->latent_channels * sizeof(float));
-    flux_linear_nobias(output_nlc, final_norm, tf->final_proj_weight,
+    LINEAR_BF16_OR_F32(output_nlc, final_norm, tf->final_proj_weight, tf->final_proj_weight_bf16,
                        img_seq, hidden, tf->latent_channels);
 
     /* Transpose output from NLC [seq, channels] to NCHW [channels, h, w] format
@@ -1282,6 +1604,14 @@ float *flux_transformer_forward(flux_transformer_t *tf,
     free(img_rope_sin);
     free(txt_rope_cos);
     free(txt_rope_sin);
+
+    double final_time = tf_get_time_ms() - final_start;
+
+    /* Update global timing counters */
+    flux_timing_transformer_double += double_time;
+    flux_timing_transformer_single += single_time;
+    flux_timing_transformer_final += final_time;
+    flux_timing_transformer_total += double_time + single_time + final_time;
 
     if (flux_substep_callback)
         flux_substep_callback(FLUX_SUBSTEP_FINAL_LAYER, 0, 1);
@@ -1401,7 +1731,8 @@ flux_transformer_t *flux_transformer_load(FILE *f) {
     tf->attn_k_t = (float *)malloc(max_seq * hidden * sizeof(float));
     tf->attn_v_t = (float *)malloc(max_seq * hidden * sizeof(float));
     tf->attn_out_t = (float *)malloc(max_seq * hidden * sizeof(float));
-    tf->attn_scores = (float *)malloc(max_seq * max_seq * sizeof(float));
+    /* For GPU batched attention, need space for all heads' scores simultaneously */
+    tf->attn_scores = (float *)malloc((size_t)tf->num_heads * max_seq * max_seq * sizeof(float));
     tf->attn_cat_k = (float *)malloc(max_seq * hidden * sizeof(float));
     tf->attn_cat_v = (float *)malloc(max_seq * hidden * sizeof(float));
 
@@ -1476,6 +1807,26 @@ void flux_transformer_free(flux_transformer_t *tf) {
     free(tf->attn_cat_k);
     free(tf->attn_cat_v);
 
+    /* Free single-block work buffers */
+    free(tf->single_q);
+    free(tf->single_k);
+    free(tf->single_v);
+    free(tf->single_mlp_gate);
+    free(tf->single_mlp_up);
+    free(tf->single_attn_out);
+    free(tf->single_concat);
+
+    /* Free FFN work buffers */
+    free(tf->ffn_gate);
+    free(tf->ffn_up);
+
+    /* Free double-block work buffers */
+    free(tf->t_emb_silu);
+    free(tf->double_mod_img);
+    free(tf->double_mod_txt);
+    free(tf->double_img_attn_out);
+    free(tf->double_txt_attn_out);
+
     free(tf);
 }
 
@@ -1490,6 +1841,18 @@ static float *get_sf_tensor_tf(safetensors_file_t *sf, const char *name) {
         return NULL;
     }
     return safetensors_get_f32(sf, t);
+}
+
+/* Get tensor as bf16 (for GPU acceleration) */
+static uint16_t *get_sf_tensor_bf16(safetensors_file_t *sf, const char *name) {
+    const safetensor_t *t = safetensors_find(sf, name);
+    if (!t) {
+        return NULL;  /* Not an error - bf16 is optional */
+    }
+    if (!safetensor_is_bf16(t)) {
+        return NULL;  /* Not bf16, will use f32 version */
+    }
+    return safetensors_get_bf16(sf, t);
 }
 
 flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf) {
@@ -1516,12 +1879,26 @@ flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf) {
     tf->rope_dim = 128;
     tf->rope_theta = 2000.0f;
 
+    /* Enable bf16 mode if Metal GPU is available */
+#ifdef USE_METAL
+    tf->use_bf16 = flux_metal_available();
+    if (tf->use_bf16) {
+        printf("Using bf16 weights for GPU acceleration\n");
+    }
+#else
+    tf->use_bf16 = 0;
+#endif
+
     int h = tf->hidden_size;
     int mlp = tf->mlp_hidden;
 
     /* Input projections */
     tf->img_in_weight = get_sf_tensor_tf(sf, "x_embedder.weight");
     tf->txt_in_weight = get_sf_tensor_tf(sf, "context_embedder.weight");
+    if (tf->use_bf16) {
+        tf->img_in_weight_bf16 = get_sf_tensor_bf16(sf, "x_embedder.weight");
+        tf->txt_in_weight_bf16 = get_sf_tensor_bf16(sf, "context_embedder.weight");
+    }
 
     /* Time embedding
      * FLUX.2-klein uses 256-dim sinusoidal embedding (128 frequencies)
@@ -1540,13 +1917,21 @@ flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf) {
         "double_stream_modulation_txt.linear.weight");
     tf->adaln_single_weight = get_sf_tensor_tf(sf,
         "single_stream_modulation.linear.weight");
+    if (tf->use_bf16) {
+        tf->adaln_double_img_weight_bf16 = get_sf_tensor_bf16(sf,
+            "double_stream_modulation_img.linear.weight");
+        tf->adaln_double_txt_weight_bf16 = get_sf_tensor_bf16(sf,
+            "double_stream_modulation_txt.linear.weight");
+        tf->adaln_single_weight_bf16 = get_sf_tensor_bf16(sf,
+            "single_stream_modulation.linear.weight");
+    }
 
     /* Double blocks */
     tf->double_blocks = calloc(tf->num_double_layers, sizeof(double_block_t));
     for (int i = 0; i < tf->num_double_layers; i++) {
         double_block_t *b = &tf->double_blocks[i];
 
-        /* Image attention - QK norm weights */
+        /* Image attention - QK norm weights (always f32) */
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.norm_q.weight", i);
         b->img_norm_q_weight = get_sf_tensor_tf(sf, name);
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.norm_k.weight", i);
@@ -1555,13 +1940,17 @@ flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf) {
         /* Image Q, K, V projections (separate) */
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_q.weight", i);
         b->img_q_weight = get_sf_tensor_tf(sf, name);
+        if (tf->use_bf16) b->img_q_weight_bf16 = get_sf_tensor_bf16(sf, name);
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_k.weight", i);
         b->img_k_weight = get_sf_tensor_tf(sf, name);
+        if (tf->use_bf16) b->img_k_weight_bf16 = get_sf_tensor_bf16(sf, name);
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_v.weight", i);
         b->img_v_weight = get_sf_tensor_tf(sf, name);
+        if (tf->use_bf16) b->img_v_weight_bf16 = get_sf_tensor_bf16(sf, name);
 
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_out.0.weight", i);
         b->img_proj_weight = get_sf_tensor_tf(sf, name);
+        if (tf->use_bf16) b->img_proj_weight_bf16 = get_sf_tensor_bf16(sf, name);
 
         /* Image FFN - linear_in contains gate and up fused (18432 = 2*9216) */
         snprintf(name, sizeof(name), "transformer_blocks.%d.ff.linear_in.weight", i);
@@ -1574,11 +1963,22 @@ flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf) {
             memcpy(b->img_mlp_up_weight, ff_in + mlp * h, mlp * h * sizeof(float));
             free(ff_in);
         }
+        if (tf->use_bf16) {
+            uint16_t *ff_in_bf16 = get_sf_tensor_bf16(sf, name);
+            if (ff_in_bf16) {
+                b->img_mlp_gate_weight_bf16 = malloc(mlp * h * sizeof(uint16_t));
+                b->img_mlp_up_weight_bf16 = malloc(mlp * h * sizeof(uint16_t));
+                memcpy(b->img_mlp_gate_weight_bf16, ff_in_bf16, mlp * h * sizeof(uint16_t));
+                memcpy(b->img_mlp_up_weight_bf16, ff_in_bf16 + mlp * h, mlp * h * sizeof(uint16_t));
+                free(ff_in_bf16);
+            }
+        }
 
         snprintf(name, sizeof(name), "transformer_blocks.%d.ff.linear_out.weight", i);
         b->img_mlp_down_weight = get_sf_tensor_tf(sf, name);
+        if (tf->use_bf16) b->img_mlp_down_weight_bf16 = get_sf_tensor_bf16(sf, name);
 
-        /* Text stream - QK norm weights */
+        /* Text stream - QK norm weights (always f32) */
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.norm_added_q.weight", i);
         b->txt_norm_q_weight = get_sf_tensor_tf(sf, name);
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.norm_added_k.weight", i);
@@ -1587,13 +1987,17 @@ flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf) {
         /* Text Q, K, V projections (separate) */
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.add_q_proj.weight", i);
         b->txt_q_weight = get_sf_tensor_tf(sf, name);
+        if (tf->use_bf16) b->txt_q_weight_bf16 = get_sf_tensor_bf16(sf, name);
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.add_k_proj.weight", i);
         b->txt_k_weight = get_sf_tensor_tf(sf, name);
+        if (tf->use_bf16) b->txt_k_weight_bf16 = get_sf_tensor_bf16(sf, name);
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.add_v_proj.weight", i);
         b->txt_v_weight = get_sf_tensor_tf(sf, name);
+        if (tf->use_bf16) b->txt_v_weight_bf16 = get_sf_tensor_bf16(sf, name);
 
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_add_out.weight", i);
         b->txt_proj_weight = get_sf_tensor_tf(sf, name);
+        if (tf->use_bf16) b->txt_proj_weight_bf16 = get_sf_tensor_bf16(sf, name);
 
         snprintf(name, sizeof(name), "transformer_blocks.%d.ff_context.linear_in.weight", i);
         float *txt_ff_in = get_sf_tensor_tf(sf, name);
@@ -1604,9 +2008,20 @@ flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf) {
             memcpy(b->txt_mlp_up_weight, txt_ff_in + mlp * h, mlp * h * sizeof(float));
             free(txt_ff_in);
         }
+        if (tf->use_bf16) {
+            uint16_t *txt_ff_in_bf16 = get_sf_tensor_bf16(sf, name);
+            if (txt_ff_in_bf16) {
+                b->txt_mlp_gate_weight_bf16 = malloc(mlp * h * sizeof(uint16_t));
+                b->txt_mlp_up_weight_bf16 = malloc(mlp * h * sizeof(uint16_t));
+                memcpy(b->txt_mlp_gate_weight_bf16, txt_ff_in_bf16, mlp * h * sizeof(uint16_t));
+                memcpy(b->txt_mlp_up_weight_bf16, txt_ff_in_bf16 + mlp * h, mlp * h * sizeof(uint16_t));
+                free(txt_ff_in_bf16);
+            }
+        }
 
         snprintf(name, sizeof(name), "transformer_blocks.%d.ff_context.linear_out.weight", i);
         b->txt_mlp_down_weight = get_sf_tensor_tf(sf, name);
+        if (tf->use_bf16) b->txt_mlp_down_weight_bf16 = get_sf_tensor_bf16(sf, name);
     }
 
     /* Single blocks */
@@ -1614,22 +2029,32 @@ flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf) {
     for (int i = 0; i < tf->num_single_layers; i++) {
         single_block_t *b = &tf->single_blocks[i];
 
-        /* QK norm weights */
+        /* QK norm weights (always f32, small) */
         snprintf(name, sizeof(name), "single_transformer_blocks.%d.attn.norm_q.weight", i);
         b->norm_q_weight = get_sf_tensor_tf(sf, name);
         snprintf(name, sizeof(name), "single_transformer_blocks.%d.attn.norm_k.weight", i);
         b->norm_k_weight = get_sf_tensor_tf(sf, name);
 
+        /* Major linear weights - load bf16 version for GPU acceleration */
         snprintf(name, sizeof(name), "single_transformer_blocks.%d.attn.to_qkv_mlp_proj.weight", i);
         b->qkv_mlp_weight = get_sf_tensor_tf(sf, name);
+        if (tf->use_bf16) {
+            b->qkv_mlp_weight_bf16 = get_sf_tensor_bf16(sf, name);
+        }
 
         snprintf(name, sizeof(name), "single_transformer_blocks.%d.attn.to_out.weight", i);
         b->proj_mlp_weight = get_sf_tensor_tf(sf, name);
+        if (tf->use_bf16) {
+            b->proj_mlp_weight_bf16 = get_sf_tensor_bf16(sf, name);
+        }
     }
 
     /* Final layer */
     tf->final_norm_weight = get_sf_tensor_tf(sf, "norm_out.linear.weight");
     tf->final_proj_weight = get_sf_tensor_tf(sf, "proj_out.weight");
+    if (tf->use_bf16) {
+        tf->final_proj_weight_bf16 = get_sf_tensor_bf16(sf, "proj_out.weight");
+    }
 
     /* Precompute RoPE frequencies */
     tf->rope_freqs = malloc(tf->max_seq_len * tf->head_dim * sizeof(float));
@@ -1651,13 +2076,39 @@ flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf) {
     tf->attn_k_t = malloc(max_seq * hidden * sizeof(float));
     tf->attn_v_t = malloc(max_seq * hidden * sizeof(float));
     tf->attn_out_t = malloc(max_seq * hidden * sizeof(float));
-    tf->attn_scores = malloc(max_seq * max_seq * sizeof(float));
+    /* For GPU batched attention, need space for all heads' scores simultaneously */
+    tf->attn_scores = malloc((size_t)tf->num_heads * max_seq * max_seq * sizeof(float));
     tf->attn_cat_k = malloc(max_seq * hidden * sizeof(float));
     tf->attn_cat_v = malloc(max_seq * hidden * sizeof(float));
 
+    /* Single-block work buffers (pre-allocated to avoid malloc in hot path) */
+    tf->single_q = malloc(max_seq * hidden * sizeof(float));
+    tf->single_k = malloc(max_seq * hidden * sizeof(float));
+    tf->single_v = malloc(max_seq * hidden * sizeof(float));
+    tf->single_mlp_gate = malloc((size_t)max_seq * mlp * sizeof(float));
+    tf->single_mlp_up = malloc((size_t)max_seq * mlp * sizeof(float));
+    tf->single_attn_out = malloc(max_seq * hidden * sizeof(float));
+    tf->single_concat = malloc((size_t)max_seq * (hidden + mlp) * sizeof(float));
+
+    /* FFN work buffers (shared by double and single blocks) */
+    tf->ffn_gate = malloc((size_t)max_seq * mlp * sizeof(float));
+    tf->ffn_up = malloc((size_t)max_seq * mlp * sizeof(float));
+
+    /* Double-block work buffers */
+    tf->t_emb_silu = malloc(hidden * sizeof(float));
+    tf->double_mod_img = malloc(hidden * 6 * sizeof(float));
+    tf->double_mod_txt = malloc(hidden * 6 * sizeof(float));
+    tf->double_img_attn_out = malloc(max_seq * hidden * sizeof(float));
+    tf->double_txt_attn_out = malloc(max_seq * hidden * sizeof(float));
+
     if (!tf->img_hidden || !tf->txt_hidden || !tf->work1 || !tf->work2 ||
         !tf->attn_q_t || !tf->attn_k_t || !tf->attn_v_t || !tf->attn_out_t ||
-        !tf->attn_scores || !tf->attn_cat_k || !tf->attn_cat_v) {
+        !tf->attn_scores || !tf->attn_cat_k || !tf->attn_cat_v ||
+        !tf->single_q || !tf->single_k || !tf->single_v ||
+        !tf->single_mlp_gate || !tf->single_mlp_up || !tf->single_attn_out ||
+        !tf->single_concat || !tf->ffn_gate || !tf->ffn_up ||
+        !tf->t_emb_silu || !tf->double_mod_img || !tf->double_mod_txt ||
+        !tf->double_img_attn_out || !tf->double_txt_attn_out) {
         flux_transformer_free(tf);
         return NULL;
     }

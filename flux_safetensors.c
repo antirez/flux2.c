@@ -377,6 +377,33 @@ float *safetensors_get_f32(const safetensors_file_t *sf, const safetensor_t *t) 
     return out;
 }
 
+int safetensor_is_bf16(const safetensor_t *t) {
+    return t && t->dtype == DTYPE_BF16;
+}
+
+uint16_t *safetensors_get_bf16(const safetensors_file_t *sf, const safetensor_t *t) {
+    if (!sf || !t) return NULL;
+
+    /* Only works for BF16 tensors */
+    if (t->dtype != DTYPE_BF16) {
+        fprintf(stderr, "safetensors_get_bf16: tensor is not BF16 (dtype=%d)\n", t->dtype);
+        return NULL;
+    }
+
+    int64_t n = safetensor_numel(t);
+    if (n <= 0) return NULL;
+
+    const void *data = safetensors_data(sf, t);
+    if (!data) return NULL;
+
+    /* Allocate and copy bf16 data (already in correct format) */
+    uint16_t *out = (uint16_t *)malloc(n * sizeof(uint16_t));
+    if (!out) return NULL;
+
+    memcpy(out, data, n * sizeof(uint16_t));
+    return out;
+}
+
 void safetensor_print(const safetensor_t *t) {
     const char *dtype_names[] = {"F32", "F16", "BF16", "I32", "I64", "BOOL"};
     const char *dtype_name = t->dtype >= 0 && t->dtype <= 5 ?

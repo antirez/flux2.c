@@ -11,6 +11,28 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
+#include <sys/time.h>
+
+/* Timing utilities for performance analysis - use wall-clock time */
+static double get_time_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+}
+
+/* Cumulative timing for denoising breakdown */
+double flux_timing_transformer_total = 0.0;
+double flux_timing_transformer_double = 0.0;
+double flux_timing_transformer_single = 0.0;
+double flux_timing_transformer_final = 0.0;
+
+void flux_reset_timing(void) {
+    flux_timing_transformer_total = 0.0;
+    flux_timing_transformer_double = 0.0;
+    flux_timing_transformer_single = 0.0;
+    flux_timing_transformer_final = 0.0;
+}
 
 /* ========================================================================
  * Timestep Schedules
@@ -164,10 +186,17 @@ float *flux_sample_euler(void *transformer, void *text_encoder,
 
     int use_cfg = (guidance_scale > 1.0f && null_emb != NULL);
 
+    /* Reset timing counters */
+    flux_reset_timing();
+    double total_denoising_start = get_time_ms();
+    double step_times[64];  /* Max 64 steps */
+
     for (int step = 0; step < num_steps; step++) {
         float t_curr = schedule[step];
         float t_next = schedule[step + 1];
         float dt = t_next - t_curr;  /* Negative for denoising */
+
+        double step_start = get_time_ms();
 
         /* Notify step start */
         if (flux_step_callback)
@@ -195,10 +224,28 @@ float *flux_sample_euler(void *transformer, void *text_encoder,
 
         free(v_cond);
 
+        step_times[step] = get_time_ms() - step_start;
+
         if (progress_callback) {
             progress_callback(step + 1, num_steps);
         }
     }
+
+    /* Print timing summary */
+    double total_denoising = get_time_ms() - total_denoising_start;
+    fprintf(stderr, "\nDenoising timing breakdown:\n");
+    for (int step = 0; step < num_steps; step++) {
+        fprintf(stderr, "  Step %d: %.1f ms\n", step + 1, step_times[step]);
+    }
+    fprintf(stderr, "  Total denoising: %.1f ms (%.2f s)\n", total_denoising, total_denoising / 1000.0);
+    fprintf(stderr, "  Transformer breakdown:\n");
+    fprintf(stderr, "    Double blocks: %.1f ms (%.1f%%)\n",
+            flux_timing_transformer_double, 100.0 * flux_timing_transformer_double / flux_timing_transformer_total);
+    fprintf(stderr, "    Single blocks: %.1f ms (%.1f%%)\n",
+            flux_timing_transformer_single, 100.0 * flux_timing_transformer_single / flux_timing_transformer_total);
+    fprintf(stderr, "    Final layer:   %.1f ms (%.1f%%)\n",
+            flux_timing_transformer_final, 100.0 * flux_timing_transformer_final / flux_timing_transformer_total);
+    fprintf(stderr, "    Total:         %.1f ms\n", flux_timing_transformer_total);
 
     return z_curr;
 }

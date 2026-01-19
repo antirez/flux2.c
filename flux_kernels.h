@@ -68,6 +68,38 @@ void flux_linear(float *y, const float *x, const float *W, const float *b,
 void flux_linear_nobias(float *y, const float *x, const float *W,
                         int seq_len, int in_dim, int out_dim);
 
+/*
+ * Linear layer without bias using bf16 weights
+ * x: [seq_len, in_dim] (f32), W: [out_dim, in_dim] (bf16), y: [seq_len, out_dim] (f32)
+ * Provides 2x memory bandwidth improvement for weight-bound operations.
+ */
+void flux_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
+                             int seq_len, int in_dim, int out_dim);
+
+/* ========================================================================
+ * GPU Batch Operations
+ * These functions allow batching multiple GPU operations to reduce sync overhead.
+ * On non-GPU builds, these are no-ops.
+ * ======================================================================== */
+
+/*
+ * Begin a batch of GPU operations.
+ * Operations after this call are queued but not executed until flux_gpu_end_batch().
+ * NOTE: Only use for INDEPENDENT operations (outputs don't feed into subsequent inputs).
+ */
+void flux_gpu_begin_batch(void);
+
+/*
+ * End a batch of GPU operations.
+ * Executes all queued operations and waits for completion.
+ */
+void flux_gpu_end_batch(void);
+
+/*
+ * Check if GPU batch mode is currently active.
+ */
+int flux_gpu_in_batch(void);
+
 /* ========================================================================
  * Convolution Operations
  * ======================================================================== */
@@ -177,6 +209,20 @@ void flux_attention_masked(float *out, const float *Q, const float *K, const flo
                            const float *mask,
                            int batch, int heads, int seq_q, int seq_k, int head_dim,
                            float scale);
+
+/*
+ * Flash attention - memory-efficient tiled attention.
+ * Uses online softmax to avoid materializing O(n²) attention matrix.
+ * Memory: O(seq_q + tile_size²) instead of O(seq_q × seq_k).
+ *
+ * Works on [seq, heads*head_dim] layout (same as transformer tensors).
+ * Q: [seq_q, heads * head_dim]
+ * K: [seq_k, heads * head_dim]
+ * V: [seq_k, heads * head_dim]
+ * out: [seq_q, heads * head_dim]
+ */
+void flux_flash_attention(float *out, const float *Q, const float *K, const float *V,
+                          int seq_q, int seq_k, int heads, int head_dim, float scale);
 
 /*
  * Apply rotary position embeddings (RoPE)
