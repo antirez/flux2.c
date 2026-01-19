@@ -21,3 +21,4 @@ misc/
 *.a
 *.so
 *.dylib
+__pycache__/

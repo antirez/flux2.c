@@ -1,14 +1,22 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.9"
+# dependencies = [
+#   "huggingface_hub>=0.23",
+# ]
+# ///
 """
-Download FLUX.2-klein-4B model files from HuggingFace.
+Download FLUX.2-klein-4B model files from Hugging Face using the Python API.
+
+This script is self-contained: `uv` will provision the right Python + dependencies
+from the inline PEP 723 metadata block above.
 
 Usage:
-    python download_model.py [--output-dir DIR]
+  ./download_model.py --output-dir ./flux-klein-model
+  uv run --script download_model.py --output-dir ./flux-klein-model
 
-Requirements:
-    pip install huggingface_hub
-
-This downloads the VAE, transformer, and Qwen3 text encoder needed for inference.
+Auth:
+  If the repo requires authentication, set `HF_TOKEN` in your environment.
 """
 
 import argparse
@@ -18,28 +26,35 @@ from pathlib import Path
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Download FLUX.2-klein-4B model files from HuggingFace'
+        description="Download FLUX.2-klein-4B model files from HuggingFace"
     )
     parser.add_argument(
-        '--output-dir', '-o',
-        default='./flux-klein-model',
-        help='Output directory (default: ./flux-klein-model)'
+        "--output-dir",
+        "-o",
+        default="./flux-klein-model",
+        help="Output directory (default: ./flux-klein-model)",
+    )
+    parser.add_argument(
+        "--repo-id",
+        default="black-forest-labs/FLUX.2-klein-4B",
+        help="Hugging Face repo id (default: black-forest-labs/FLUX.2-klein-4B)",
+    )
+    parser.add_argument(
+        "--revision",
+        default=None,
+        help="Optional git revision/branch/tag to download (default: latest)",
     )
     args = parser.parse_args()
 
-    try:
-        from huggingface_hub import snapshot_download
-    except ImportError:
-        print("Error: huggingface_hub not installed")
-        print("Install with: pip install huggingface_hub")
-        return 1
+    # Hugging Face Python API (not CLI).
+    from huggingface_hub import snapshot_download
 
     output_dir = Path(args.output_dir)
 
     print("FLUX.2-klein-4B Model Downloader")
     print("================================")
     print()
-    print(f"Repository: black-forest-labs/FLUX.2-klein-4B")
+    print(f"Repository: {args.repo_id}")
     print(f"Output dir: {output_dir}")
     print()
 
@@ -61,10 +76,12 @@ def main():
 
     try:
         model_dir = snapshot_download(
-            "black-forest-labs/FLUX.2-klein-4B",
+            repo_id=args.repo_id,
+            revision=args.revision,
             local_dir=str(output_dir),
             allow_patterns=patterns,
             ignore_patterns=["*.bin", "*.pt", "*.pth"],  # Skip pytorch format
+            resume_download=True,
         )
         print()
         print("Download complete!")
@@ -94,18 +111,18 @@ def main():
             print(f"  Total:        {total_size / 1024 / 1024 / 1024:.2f} GB")
         print()
         print("Usage:")
-        print(f"  ./flux -d {output_dir} -p \"your prompt\" -o output.png")
+        print(f'  ./flux -d {output_dir} -p "your prompt" -o output.png')
         print()
 
     except Exception as e:
         print(f"Error downloading: {e}")
         print()
-        print("If you need to authenticate, run:")
-        print("  huggingface-cli login")
+        print("If you need to authenticate, set an access token:")
+        print("  export HF_TOKEN=...  (or HUGGINGFACE_HUB_TOKEN=...)")
         return 1
 
     return 0
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     sys.exit(main())
