@@ -9,9 +9,8 @@
  *   if (!ctx) { handle error }
  *
  *   flux_params params = FLUX_PARAMS_DEFAULT;
- *   flux_image *img = flux_generate(ctx, "a cat sitting on a rainbow", &params);
- *   flux_image_save(img, "output.png");
- *   flux_image_free(img);
+ *   flux_image *img = flux_generate(ctx, "a cat sitting on a rainbow",
+ * &params); flux_image_save(img, "output.png"); flux_image_free(img);
  *   flux_free(ctx);
  */
 
@@ -30,29 +29,29 @@ extern "C" {
  * ======================================================================== */
 
 /* Model architecture (klein 4B) */
-#define FLUX_HIDDEN_SIZE        3072
-#define FLUX_NUM_HEADS          24
-#define FLUX_HEAD_DIM           128
-#define FLUX_NUM_DOUBLE_LAYERS  5
-#define FLUX_NUM_SINGLE_LAYERS  20
-#define FLUX_MLP_RATIO          3.0f
-#define FLUX_TEXT_DIM           7680
-#define FLUX_LATENT_CHANNELS    128
-#define FLUX_ROPE_THETA         2000.0f
+#define FLUX_HIDDEN_SIZE 3072
+#define FLUX_NUM_HEADS 24
+#define FLUX_HEAD_DIM 128
+#define FLUX_NUM_DOUBLE_LAYERS 5
+#define FLUX_NUM_SINGLE_LAYERS 20
+#define FLUX_MLP_RATIO 3.0f
+#define FLUX_TEXT_DIM 7680
+#define FLUX_LATENT_CHANNELS 128
+#define FLUX_ROPE_THETA 2000.0f
 
 /* VAE architecture */
-#define FLUX_VAE_Z_CHANNELS     32
-#define FLUX_VAE_BASE_CH        128
-#define FLUX_VAE_CH_MULT_0      1
-#define FLUX_VAE_CH_MULT_1      2
-#define FLUX_VAE_CH_MULT_2      4
-#define FLUX_VAE_CH_MULT_3      4
-#define FLUX_VAE_NUM_RES        2
-#define FLUX_VAE_GROUPS         32
+#define FLUX_VAE_Z_CHANNELS 32
+#define FLUX_VAE_BASE_CH 128
+#define FLUX_VAE_CH_MULT_0 1
+#define FLUX_VAE_CH_MULT_1 2
+#define FLUX_VAE_CH_MULT_2 4
+#define FLUX_VAE_CH_MULT_3 4
+#define FLUX_VAE_NUM_RES 2
+#define FLUX_VAE_GROUPS 32
 
 /* Tokenizer */
-#define FLUX_MAX_SEQ_LEN        512
-#define FLUX_VOCAB_HASH_SIZE    150001
+#define FLUX_MAX_SEQ_LEN 512
+#define FLUX_VOCAB_HASH_SIZE 150001
 
 /* ========================================================================
  * Opaque Types
@@ -61,16 +60,17 @@ extern "C" {
 typedef struct flux_ctx flux_ctx;
 typedef struct flux_image flux_image;
 typedef struct flux_tokenizer flux_tokenizer;
+typedef struct flux_vae flux_vae_t;
 
 /* ========================================================================
  * Image Structure
  * ======================================================================== */
 
 struct flux_image {
-    int width;
-    int height;
-    int channels;       /* 3 for RGB, 4 for RGBA */
-    uint8_t *data;      /* Row-major, channel-interleaved */
+  int width;
+  int height;
+  int channels;  /* 3 for RGB, 4 for RGBA */
+  uint8_t *data; /* Row-major, channel-interleaved */
 };
 
 /* ========================================================================
@@ -78,16 +78,16 @@ struct flux_image {
  * ======================================================================== */
 
 typedef struct {
-    int width;              /* Output width (default: 1024) */
-    int height;             /* Output height (default: 1024) */
-    int num_steps;          /* Inference steps (default: 4 for klein) */
-    float guidance_scale;   /* CFG scale (default: 1.0 for klein) */
-    int64_t seed;           /* Random seed (-1 for random) */
-    float strength;         /* For img2img: 0.0-1.0 (default: 0.75) */
+  int width;            /* Output width (default: 1024) */
+  int height;           /* Output height (default: 1024) */
+  int num_steps;        /* Inference steps (default: 4 for klein) */
+  float guidance_scale; /* CFG scale (default: 1.0 for klein) */
+  int64_t seed;         /* Random seed (-1 for random) */
+  float strength;       /* For img2img: 0.0-1.0 (default: 0.75) */
 } flux_params;
 
 /* Default parameters */
-#define FLUX_PARAMS_DEFAULT { 256, 256, 4, 1.0f, -1, 0.75f }
+#define FLUX_PARAMS_DEFAULT {256, 256, 4, 1.0f, -1, 0.75f}
 
 /* ========================================================================
  * Core API
@@ -123,7 +123,8 @@ flux_image *flux_generate(flux_ctx *ctx, const char *prompt,
 /*
  * Image-to-image generation.
  * Takes an input image and modifies it according to the prompt.
- * strength controls how much the image changes (0.0 = no change, 1.0 = full generation).
+ * strength controls how much the image changes (0.0 = no change, 1.0 = full
+ * generation).
  */
 flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
                          const flux_image *input, const flux_params *params);
@@ -140,9 +141,9 @@ flux_image *flux_multiref(flux_ctx *ctx, const char *prompt,
  * text_emb: float array of shape [text_seq, FLUX_TEXT_DIM]
  * text_seq: number of text tokens (typically 512)
  */
-flux_image *flux_generate_with_embeddings(flux_ctx *ctx,
-                                           const float *text_emb, int text_seq,
-                                           const flux_params *params);
+flux_image *flux_generate_with_embeddings(flux_ctx *ctx, const float *text_emb,
+                                          int text_seq,
+                                          const flux_params *params);
 
 /*
  * Generate image with external embeddings and external noise.
@@ -150,10 +151,9 @@ flux_image *flux_generate_with_embeddings(flux_ctx *ctx,
  * noise: [latent_channels, height/16, width/16] in NCHW format
  * noise_size: total number of floats in noise array
  */
-flux_image *flux_generate_with_embeddings_and_noise(flux_ctx *ctx,
-                                                     const float *text_emb, int text_seq,
-                                                     const float *noise, int noise_size,
-                                                     const flux_params *params);
+flux_image *flux_generate_with_embeddings_and_noise(
+    flux_ctx *ctx, const float *text_emb, int text_seq, const float *noise,
+    int noise_size, const flux_params *params);
 
 /* ========================================================================
  * Image I/O
@@ -185,7 +185,8 @@ void flux_image_free(flux_image *img);
 /*
  * Resize image using bilinear interpolation.
  */
-flux_image *flux_image_resize(const flux_image *img, int new_width, int new_height);
+flux_image *flux_image_resize(const flux_image *img, int new_width,
+                              int new_height);
 
 /* ========================================================================
  * Utility Functions
@@ -215,14 +216,18 @@ const char *flux_get_error(void);
  * Returns latent tensor [1, 128, H/16, W/16].
  * Caller must free() the returned pointer.
  */
-float *flux_encode_image(flux_ctx *ctx, const flux_image *img,
-                         int *out_h, int *out_w);
+float *flux_encode_image(flux_ctx *ctx, const flux_image *img, int *out_h,
+                         int *out_w);
 
 /*
  * Decode latent to image using VAE decoder.
  */
-flux_image *flux_decode_latent(flux_ctx *ctx, const float *latent,
-                               int latent_h, int latent_w);
+flux_image *flux_decode_latent(flux_ctx *ctx, const float *latent, int latent_h,
+                               int latent_w);
+
+/* Decode latent - GPU Optimized (ROCm) */
+flux_image *flux_vae_decode_gpu(flux_vae_t *vae, const float *latent, int batch,
+                                int latent_h, int latent_w);
 
 /*
  * Encode text prompt to embeddings.
@@ -239,8 +244,8 @@ float *flux_encode_text(flux_ctx *ctx, const char *prompt, int *out_seq_len);
  * Returns velocity prediction.
  */
 float *flux_denoise_step(flux_ctx *ctx, const float *z, float t,
-                         const float *text_emb, int text_len,
-                         int latent_h, int latent_w);
+                         const float *text_emb, int text_len, int latent_h,
+                         int latent_w);
 
 #ifdef __cplusplus
 }

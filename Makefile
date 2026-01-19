@@ -2,8 +2,8 @@
 # Makefile
 
 CC = gcc
-CFLAGS_BASE = -Wall -Wextra -O3 -march=native -ffast-math
-LDFLAGS = -lm
+CFLAGS_BASE = -Wall -Wextra -O3 -march=native -ffast-math -fopenmp
+LDFLAGS = -lm -fopenmp
 
 # Platform detection
 UNAME_S := $(shell uname -s)
@@ -34,6 +34,9 @@ ifeq ($(UNAME_S),Darwin)
 ifeq ($(UNAME_M),arm64)
 	@echo "  make mps      - Apple Silicon with Metal GPU (fastest)"
 endif
+endif
+ifneq ($(shell command -v hipcc 2> /dev/null),)
+	@echo "  make rocm     - AMD GPU with ROCm/rocBLAS (GPU acceleration)"
 endif
 	@echo ""
 	@echo "Other targets:"
@@ -98,6 +101,36 @@ else
 mps:
 	@echo "Error: MPS backend requires macOS"
 	@exit 1
+endif
+
+# =============================================================================
+# Backend: rocm (AMD GPUs with custom CBLAS wrapper)
+# =============================================================================
+ifeq ($(shell command -v hipcc 2> /dev/null),)
+rocm:
+	@echo "Error: ROCm/hipcc not found. Install ROCm toolkit first."
+	@echo "Visit: https://rocm.docs.amd.com/en/latest/deploy/linux/quick_start.html"
+	@exit 1
+else
+ROCM_PATH ?= $(shell hipcc --version 2>/dev/null | grep -q "HIP" && echo /opt/rocm || echo "")
+ifeq ($(ROCM_PATH),)
+ROCM_PATH = /opt/rocm
+endif
+
+# Use custom CBLAS wrapper for rocBLAS
+rocm: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_ROCM -D__HIP_PLATFORM_AMD__ -I$(ROCM_PATH)/include
+rocm: LDFLAGS += -L$(ROCM_PATH)/lib -lrocblas -lamdhip64 -lm
+rocm: clean rocblas_cblas_wrapper.o flux_kernels_rocm.o $(OBJS) main.o
+	$(CC) $(CFLAGS) -o $(TARGET) rocblas_cblas_wrapper.o flux_kernels_rocm.o $(OBJS) main.o $(LDFLAGS)
+	@echo ""
+	@echo "Built with rocBLAS + custom CBLAS wrapper (GPU)"
+	@echo "ROCm path: $(ROCM_PATH)"
+
+rocblas_cblas_wrapper.o: rocblas_cblas_wrapper.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+flux_kernels_rocm.o: flux_kernels_rocm.cpp
+	hipcc -O3 -fPIC --offload-arch=native -c -o $@ $<
 endif
 
 # =============================================================================

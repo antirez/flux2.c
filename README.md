@@ -38,6 +38,7 @@ That's it. No Python runtime, no PyTorch, no CUDA toolkit required at inference 
 
 - **Zero dependencies**: Pure C implementation, works standalone. BLAS optional for ~30x speedup (Apple Accelerate on macOS, OpenBLAS on Linux)
 - **Metal GPU acceleration**: Automatic on Apple Silicon Macs
+- **ROCm GPU acceleration**: Hybrid CPU/GPU acceleration on Linux with AMD GPUs
 - **Text-to-image**: Generate images from text prompts
 - **Image-to-image**: Transform existing images guided by prompts
 - **Integrated text encoder**: Qwen3-4B encoder built-in, no external embedding computation needed
@@ -121,12 +122,14 @@ Choose a backend when building:
 make            # Show available backends
 make generic    # Pure C, no dependencies (slow)
 make blas       # BLAS acceleration (~30x faster)
+make rocm       # AMD GPU acceleration (Hybrid mode, fastest on Linux AMD)
 make mps        # Apple Silicon Metal GPU (fastest, macOS only)
 ```
 
 **Recommended:**
 - macOS Apple Silicon: `make mps`
 - macOS Intel: `make blas`
+- Linux with AMD GPU: `make rocm`
 - Linux with OpenBLAS: `make blas`
 - Linux without OpenBLAS: `make generic`
 
