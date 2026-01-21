@@ -21,6 +21,13 @@
 static id<MTLDevice> g_device = nil;
 static id<MTLCommandQueue> g_queue = nil;
 static int g_initialized = 0;
+static int g_metal_error = 0;
+static int g_metal_error_is_oom = 0;
+static char g_metal_error_msg[256];
+
+static void metal_set_error_msg(const char *where, const char *msg, int is_oom);
+static void metal_set_error(NSError *error, const char *where);
+static void metal_check_cmd(id<MTLCommandBuffer> cmdBuffer, const char *where);
 
 /* ========================================================================
  * Batch Execution State
@@ -210,7 +217,12 @@ static id<MTLBuffer> pool_get_buffer(size_t size) {
     pthread_mutex_unlock(&g_pool_mutex);
 
     /* Pool full or allocation failed - create temporary buffer */
-    return [g_device newBufferWithLength:size options:MTLResourceStorageModeShared];
+    id<MTLBuffer> buf = [g_device newBufferWithLength:size
+                                              options:MTLResourceStorageModeShared];
+    if (!buf) {
+        metal_set_error_msg(__func__, "Metal buffer allocation failed", 1);
+    }
+    return buf;
 }
 
 /* Return buffer to pool (mark as available) */
@@ -248,6 +260,93 @@ static void clear_activation_pool(void) {
     pthread_mutex_unlock(&g_pool_mutex);
 }
 
+/* ========================================================================
+ * Metal Error Reporting
+ * ======================================================================== */
+
+static void metal_set_error_msg(const char *where, const char *msg, int is_oom) {
+    if (g_metal_error) return;
+    g_metal_error = 1;
+    g_metal_error_is_oom = is_oom;
+
+    if (msg && where) {
+        snprintf(g_metal_error_msg, sizeof(g_metal_error_msg), "%s in %s", msg, where);
+    } else if (msg) {
+        snprintf(g_metal_error_msg, sizeof(g_metal_error_msg), "%s", msg);
+    } else if (where) {
+        snprintf(g_metal_error_msg, sizeof(g_metal_error_msg),
+                 "Metal command buffer failed in %s", where);
+    } else {
+        snprintf(g_metal_error_msg, sizeof(g_metal_error_msg),
+                 "Metal command buffer failed");
+    }
+
+    fprintf(stderr, "%s\n", g_metal_error_msg);
+}
+
+static void metal_set_error(NSError *error, const char *where) {
+    if (g_metal_error) return;
+    if (!error) {
+        metal_set_error_msg(where, "Metal command buffer failed", 0);
+        return;
+    }
+
+    int is_oom = 0;
+    if ([[error domain] isEqualToString:MTLCommandBufferErrorDomain] &&
+        error.code == MTLCommandBufferErrorOutOfMemory) {
+        is_oom = 1;
+    }
+
+    const char *desc = [[error localizedDescription] UTF8String];
+    if (is_oom) {
+        if (desc) {
+            snprintf(g_metal_error_msg, sizeof(g_metal_error_msg),
+                     "Metal out of memory in %s: %s", where, desc);
+        } else {
+            snprintf(g_metal_error_msg, sizeof(g_metal_error_msg),
+                     "Metal out of memory in %s", where);
+        }
+    } else if (desc) {
+        snprintf(g_metal_error_msg, sizeof(g_metal_error_msg),
+                 "Metal error in %s: %s", where, desc);
+    } else {
+        snprintf(g_metal_error_msg, sizeof(g_metal_error_msg),
+                 "Metal error in %s (code %ld)", where, (long)error.code);
+    }
+
+    g_metal_error = 1;
+    g_metal_error_is_oom = is_oom;
+    fprintf(stderr, "%s\n", g_metal_error_msg);
+}
+
+static void metal_check_cmd(id<MTLCommandBuffer> cmdBuffer, const char *where) {
+    if (!cmdBuffer || g_metal_error) return;
+    MTLCommandBufferStatus status = cmdBuffer.status;
+    if (status == MTLCommandBufferStatusError) {
+        metal_set_error(cmdBuffer.error, where);
+    } else if (status != MTLCommandBufferStatusCompleted) {
+        metal_set_error_msg(where, "Metal command buffer did not complete", 0);
+    }
+}
+
+int flux_metal_had_error(void) {
+    return g_metal_error;
+}
+
+int flux_metal_error_is_oom(void) {
+    return g_metal_error_is_oom;
+}
+
+const char *flux_metal_last_error(void) {
+    return g_metal_error_msg;
+}
+
+void flux_metal_clear_error(void) {
+    g_metal_error = 0;
+    g_metal_error_is_oom = 0;
+    g_metal_error_msg[0] = '\0';
+}
+
 
 /* ========================================================================
  * Metal Initialization
@@ -257,6 +356,8 @@ int flux_metal_init(void) {
     if (g_initialized) return 1;
 
     @autoreleasepool {
+        flux_metal_clear_error();
+
         /* Get default Metal device */
         g_device = MTLCreateSystemDefaultDevice();
         if (!g_device) {
@@ -306,6 +407,7 @@ void flux_metal_cleanup(void) {
         }
         clear_weight_cache();
         clear_activation_pool();
+        flux_metal_clear_error();
         g_queue = nil;
         g_device = nil;
         g_initialized = 0;
@@ -346,6 +448,7 @@ void flux_metal_reset(void) {
         g_pending_count = 0;
 
         /* Note: Device, queue, and pipelines are preserved */
+        flux_metal_clear_error();
     }
 }
 
@@ -389,6 +492,7 @@ void flux_metal_end_batch(void) {
         if (g_batch_cmd) {
             [g_batch_cmd commit];
             [g_batch_cmd waitUntilCompleted];
+            metal_check_cmd(g_batch_cmd, __func__);
 
             /* Copy all pending outputs back to CPU */
             for (int i = 0; i < g_pending_count; i++) {
@@ -529,6 +633,7 @@ void flux_metal_sgemm(int transpose_a, int transpose_b,
                 /* Too many pending outputs - fall back to immediate sync */
                 [cmdBuffer commit];
                 [cmdBuffer waitUntilCompleted];
+                metal_check_cmd(cmdBuffer, __func__);
                 memcpy(C, [bufferC contents], sizeC);
                 if (!bufferA_from_cache) {
                     pool_release_buffer(bufferA);
@@ -539,6 +644,7 @@ void flux_metal_sgemm(int transpose_a, int transpose_b,
             /* Not in batch mode: execute immediately */
             [cmdBuffer commit];
             [cmdBuffer waitUntilCompleted];
+            metal_check_cmd(cmdBuffer, __func__);
             memcpy(C, [bufferC contents], sizeC);
 
             /* Release pooled buffers */
@@ -760,6 +866,7 @@ void flux_metal_sgemm_bf16(int transpose_a, int transpose_b,
             } else {
                 [cmdBuffer commit];
                 [cmdBuffer waitUntilCompleted];
+                metal_check_cmd(cmdBuffer, __func__);
                 memcpy(C, [bufferC contents], sizeC);
                 if (!bufferA_from_cache) {
                     pool_release_buffer(bufferA);
@@ -769,6 +876,7 @@ void flux_metal_sgemm_bf16(int transpose_a, int transpose_b,
         } else {
             [cmdBuffer commit];
             [cmdBuffer waitUntilCompleted];
+            metal_check_cmd(cmdBuffer, __func__);
             memcpy(C, [bufferC contents], sizeC);
             pool_release_buffer(bufferA);
             pool_release_buffer(bufferC);
@@ -853,6 +961,7 @@ void flux_metal_sgemm_batch(int transpose_a, int transpose_b,
 
         [cmdBuffer commit];
         [cmdBuffer waitUntilCompleted];
+        metal_check_cmd(cmdBuffer, __func__);
 
         /* Copy results back and release buffers */
         for (int i = 0; i < batch_count; i++) {
@@ -1005,6 +1114,7 @@ void flux_metal_attention(float *out,
             /* CPU softmax fallback - sync required */
             [cmdBuffer commit];
             [cmdBuffer waitUntilCompleted];
+            metal_check_cmd(cmdBuffer, __func__);
 
             /* Copy, softmax on CPU, copy back */
             memcpy(scores_scratch, [bufScores contents], sizeScores);
@@ -1067,6 +1177,7 @@ void flux_metal_attention(float *out,
         /* Execute and copy output back to CPU */
         [cmdBuffer commit];
         [cmdBuffer waitUntilCompleted];
+        metal_check_cmd(cmdBuffer, __func__);
         memcpy(out, [bufOut contents], sizeOut);
 
         /* Release pooled buffers */
@@ -1231,6 +1342,7 @@ void flux_gpu_sync(void) {
         if (g_tensor_cmd) {
             [g_tensor_cmd commit];
             [g_tensor_cmd waitUntilCompleted];
+            metal_check_cmd(g_tensor_cmd, __func__);
             g_tensor_cmd = nil;
         }
     }
@@ -1252,6 +1364,7 @@ void flux_gpu_batch_end(void) {
         if (g_tensor_cmd) {
             [g_tensor_cmd commit];
             [g_tensor_cmd waitUntilCompleted];
+            metal_check_cmd(g_tensor_cmd, __func__);
             g_tensor_cmd = nil;
         }
         g_tensor_batch_mode = 0;
@@ -1278,6 +1391,7 @@ void flux_gpu_chain_end(void) {
         if (g_chain_cmd) {
             [g_chain_cmd commit];
             [g_chain_cmd waitUntilCompleted];
+            metal_check_cmd(g_chain_cmd, __func__);
             g_chain_cmd = nil;
         }
         g_chain_mode = 0;
@@ -1362,6 +1476,7 @@ flux_gpu_tensor_t flux_gpu_linear(flux_gpu_tensor_t x,
             /* For now, sync and add bias on CPU (can optimize later with compute shader) */
             [cmdBuffer commit];
             [cmdBuffer waitUntilCompleted];
+            metal_check_cmd(cmdBuffer, __func__);
 
             float *out_data = (float *)[out->buffer contents];
             for (int i = 0; i < seq_len; i++) {
@@ -1378,6 +1493,7 @@ flux_gpu_tensor_t flux_gpu_linear(flux_gpu_tensor_t x,
                 /* Not in batch mode - sync immediately */
                 [cmdBuffer commit];
                 [cmdBuffer waitUntilCompleted];
+                metal_check_cmd(cmdBuffer, __func__);
                 out->has_pending_work = 0;
             }
         }
@@ -1456,6 +1572,7 @@ flux_gpu_tensor_t flux_gpu_linear_bf16(flux_gpu_tensor_t x,
             /* Not in batch mode - sync immediately */
             [cmdBuffer commit];
             [cmdBuffer waitUntilCompleted];
+            metal_check_cmd(cmdBuffer, __func__);
             out->has_pending_work = 0;
         }
 
@@ -1732,6 +1849,7 @@ void flux_metal_rms_norm(float *out, const float *x, const float *weight,
         if (!g_in_batch) {
             [cmdBuffer commit];
             [cmdBuffer waitUntilCompleted];
+            metal_check_cmd(cmdBuffer, __func__);
             memcpy(out, [bufOut contents], data_size);
             pool_release_buffer(bufX);
             pool_release_buffer(bufOut);
@@ -1791,6 +1909,7 @@ void flux_metal_qk_rms_norm(float *q, float *k,
 
         [cmdBuffer commit];
         [cmdBuffer waitUntilCompleted];
+        metal_check_cmd(cmdBuffer, __func__);
 
         memcpy(q, [bufQ contents], data_size);
         memcpy(k, [bufK contents], data_size);
@@ -1846,6 +1965,7 @@ void flux_metal_adaln_norm(float *out, const float *x,
         if (!g_in_batch) {
             [cmdBuffer commit];
             [cmdBuffer waitUntilCompleted];
+            metal_check_cmd(cmdBuffer, __func__);
             memcpy(out, [bufOut contents], data_size);
             pool_release_buffer(bufX);
             pool_release_buffer(bufShift);
@@ -1893,6 +2013,7 @@ void flux_metal_silu(float *x, int n) {
         if (!g_in_batch) {
             [cmdBuffer commit];
             [cmdBuffer waitUntilCompleted];
+            metal_check_cmd(cmdBuffer, __func__);
             memcpy(x, [bufX contents], data_size);
             pool_release_buffer(bufX);
         } else {
@@ -1941,6 +2062,7 @@ void flux_metal_silu_mul(float *gate, const float *up, int n) {
         if (!g_in_batch) {
             [cmdBuffer commit];
             [cmdBuffer waitUntilCompleted];
+            metal_check_cmd(cmdBuffer, __func__);
             memcpy(gate, [bufGate contents], data_size);
             pool_release_buffer(bufGate);
             pool_release_buffer(bufUp);
@@ -1985,6 +2107,7 @@ void flux_metal_softmax(float *x, int rows, int cols) {
         if (!g_in_batch) {
             [cmdBuffer commit];
             [cmdBuffer waitUntilCompleted];
+            metal_check_cmd(cmdBuffer, __func__);
             memcpy(x, [bufX contents], data_size);
             pool_release_buffer(bufX);
         } else {
@@ -2041,6 +2164,7 @@ void flux_metal_rope_2d(float *x, const float *cos_freq, const float *sin_freq,
 
         [cmdBuffer commit];
         [cmdBuffer waitUntilCompleted];
+        metal_check_cmd(cmdBuffer, __func__);
 
         memcpy(x, [bufX contents], data_size);
 
@@ -2099,6 +2223,7 @@ void flux_gpu_adaln_norm(flux_gpu_tensor_t out, flux_gpu_tensor_t x,
         if (!g_tensor_batch_mode) {
             [cmdBuffer commit];
             [cmdBuffer waitUntilCompleted];
+            metal_check_cmd(cmdBuffer, __func__);
             out->has_pending_work = 0;
             x->has_pending_work = 0;
         }
@@ -2143,6 +2268,7 @@ void flux_gpu_qk_rms_norm(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
         if (!g_tensor_batch_mode) {
             [cmdBuffer commit];
             [cmdBuffer waitUntilCompleted];
+            metal_check_cmd(cmdBuffer, __func__);
             q->has_pending_work = 0;
             k->has_pending_work = 0;
         }
@@ -2191,6 +2317,7 @@ void flux_gpu_rope_2d(flux_gpu_tensor_t x, const float *cos_freq, const float *s
         if (!g_tensor_batch_mode) {
             [cmdBuffer commit];
             [cmdBuffer waitUntilCompleted];
+            metal_check_cmd(cmdBuffer, __func__);
             x->has_pending_work = 0;
         }
 
@@ -2279,6 +2406,7 @@ void flux_gpu_rope_unified(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
         if (!g_tensor_batch_mode) {
             [cmdBuffer commit];
             [cmdBuffer waitUntilCompleted];
+            metal_check_cmd(cmdBuffer, __func__);
             q->has_pending_work = 0;
             k->has_pending_work = 0;
         }
@@ -2315,6 +2443,7 @@ void flux_gpu_silu_mul(flux_gpu_tensor_t gate, flux_gpu_tensor_t up, int n) {
         if (!g_tensor_batch_mode) {
             [cmdBuffer commit];
             [cmdBuffer waitUntilCompleted];
+            metal_check_cmd(cmdBuffer, __func__);
             gate->has_pending_work = 0;
             up->has_pending_work = 0;
         }
@@ -2358,6 +2487,7 @@ void flux_gpu_gated_add(flux_gpu_tensor_t out, const float *gate,
         if (!g_tensor_batch_mode) {
             [cmdBuffer commit];
             [cmdBuffer waitUntilCompleted];
+            metal_check_cmd(cmdBuffer, __func__);
             out->has_pending_work = 0;
             proj->has_pending_work = 0;
         }
@@ -2405,6 +2535,7 @@ void flux_gpu_split_qkv_mlp(flux_gpu_tensor_t fused,
         if (!g_tensor_batch_mode) {
             [cmdBuffer commit];
             [cmdBuffer waitUntilCompleted];
+            metal_check_cmd(cmdBuffer, __func__);
             fused->has_pending_work = 0;
             q->has_pending_work = 0;
             k->has_pending_work = 0;
@@ -2447,6 +2578,7 @@ void flux_gpu_concat_attn_mlp(flux_gpu_tensor_t attn, flux_gpu_tensor_t mlp,
         if (!g_tensor_batch_mode) {
             [cmdBuffer commit];
             [cmdBuffer waitUntilCompleted];
+            metal_check_cmd(cmdBuffer, __func__);
             attn->has_pending_work = 0;
             mlp->has_pending_work = 0;
             out->has_pending_work = 0;
@@ -2491,6 +2623,7 @@ int flux_gpu_attention_fused(flux_gpu_tensor_t out,
         if (!g_tensor_batch_mode) {
             [cmdBuffer commit];
             [cmdBuffer waitUntilCompleted];
+            metal_check_cmd(cmdBuffer, __func__);
             out->has_pending_work = 0;
             Q->has_pending_work = 0;
             K->has_pending_work = 0;
@@ -2585,6 +2718,7 @@ int flux_metal_causal_attention(float *out,
         /* Execute and wait */
         [cmdBuffer commit];
         [cmdBuffer waitUntilCompleted];
+        metal_check_cmd(cmdBuffer, __func__);
 
         /* Copy output back to CPU */
         memcpy(out, [bufOut contents], out_size);
@@ -2668,6 +2802,7 @@ int flux_metal_attention_fused(float *out,
         /* Execute and wait */
         [cmdBuffer commit];
         [cmdBuffer waitUntilCompleted];
+        metal_check_cmd(cmdBuffer, __func__);
 
         /* Copy output back to CPU */
         memcpy(out, [bufOut contents], out_size);

@@ -40,6 +40,14 @@ void flux_metal_cleanup(void);
  */
 void flux_metal_reset(void);
 
+/*
+ * Metal error reporting (e.g., command buffer failure or OOM).
+ */
+int flux_metal_had_error(void);
+int flux_metal_error_is_oom(void);
+const char *flux_metal_last_error(void);
+void flux_metal_clear_error(void);
+
 /* Debug: Clear only specific caches (for isolating issues) */
 void flux_metal_clear_weight_cache_only(void);
 void flux_metal_clear_f16_cache_only(void);

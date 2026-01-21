@@ -105,6 +105,24 @@ static void set_error(const char *msg) {
     g_error_msg[sizeof(g_error_msg) - 1] = '\0';
 }
 
+static void set_sampling_error(void) {
+#ifdef USE_METAL
+    if (flux_metal_had_error()) {
+        const char *err = flux_metal_last_error();
+        if (err && err[0]) {
+            set_error(err);
+        } else if (flux_metal_error_is_oom()) {
+            set_error("Metal out of memory");
+        } else {
+            set_sampling_error();
+        }
+        flux_metal_clear_error();
+        return;
+    }
+#endif
+    set_sampling_error();
+}
+
 /* ========================================================================
  * Model Loading from HuggingFace-style directory with safetensors files
  * ======================================================================== */
@@ -338,7 +356,7 @@ flux_image *flux_generate(flux_ctx *ctx, const char *prompt,
     free(text_emb);
 
     if (!latent) {
-        set_error("Sampling failed");
+        set_sampling_error();
         return NULL;
     }
 
@@ -420,7 +438,7 @@ flux_image *flux_generate_with_embeddings(flux_ctx *ctx,
     free(schedule);
 
     if (!latent) {
-        set_error("Sampling failed");
+        set_sampling_error();
         return NULL;
     }
 
@@ -509,7 +527,7 @@ flux_image *flux_generate_with_embeddings_and_noise(flux_ctx *ctx,
     free(schedule);
 
     if (!latent) {
-        set_error("Sampling failed");
+        set_sampling_error();
         return NULL;
     }
 
@@ -653,7 +671,7 @@ flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
     free(text_emb);
 
     if (!latent) {
-        set_error("Sampling failed");
+        set_sampling_error();
         return NULL;
     }
 

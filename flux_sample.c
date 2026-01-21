@@ -188,6 +188,10 @@ float *flux_sample_euler(void *transformer, void *text_encoder,
 
     flux_copy(z_curr, z, latent_size);
 
+#ifdef USE_METAL
+    flux_metal_clear_error();
+#endif
+
     int use_cfg = (guidance_scale > 1.0f && null_emb != NULL);
 
     /* Reset timing counters */
@@ -209,11 +213,20 @@ float *flux_sample_euler(void *transformer, void *text_encoder,
         /* Predict velocity with conditioning */
         v_cond = flux_transformer_forward(tf, z_curr, h, w,
                                           text_emb, text_seq, t_curr);
+        if (!v_cond) {
+            free(z_curr);
+            return NULL;
+        }
 
         if (use_cfg) {
             /* Predict unconditional velocity */
             v_uncond = flux_transformer_forward(tf, z_curr, h, w,
                                                 null_emb, text_seq, t_curr);
+            if (!v_uncond) {
+                free(v_cond);
+                free(z_curr);
+                return NULL;
+            }
 
             /* CFG: v = v_uncond + scale * (v_cond - v_uncond) */
             for (int i = 0; i < latent_size; i++) {
@@ -273,6 +286,10 @@ float *flux_sample_euler_ancestral(void *transformer,
 
     flux_copy(z_curr, z, latent_size);
 
+#ifdef USE_METAL
+    flux_metal_clear_error();
+#endif
+
     for (int step = 0; step < num_steps; step++) {
         float t_curr = schedule[step];
         float t_next = schedule[step + 1];
@@ -281,6 +298,11 @@ float *flux_sample_euler_ancestral(void *transformer,
         /* Predict velocity */
         float *v = flux_transformer_forward(tf, z_curr, h, w,
                                             text_emb, text_seq, t_curr);
+        if (!v) {
+            free(noise);
+            free(z_curr);
+            return NULL;
+        }
 
         /* Euler step */
         flux_axpy(z_curr, dt, v, latent_size);
@@ -327,6 +349,10 @@ float *flux_sample_heun(void *transformer,
 
     flux_copy(z_curr, z, latent_size);
 
+#ifdef USE_METAL
+    flux_metal_clear_error();
+#endif
+
     for (int step = 0; step < num_steps; step++) {
         float t_curr = schedule[step];
         float t_next = schedule[step + 1];
@@ -335,6 +361,11 @@ float *flux_sample_heun(void *transformer,
         /* First velocity estimate */
         float *v1 = flux_transformer_forward(tf, z_curr, h, w,
                                              text_emb, text_seq, t_curr);
+        if (!v1) {
+            free(z_pred);
+            free(z_curr);
+            return NULL;
+        }
 
         /* Predict next state */
         flux_copy(z_pred, z_curr, latent_size);
@@ -344,6 +375,12 @@ float *flux_sample_heun(void *transformer,
         if (step < num_steps - 1) {
             float *v2 = flux_transformer_forward(tf, z_pred, h, w,
                                                  text_emb, text_seq, t_next);
+            if (!v2) {
+                free(v1);
+                free(z_pred);
+                free(z_curr);
+                return NULL;
+            }
 
             /* Heun correction: z_next = z_curr + dt/2 * (v1 + v2) */
             for (int i = 0; i < latent_size; i++) {

@@ -1959,6 +1959,10 @@ float *flux_transformer_forward(flux_transformer_t *tf,
      * This prevents issues where subsequent denoising steps
      * start before previous step's GPU work is fully done. */
     flux_gpu_sync();
+    if (flux_metal_had_error()) {
+        free(output);
+        return NULL;
+    }
 #endif
 
     return output;
