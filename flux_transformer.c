@@ -1429,9 +1429,8 @@ static int single_block_forward_gpu(float *hidden, const single_block_t *block,
         float x = t_emb[i];
         t_emb_silu[i] = x / (1.0f + expf(-x));
     }
-    /* mod_params goes after fused_out in work2 buffer. Must match single_block_forward. */
-    int fused_dim = h_size * 3 + mlp_hidden * 2;
-    float *mod_params = tf->work2 + seq * fused_dim;
+    /* mod_params goes at start of work2 buffer. */
+    float *mod_params = tf->work2;
     flux_linear_nobias(mod_params, t_emb_silu, adaln_weight, 1, h_size, mod_size);
 
     float *shift = mod_params;
@@ -1450,7 +1449,6 @@ static int single_block_forward_gpu(float *hidden, const single_block_t *block,
 
     /* Allocate output tensors */
     flux_gpu_tensor_t norm_gpu = flux_gpu_tensor_alloc(seq * h_size);
-    flux_gpu_tensor_t fused_gpu = flux_gpu_tensor_alloc(seq * fused_dim);
     flux_gpu_tensor_t q_gpu = flux_gpu_tensor_alloc(seq * h_size);
     flux_gpu_tensor_t k_gpu = flux_gpu_tensor_alloc(seq * h_size);
     flux_gpu_tensor_t v_gpu = flux_gpu_tensor_alloc(seq * h_size);
@@ -1460,12 +1458,11 @@ static int single_block_forward_gpu(float *hidden, const single_block_t *block,
     flux_gpu_tensor_t concat_gpu = flux_gpu_tensor_alloc(seq * (h_size + mlp_hidden));
     flux_gpu_tensor_t proj_out_gpu = flux_gpu_tensor_alloc(seq * h_size);
 
-    if (!norm_gpu || !fused_gpu || !q_gpu || !k_gpu || !v_gpu ||
+    if (!norm_gpu || !q_gpu || !k_gpu || !v_gpu ||
         !gate_gpu || !up_gpu || !attn_out_gpu || !concat_gpu || !proj_out_gpu) {
         /* Cleanup and fall back */
         if (hidden_gpu) flux_gpu_tensor_free(hidden_gpu);
         if (norm_gpu) flux_gpu_tensor_free(norm_gpu);
-        if (fused_gpu) flux_gpu_tensor_free(fused_gpu);
         if (q_gpu) flux_gpu_tensor_free(q_gpu);
         if (k_gpu) flux_gpu_tensor_free(k_gpu);
         if (v_gpu) flux_gpu_tensor_free(v_gpu);
@@ -1481,32 +1478,25 @@ static int single_block_forward_gpu(float *hidden, const single_block_t *block,
     /* === Phase 3: AdaLN normalization on GPU === */
     flux_gpu_adaln_norm(norm_gpu, hidden_gpu, shift, scale, seq, h_size, eps);
 
-    /* === Phase 4: Fused QKV + MLP projection on GPU === */
-    flux_gpu_tensor_t fused_result = flux_gpu_linear_bf16(norm_gpu,
-                                                          block->qkv_mlp_weight_bf16,
-                                                          seq, h_size, fused_dim);
-    if (!fused_result) {
-        /* Cleanup and fall back */
-        flux_gpu_tensor_free(hidden_gpu);
-        flux_gpu_tensor_free(norm_gpu);
-        flux_gpu_tensor_free(fused_gpu);
-        flux_gpu_tensor_free(q_gpu);
-        flux_gpu_tensor_free(k_gpu);
-        flux_gpu_tensor_free(v_gpu);
-        flux_gpu_tensor_free(gate_gpu);
-        flux_gpu_tensor_free(up_gpu);
-        flux_gpu_tensor_free(attn_out_gpu);
-        flux_gpu_tensor_free(concat_gpu);
-        flux_gpu_tensor_free(proj_out_gpu);
-        flux_gpu_batch_end();
-        return 0;
-    }
+    /* === Phase 4: Split QKV + MLP projection on GPU === */
+    size_t offset_k = (size_t)h_size * h_size;
+    size_t offset_v = (size_t)2 * h_size * h_size;
+    size_t offset_gate = (size_t)3 * h_size * h_size;
+    size_t offset_up = (size_t)3 * h_size * h_size + (size_t)mlp_hidden * h_size;
 
-    /* === Phase 5: Split fused output on GPU === */
-    flux_gpu_split_qkv_mlp(fused_result, q_gpu, k_gpu, v_gpu, gate_gpu, up_gpu,
-                           seq, h_size, mlp_hidden);
+    uint16_t *w_bf16 = block->qkv_mlp_weight_bf16;
 
-    /* === Phase 6: QK RMSNorm on GPU === */
+    /* Q, K, V */
+    flux_gpu_linear_bf16_to(q_gpu, norm_gpu, w_bf16, seq, h_size, h_size);
+    flux_gpu_linear_bf16_to(k_gpu, norm_gpu, w_bf16 + offset_k, seq, h_size, h_size);
+    flux_gpu_linear_bf16_to(v_gpu, norm_gpu, w_bf16 + offset_v, seq, h_size, h_size);
+
+    /* Gate and Up */
+    flux_gpu_linear_bf16_to(gate_gpu, norm_gpu, w_bf16 + offset_gate, seq, h_size, mlp_hidden);
+    flux_gpu_linear_bf16_to(up_gpu, norm_gpu, w_bf16 + offset_up, seq, h_size, mlp_hidden);
+
+    /* === Phase 5: QK RMSNorm on GPU === */
+
     flux_gpu_qk_rms_norm(q_gpu, k_gpu, block->norm_q_weight, block->norm_k_weight,
                          seq, heads, head_dim, eps);
 
@@ -1568,7 +1558,6 @@ cleanup:
     /* === Cleanup GPU tensors === */
     flux_gpu_tensor_free(hidden_gpu);
     flux_gpu_tensor_free(norm_gpu);
-    flux_gpu_tensor_free(fused_result);
     flux_gpu_tensor_free(q_gpu);
     flux_gpu_tensor_free(k_gpu);
     flux_gpu_tensor_free(v_gpu);
@@ -1594,7 +1583,6 @@ static void single_block_forward(float *hidden, const single_block_t *block,
     int heads = tf->num_heads;
     int head_dim = tf->head_dim;
     int mlp_hidden = tf->mlp_hidden;
-    int fused_dim = h_size * 3 + mlp_hidden * 2;  /* QKV + gate + up */
     int img_seq = seq - img_offset;  /* Number of image tokens */
     float eps = 1e-6f;
 
@@ -1611,9 +1599,8 @@ static void single_block_forward(float *hidden, const single_block_t *block,
         t_emb_silu[i] = x / (1.0f + expf(-x));
     }
 
-    /* Use end of work2 for mod_params (3*hidden = 9216 floats)
-     * fused_out uses seq * fused_dim floats, place mod_params after */
-    float *mod_params = tf->work2 + seq * fused_dim;
+    /* Use beginning of work2 for mod_params (3*hidden = 9216 floats) */
+    float *mod_params = tf->work2;
     flux_linear_nobias(mod_params, t_emb_silu, adaln_weight, 1, h_size, mod_size);
 
     float *shift = mod_params;
@@ -1624,16 +1611,10 @@ static void single_block_forward(float *hidden, const single_block_t *block,
     float *norm = tf->work1;
     apply_adaln(norm, hidden, shift, scale, seq, h_size, eps);
 
-    /* Fused QKV + FFN input projection
-     * Output: [seq, fused_dim] where fused_dim = [Q, K, V, gate, up]
-     * Layout per position: [3072 Q, 3072 K, 3072 V, 9216 gate, 9216 up] = 27648 total
-     */
-    float *fused_out = tf->work2;
-    LINEAR_BF16_OR_F32(fused_out, norm, block->qkv_mlp_weight, block->qkv_mlp_weight_bf16,
-                       seq, h_size, fused_dim);
-
-    /* Split outputs: use pre-allocated buffers
-     * Each position has [Q, K, V, gate, up] concatenated
+    /* Split QKV+MLP projection: Perform separate linear ops to avoid large matrix on M1
+     * Layout: Q, K, V, Gate, Up.
+     * Dimensions: Q,K,V = [h_size, h_size]. Gate,Up = [mlp_hidden, h_size].
+     * Input: norm [seq, h_size].
      */
     float *q = tf->single_q;
     float *k = tf->single_k;
@@ -1641,14 +1622,45 @@ static void single_block_forward(float *hidden, const single_block_t *block,
     float *mlp_gate = tf->single_mlp_gate;
     float *mlp_up = tf->single_mlp_up;
 
-    for (int s = 0; s < seq; s++) {
-        float *row = fused_out + s * fused_dim;
-        memcpy(q + s * h_size, row, h_size * sizeof(float));
-        memcpy(k + s * h_size, row + h_size, h_size * sizeof(float));
-        memcpy(v + s * h_size, row + h_size * 2, h_size * sizeof(float));
-        memcpy(mlp_gate + s * mlp_hidden, row + h_size * 3, mlp_hidden * sizeof(float));
-        memcpy(mlp_up + s * mlp_hidden, row + h_size * 3 + mlp_hidden, mlp_hidden * sizeof(float));
-    }
+    /* Calculate weight offsets (in elements) */
+    size_t offset_q = 0;
+    size_t offset_k = (size_t)h_size * h_size;
+    size_t offset_v = (size_t)2 * h_size * h_size;
+    size_t offset_gate = (size_t)3 * h_size * h_size;
+    size_t offset_up = (size_t)3 * h_size * h_size + (size_t)mlp_hidden * h_size;
+
+    float *w_f32 = block->qkv_mlp_weight;
+    uint16_t *w_bf16 = block->qkv_mlp_weight_bf16;
+
+    flux_metal_begin_batch();
+
+    /* Q */
+    LINEAR_BF16_OR_F32(q, norm,
+                       w_f32 ? w_f32 + offset_q : NULL,
+                       w_bf16 ? w_bf16 + offset_q : NULL,
+                       seq, h_size, h_size);
+    /* K */
+    LINEAR_BF16_OR_F32(k, norm,
+                       w_f32 ? w_f32 + offset_k : NULL,
+                       w_bf16 ? w_bf16 + offset_k : NULL,
+                       seq, h_size, h_size);
+    /* V */
+    LINEAR_BF16_OR_F32(v, norm,
+                       w_f32 ? w_f32 + offset_v : NULL,
+                       w_bf16 ? w_bf16 + offset_v : NULL,
+                       seq, h_size, h_size);
+    /* Gate */
+    LINEAR_BF16_OR_F32(mlp_gate, norm,
+                       w_f32 ? w_f32 + offset_gate : NULL,
+                       w_bf16 ? w_bf16 + offset_gate : NULL,
+                       seq, h_size, mlp_hidden);
+    /* Up */
+    LINEAR_BF16_OR_F32(mlp_up, norm,
+                       w_f32 ? w_f32 + offset_up : NULL,
+                       w_bf16 ? w_bf16 + offset_up : NULL,
+                       seq, h_size, mlp_hidden);
+
+    flux_metal_end_batch();
 
     /* Apply QK normalization */
     apply_qk_norm(q, k, block->norm_q_weight, block->norm_k_weight,
@@ -1815,6 +1827,9 @@ float *flux_transformer_forward(flux_transformer_t *tf,
         /* In mmap mode, free block weights after use */
         if (tf->use_mmap) {
             free_double_block_weights(&tf->double_blocks[i]);
+#ifdef USE_METAL
+            flux_metal_reset();
+#endif
         }
         if (flux_substep_callback)
             flux_substep_callback(FLUX_SUBSTEP_DOUBLE_BLOCK, i, tf->num_double_layers);
@@ -1873,6 +1888,9 @@ float *flux_transformer_forward(flux_transformer_t *tf,
         /* In mmap mode, free block weights after use */
         if (tf->use_mmap) {
             free_single_block_weights(&tf->single_blocks[i]);
+#ifdef USE_METAL
+            flux_metal_reset();
+#endif
         }
         if (flux_substep_callback)
             flux_substep_callback(FLUX_SUBSTEP_SINGLE_BLOCK, i, tf->num_single_layers);

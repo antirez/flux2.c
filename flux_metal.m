@@ -1518,13 +1518,21 @@ flux_gpu_tensor_t flux_gpu_linear_bf16(flux_gpu_tensor_t x,
         flux_gpu_tensor_t out = flux_gpu_tensor_alloc(out_elements);
         if (!out) return NULL;
 
+        flux_gpu_linear_bf16_to(out, x, W_bf16, seq_len, in_dim, out_dim);
+        return out;
+    }
+}
+
+void flux_gpu_linear_bf16_to(flux_gpu_tensor_t out, flux_gpu_tensor_t x,
+                             const uint16_t *W_bf16,
+                             int seq_len, int in_dim, int out_dim) {
+    if (!g_initialized || !x || !out || !W_bf16) return;
+
+    @autoreleasepool {
         /* Get cached f16 weight buffer (bf16 converted to f16) */
         size_t numW = (size_t)out_dim * in_dim;
         id<MTLBuffer> bufW = get_cached_bf16_as_f16_buffer(W_bf16, numW);
-        if (!bufW) {
-            flux_gpu_tensor_free(out);
-            return NULL;
-        }
+        if (!bufW) return;
 
         /* Create matrix descriptors
          * x: [seq_len, in_dim] (f32)
@@ -1568,20 +1576,18 @@ flux_gpu_tensor_t flux_gpu_linear_bf16(flux_gpu_tensor_t x,
         /* Mark output as having pending work */
         out->has_pending_work = 1;
 
-        if (!g_tensor_batch_mode) {
-            /* Not in batch mode - sync immediately */
+        if (!g_tensor_batch_mode && !g_chain_mode) {
+            /* Not in batch/chain mode - sync immediately */
             [cmdBuffer commit];
             [cmdBuffer waitUntilCompleted];
             metal_check_cmd(cmdBuffer, __func__);
             out->has_pending_work = 0;
         }
 
-        /* Mark input as having pending work if in batch mode */
-        if (g_tensor_batch_mode) {
+        /* Mark input as having pending work if in batch/chain mode */
+        if (g_tensor_batch_mode || g_chain_mode) {
             x->has_pending_work = 1;
         }
-
-        return out;
     }
 }
 

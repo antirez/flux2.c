@@ -212,6 +212,14 @@ flux_gpu_tensor_t flux_gpu_linear_bf16(flux_gpu_tensor_t x,
                                         int seq_len, int in_dim, int out_dim);
 
 /*
+ * Linear layer on GPU with bf16 weights into existing output tensor.
+ * out: [seq_len, out_dim] (pre-allocated)
+ */
+void flux_gpu_linear_bf16_to(flux_gpu_tensor_t out, flux_gpu_tensor_t x,
+                             const uint16_t *W_bf16,
+                             int seq_len, int in_dim, int out_dim);
+
+/*
  * Sync all pending GPU operations.
  * Call this before reading tensor data or at step boundaries.
  */
