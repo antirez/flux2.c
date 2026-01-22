@@ -24,7 +24,13 @@ That's it. No Python runtime or CUDA toolkit required at inference time.
 
 ![Woman with sunglasses](images/woman_with_sunglasses.png)
 
-*Generated with: `./flux -d flux-klein-model -p "A picture of a woman in 1960 America. Sunglasses. ASA 400 film. Black and White." -W 250 -H 250 -o /tmp/woman.png`, and later processed with image to image generation via `./flux -d flux-klein-model -i /tmp/woman.png -o /tmp/woman2.png -p "oil painting of woman with sunglasses" -v -H 256 -W 256`*
+*Generated with: `./flux -d flux-klein-model -p "A picture of a woman in 1960 America. Sunglasses. ASA 400 film. Black and White." -W 512 -H 512 -o woman.png`*
+
+### Image-to-Image Example
+
+![antirez to drawing](images/antirez_to_drawing.png)
+
+*Generated with: `./flux -i antirez.png -o antirez_to_drawing.png -p "make it a drawing" -d flux-klein-model`*
 
 ## Features
 
