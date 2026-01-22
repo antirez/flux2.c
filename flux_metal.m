@@ -526,6 +526,12 @@ void flux_metal_clear_weight_cache_only(void) {
     clear_weight_cache();
 }
 
+void flux_metal_clear_bf16_cache_only(void) {
+    if (!g_initialized) return;
+    flux_metal_sync();
+    clear_bf16_cache();
+}
+
 void flux_metal_clear_f16_cache_only(void) {
     if (!g_initialized) return;
     flux_metal_sync();

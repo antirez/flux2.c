@@ -43,6 +43,7 @@ void flux_metal_rope_cache_begin(void);
 
 /* Debug: Clear only specific caches (for isolating issues) */
 void flux_metal_clear_weight_cache_only(void);
+void flux_metal_clear_bf16_cache_only(void);
 void flux_metal_clear_f16_cache_only(void);
 void flux_metal_clear_activation_pool_only(void);
 
