@@ -133,7 +133,7 @@ static void free_scratch(void) {
  * GPU Tensor Pool - Keep activations on GPU between operations
  * ======================================================================== */
 
-#define GPU_TENSOR_POOL_SIZE 32
+#define GPU_TENSOR_POOL_SIZE 64
 
 static struct {
     float *ptr;
@@ -1078,13 +1078,25 @@ int flux_cuda_attention_t(int out_id, int q_id, int k_id, int v_id,
     size_t sz_qkv = (size_t)seq * heads * hdim * sizeof(float);
     size_t sz_scores = (size_t)heads * seq * seq * sizeof(float);
 
-    /* Allocate transposed buffers and scores */
-    float *d_qt, *d_kt, *d_vt, *d_ot, *d_scores;
-    if (cudaMalloc(&d_qt, sz_qkv) != cudaSuccess) return 0;
-    if (cudaMalloc(&d_kt, sz_qkv) != cudaSuccess) { cudaFree(d_qt); return 0; }
-    if (cudaMalloc(&d_vt, sz_qkv) != cudaSuccess) { cudaFree(d_qt); cudaFree(d_kt); return 0; }
-    if (cudaMalloc(&d_ot, sz_qkv) != cudaSuccess) { cudaFree(d_qt); cudaFree(d_kt); cudaFree(d_vt); return 0; }
-    if (cudaMalloc(&d_scores, sz_scores) != cudaSuccess) { cudaFree(d_qt); cudaFree(d_kt); cudaFree(d_vt); cudaFree(d_ot); return 0; }
+    /* Use tensor pool for transposed buffers */
+    int t_qt = flux_cuda_tensor_get(sz_qkv);
+    int t_kt = flux_cuda_tensor_get(sz_qkv);
+    int t_vt = flux_cuda_tensor_get(sz_qkv);
+    int t_ot = flux_cuda_tensor_get(sz_qkv);
+    int t_scores = flux_cuda_tensor_get(sz_scores);
+
+    if (t_qt < 0 || t_kt < 0 || t_vt < 0 || t_ot < 0 || t_scores < 0) {
+        flux_cuda_tensor_release(t_qt); flux_cuda_tensor_release(t_kt);
+        flux_cuda_tensor_release(t_vt); flux_cuda_tensor_release(t_ot);
+        flux_cuda_tensor_release(t_scores);
+        return 0;
+    }
+
+    float *d_qt = flux_cuda_tensor_ptr(t_qt);
+    float *d_kt = flux_cuda_tensor_ptr(t_kt);
+    float *d_vt = flux_cuda_tensor_ptr(t_vt);
+    float *d_ot = flux_cuda_tensor_ptr(t_ot);
+    float *d_scores = flux_cuda_tensor_ptr(t_scores);
 
     int total = seq * heads * hdim;
 
@@ -1093,50 +1105,45 @@ int flux_cuda_attention_t(int out_id, int q_id, int k_id, int v_id,
     k_transpose_shd_to_hsd<<<(total + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(d_kt, d_k, seq, heads, hdim);
     k_transpose_shd_to_hsd<<<(total + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(d_vt, d_v, seq, heads, hdim);
 
-    /* Batched GEMM: scores = Q @ K^T for all heads
-     * Q: [heads, seq, hdim], K: [heads, seq, hdim]
-     * scores: [heads, seq, seq]
-     * scores[h] = Q[h] @ K[h]^T
-     */
+    /* Batched GEMM: scores = Q @ K^T for all heads */
     float alpha = 1.0f, beta = 0.0f;
     long long strideQ = seq * hdim;
     long long strideK = seq * hdim;
     long long strideS = seq * seq;
 
     cublasSgemmStridedBatched(g_cublas,
-        CUBLAS_OP_T, CUBLAS_OP_N,  /* K^T @ Q -> need to swap for row-major */
-        seq, seq, hdim,            /* m, n, k */
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        seq, seq, hdim,
         &alpha,
-        d_kt, hdim, strideK,       /* K: [hdim, seq] after transpose */
-        d_qt, hdim, strideQ,       /* Q: [hdim, seq] after transpose */
+        d_kt, hdim, strideK,
+        d_qt, hdim, strideQ,
         &beta,
-        d_scores, seq, strideS,    /* scores: [seq, seq] */
+        d_scores, seq, strideS,
         heads);
 
     /* Softmax with scale */
     k_softmax_attention<<<heads * seq, 256, 0, g_stream>>>(d_scores, heads, seq, seq, scale);
 
-    /* Batched GEMM: out = scores @ V for all heads
-     * scores: [heads, seq, seq], V: [heads, seq, hdim]
-     * out: [heads, seq, hdim]
-     */
+    /* Batched GEMM: out = scores @ V for all heads */
     long long strideV = seq * hdim;
     long long strideO = seq * hdim;
 
     cublasSgemmStridedBatched(g_cublas,
         CUBLAS_OP_N, CUBLAS_OP_N,
-        hdim, seq, seq,            /* m, n, k */
+        hdim, seq, seq,
         &alpha,
-        d_vt, hdim, strideV,       /* V: [hdim, seq] */
-        d_scores, seq, strideS,    /* scores: [seq, seq] */
+        d_vt, hdim, strideV,
+        d_scores, seq, strideS,
         &beta,
-        d_ot, hdim, strideO,       /* out: [hdim, seq] */
+        d_ot, hdim, strideO,
         heads);
 
-    /* Transpose output back from [heads, seq, hdim] to [seq, heads, hdim] */
+    /* Transpose output back */
     k_transpose_hsd_to_shd<<<(total + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(d_out, d_ot, seq, heads, hdim);
 
-    cudaFree(d_qt); cudaFree(d_kt); cudaFree(d_vt); cudaFree(d_ot); cudaFree(d_scores);
+    flux_cuda_tensor_release(t_qt); flux_cuda_tensor_release(t_kt);
+    flux_cuda_tensor_release(t_vt); flux_cuda_tensor_release(t_ot);
+    flux_cuda_tensor_release(t_scores);
     return 1;
 }
 
@@ -1162,24 +1169,39 @@ int flux_cuda_joint_attention_t(int img_out_id, int txt_out_id,
 
     if (!d_img_q || !d_txt_q || !d_cat_k || !d_cat_v || !d_img_out || !d_txt_out) return 0;
 
-    /* Allocate transposed buffers */
+    /* Use tensor pool for transposed buffers */
     size_t sz_img_q = (size_t)img_seq * heads * hdim * sizeof(float);
     size_t sz_txt_q = (size_t)txt_seq * heads * hdim * sizeof(float);
     size_t sz_cat = (size_t)total_seq * heads * hdim * sizeof(float);
     size_t sz_img_scores = (size_t)heads * img_seq * total_seq * sizeof(float);
     size_t sz_txt_scores = (size_t)heads * txt_seq * total_seq * sizeof(float);
 
-    float *d_img_qt, *d_txt_qt, *d_cat_kt, *d_cat_vt;
-    float *d_img_ot, *d_txt_ot, *d_img_scores, *d_txt_scores;
+    int t_img_qt = flux_cuda_tensor_get(sz_img_q);
+    int t_txt_qt = flux_cuda_tensor_get(sz_txt_q);
+    int t_cat_kt = flux_cuda_tensor_get(sz_cat);
+    int t_cat_vt = flux_cuda_tensor_get(sz_cat);
+    int t_img_ot = flux_cuda_tensor_get(sz_img_q);
+    int t_txt_ot = flux_cuda_tensor_get(sz_txt_q);
+    int t_img_scores = flux_cuda_tensor_get(sz_img_scores);
+    int t_txt_scores = flux_cuda_tensor_get(sz_txt_scores);
 
-    if (cudaMalloc(&d_img_qt, sz_img_q) != cudaSuccess) return 0;
-    if (cudaMalloc(&d_txt_qt, sz_txt_q) != cudaSuccess) { cudaFree(d_img_qt); return 0; }
-    if (cudaMalloc(&d_cat_kt, sz_cat) != cudaSuccess) { cudaFree(d_img_qt); cudaFree(d_txt_qt); return 0; }
-    if (cudaMalloc(&d_cat_vt, sz_cat) != cudaSuccess) { cudaFree(d_img_qt); cudaFree(d_txt_qt); cudaFree(d_cat_kt); return 0; }
-    if (cudaMalloc(&d_img_ot, sz_img_q) != cudaSuccess) { cudaFree(d_img_qt); cudaFree(d_txt_qt); cudaFree(d_cat_kt); cudaFree(d_cat_vt); return 0; }
-    if (cudaMalloc(&d_txt_ot, sz_txt_q) != cudaSuccess) { cudaFree(d_img_qt); cudaFree(d_txt_qt); cudaFree(d_cat_kt); cudaFree(d_cat_vt); cudaFree(d_img_ot); return 0; }
-    if (cudaMalloc(&d_img_scores, sz_img_scores) != cudaSuccess) { cudaFree(d_img_qt); cudaFree(d_txt_qt); cudaFree(d_cat_kt); cudaFree(d_cat_vt); cudaFree(d_img_ot); cudaFree(d_txt_ot); return 0; }
-    if (cudaMalloc(&d_txt_scores, sz_txt_scores) != cudaSuccess) { cudaFree(d_img_qt); cudaFree(d_txt_qt); cudaFree(d_cat_kt); cudaFree(d_cat_vt); cudaFree(d_img_ot); cudaFree(d_txt_ot); cudaFree(d_img_scores); return 0; }
+    if (t_img_qt < 0 || t_txt_qt < 0 || t_cat_kt < 0 || t_cat_vt < 0 ||
+        t_img_ot < 0 || t_txt_ot < 0 || t_img_scores < 0 || t_txt_scores < 0) {
+        flux_cuda_tensor_release(t_img_qt); flux_cuda_tensor_release(t_txt_qt);
+        flux_cuda_tensor_release(t_cat_kt); flux_cuda_tensor_release(t_cat_vt);
+        flux_cuda_tensor_release(t_img_ot); flux_cuda_tensor_release(t_txt_ot);
+        flux_cuda_tensor_release(t_img_scores); flux_cuda_tensor_release(t_txt_scores);
+        return 0;
+    }
+
+    float *d_img_qt = flux_cuda_tensor_ptr(t_img_qt);
+    float *d_txt_qt = flux_cuda_tensor_ptr(t_txt_qt);
+    float *d_cat_kt = flux_cuda_tensor_ptr(t_cat_kt);
+    float *d_cat_vt = flux_cuda_tensor_ptr(t_cat_vt);
+    float *d_img_ot = flux_cuda_tensor_ptr(t_img_ot);
+    float *d_txt_ot = flux_cuda_tensor_ptr(t_txt_ot);
+    float *d_img_scores = flux_cuda_tensor_ptr(t_img_scores);
+    float *d_txt_scores = flux_cuda_tensor_ptr(t_txt_scores);
 
     /* Transpose all inputs */
     int img_total = img_seq * heads * hdim;
@@ -1247,7 +1269,9 @@ int flux_cuda_joint_attention_t(int img_out_id, int txt_out_id,
     k_transpose_hsd_to_shd<<<(img_total + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(d_img_out, d_img_ot, img_seq, heads, hdim);
     k_transpose_hsd_to_shd<<<(txt_total + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(d_txt_out, d_txt_ot, txt_seq, heads, hdim);
 
-    cudaFree(d_img_qt); cudaFree(d_txt_qt); cudaFree(d_cat_kt); cudaFree(d_cat_vt);
-    cudaFree(d_img_ot); cudaFree(d_txt_ot); cudaFree(d_img_scores); cudaFree(d_txt_scores);
+    flux_cuda_tensor_release(t_img_qt); flux_cuda_tensor_release(t_txt_qt);
+    flux_cuda_tensor_release(t_cat_kt); flux_cuda_tensor_release(t_cat_vt);
+    flux_cuda_tensor_release(t_img_ot); flux_cuda_tensor_release(t_txt_ot);
+    flux_cuda_tensor_release(t_img_scores); flux_cuda_tensor_release(t_txt_scores);
     return 1;
 }
