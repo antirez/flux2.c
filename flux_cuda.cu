@@ -961,16 +961,122 @@ void flux_cuda_rope_offset_t(int x_id, const float *cos_f, const float *sin_f,
 }
 
 /* ========================================================================
- * Attention and Conv2D - Fall back to CPU for now
+ * Conv2D with im2col + cuBLAS
  * ======================================================================== */
+
+/* im2col kernel: extract patches for convolution */
+__global__ void k_im2col(float *col, const float *in,
+                         int in_ch, int H, int W,
+                         int kH, int kW, int outH, int outW,
+                         int stride, int padding) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = in_ch * kH * kW * outH * outW;
+    if (idx >= total) return;
+
+    /* Decode index: col is [in_ch*kH*kW, outH*outW] */
+    int ow = idx % outW;
+    int oh = (idx / outW) % outH;
+    int kw = (idx / (outW * outH)) % kW;
+    int kh = (idx / (outW * outH * kW)) % kH;
+    int ic = idx / (outW * outH * kW * kH);
+
+    int ih = oh * stride - padding + kh;
+    int iw = ow * stride - padding + kw;
+
+    float val = 0.0f;
+    if (ih >= 0 && ih < H && iw >= 0 && iw < W) {
+        val = in[ic * H * W + ih * W + iw];
+    }
+
+    /* col layout: [in_ch*kH*kW, outH*outW] row-major */
+    int col_row = ic * kH * kW + kh * kW + kw;
+    int col_col = oh * outW + ow;
+    col[col_row * (outH * outW) + col_col] = val;
+}
+
+/* Add bias kernel */
+__global__ void k_add_bias_conv(float *out, const float *bias,
+                                 int out_ch, int spatial) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = out_ch * spatial;
+    if (idx >= total) return;
+
+    int oc = idx / spatial;
+    out[idx] += bias[oc];
+}
 
 int flux_cuda_conv2d(float *out, const float *in, const float *weight, const float *bias,
                      int batch, int in_ch, int out_ch, int H, int W, int kH, int kW,
                      int stride, int padding) {
-    (void)out; (void)in; (void)weight; (void)bias;
-    (void)batch; (void)in_ch; (void)out_ch; (void)H; (void)W; (void)kH; (void)kW;
-    (void)stride; (void)padding;
-    return 0;  /* Fall back to CPU */
+    if (!g_available) return 0;
+
+    int outH = (H + 2 * padding - kH) / stride + 1;
+    int outW = (W + 2 * padding - kW) / stride + 1;
+    int col_rows = in_ch * kH * kW;
+    int col_cols = outH * outW;
+
+    /* Allocate GPU buffers */
+    size_t sz_in = (size_t)in_ch * H * W * sizeof(float);
+    size_t sz_out = (size_t)out_ch * outH * outW * sizeof(float);
+    size_t sz_col = (size_t)col_rows * col_cols * sizeof(float);
+    size_t sz_weight = (size_t)out_ch * col_rows * sizeof(float);
+
+    float *d_in, *d_out, *d_col, *d_weight, *d_bias = NULL;
+    if (cudaMalloc(&d_in, sz_in) != cudaSuccess) return 0;
+    if (cudaMalloc(&d_out, sz_out) != cudaSuccess) { cudaFree(d_in); return 0; }
+    if (cudaMalloc(&d_col, sz_col) != cudaSuccess) { cudaFree(d_in); cudaFree(d_out); return 0; }
+    if (cudaMalloc(&d_weight, sz_weight) != cudaSuccess) { cudaFree(d_in); cudaFree(d_out); cudaFree(d_col); return 0; }
+    if (bias) {
+        if (cudaMalloc(&d_bias, out_ch * sizeof(float)) != cudaSuccess) {
+            cudaFree(d_in); cudaFree(d_out); cudaFree(d_col); cudaFree(d_weight);
+            return 0;
+        }
+        cudaMemcpy(d_bias, bias, out_ch * sizeof(float), cudaMemcpyHostToDevice);
+    }
+
+    /* Upload weight once (same for all batches) */
+    cudaMemcpy(d_weight, weight, sz_weight, cudaMemcpyHostToDevice);
+
+    for (int b = 0; b < batch; b++) {
+        const float *in_b = in + b * in_ch * H * W;
+        float *out_b = out + b * out_ch * outH * outW;
+
+        /* Upload input */
+        cudaMemcpy(d_in, in_b, sz_in, cudaMemcpyHostToDevice);
+
+        /* im2col */
+        int total_col = in_ch * kH * kW * outH * outW;
+        k_im2col<<<(total_col + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(
+            d_col, d_in, in_ch, H, W, kH, kW, outH, outW, stride, padding);
+
+        /* GEMM: out = weight @ col
+         * weight: [out_ch, col_rows], col: [col_rows, col_cols]
+         * out: [out_ch, col_cols] = [out_ch, outH*outW]
+         */
+        float alpha = 1.0f, beta = 0.0f;
+        cublasSgemm(g_cublas,
+                    CUBLAS_OP_N, CUBLAS_OP_N,
+                    col_cols, out_ch, col_rows,  /* m, n, k for col-major */
+                    &alpha,
+                    d_col, col_cols,             /* A = col */
+                    d_weight, col_rows,          /* B = weight */
+                    &beta,
+                    d_out, col_cols);            /* C = out */
+
+        /* Add bias if present */
+        if (d_bias) {
+            int spatial = outH * outW;
+            k_add_bias_conv<<<(out_ch * spatial + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(
+                d_out, d_bias, out_ch, spatial);
+        }
+
+        /* Download output */
+        cudaMemcpy(out_b, d_out, sz_out, cudaMemcpyDeviceToHost);
+    }
+
+    cudaFree(d_in); cudaFree(d_out); cudaFree(d_col); cudaFree(d_weight);
+    if (d_bias) cudaFree(d_bias);
+    return 1;
 }
 
 int flux_cuda_attention_fused(float *out, const float *Q, const float *K, const float *V,
