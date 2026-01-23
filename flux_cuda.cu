@@ -1127,12 +1127,144 @@ int flux_cuda_attention_fused(float *out, const float *Q, const float *K, const 
     return 0;  /* Fall back to CPU */
 }
 
+/* Causal softmax kernel with attention mask */
+__global__ void k_causal_softmax(float *scores, const int *mask, int seq, float scale) {
+    int row = blockIdx.x;  /* One block per row */
+    if (row >= seq) return;
+
+    float *row_data = scores + row * seq;
+
+    /* Apply scale and causal mask, find max */
+    __shared__ float smax[256];
+    float mx = -INFINITY;
+    for (int i = threadIdx.x; i < seq; i += blockDim.x) {
+        float val = row_data[i] * scale;
+        /* Causal mask: can only attend to positions <= row */
+        if (i > row) val = -INFINITY;
+        /* Attention mask: 0 = masked, 1 = allowed */
+        if (mask && mask[i] == 0) val = -INFINITY;
+        row_data[i] = val;
+        mx = fmaxf(mx, val);
+    }
+    smax[threadIdx.x] = mx;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) smax[threadIdx.x] = fmaxf(smax[threadIdx.x], smax[threadIdx.x + s]);
+        __syncthreads();
+    }
+    mx = smax[0];
+
+    /* Exp and sum */
+    __shared__ float ssum[256];
+    float sm = 0;
+    for (int i = threadIdx.x; i < seq; i += blockDim.x) {
+        float e = expf(row_data[i] - mx);
+        row_data[i] = e;
+        sm += e;
+    }
+    ssum[threadIdx.x] = sm;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) ssum[threadIdx.x] += ssum[threadIdx.x + s];
+        __syncthreads();
+    }
+    sm = ssum[0];
+
+    /* Normalize */
+    for (int i = threadIdx.x; i < seq; i += blockDim.x) {
+        row_data[i] /= sm;
+    }
+}
+
 int flux_cuda_causal_attention(float *out, const float *Q, const float *K, const float *V,
                                const int *attention_mask, int seq, int num_q_heads,
                                int num_kv_heads, int head_dim, float scale) {
-    (void)out; (void)Q; (void)K; (void)V; (void)attention_mask;
-    (void)seq; (void)num_q_heads; (void)num_kv_heads; (void)head_dim; (void)scale;
-    return 0;  /* Fall back to CPU */
+    if (!g_available) return 0;
+
+    int heads_per_kv = num_q_heads / num_kv_heads;
+    int q_dim = num_q_heads * head_dim;
+    int kv_dim = num_kv_heads * head_dim;
+
+    /* Allocate GPU buffers */
+    size_t sz_q = (size_t)seq * q_dim * sizeof(float);
+    size_t sz_kv = (size_t)seq * kv_dim * sizeof(float);
+    size_t sz_out = sz_q;
+    size_t sz_scores = (size_t)seq * seq * sizeof(float);
+
+    float *d_q, *d_k, *d_v, *d_out, *d_scores;
+    int *d_mask = NULL;
+
+    if (cudaMalloc(&d_q, sz_q) != cudaSuccess) return 0;
+    if (cudaMalloc(&d_k, sz_kv) != cudaSuccess) { cudaFree(d_q); return 0; }
+    if (cudaMalloc(&d_v, sz_kv) != cudaSuccess) { cudaFree(d_q); cudaFree(d_k); return 0; }
+    if (cudaMalloc(&d_out, sz_out) != cudaSuccess) { cudaFree(d_q); cudaFree(d_k); cudaFree(d_v); return 0; }
+    if (cudaMalloc(&d_scores, sz_scores) != cudaSuccess) { cudaFree(d_q); cudaFree(d_k); cudaFree(d_v); cudaFree(d_out); return 0; }
+
+    if (attention_mask) {
+        if (cudaMalloc(&d_mask, seq * sizeof(int)) != cudaSuccess) {
+            cudaFree(d_q); cudaFree(d_k); cudaFree(d_v); cudaFree(d_out); cudaFree(d_scores);
+            return 0;
+        }
+        cudaMemcpy(d_mask, attention_mask, seq * sizeof(int), cudaMemcpyHostToDevice);
+    }
+
+    /* Upload Q, K, V */
+    cudaMemcpy(d_q, Q, sz_q, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_k, K, sz_kv, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_v, V, sz_kv, cudaMemcpyHostToDevice);
+
+    /* Zero output */
+    cudaMemset(d_out, 0, sz_out);
+
+    /* Process each query head */
+    for (int qh = 0; qh < num_q_heads; qh++) {
+        int kvh = qh / heads_per_kv;  /* GQA: which KV head to use */
+
+        float *q_head = d_q + qh * head_dim;  /* strided access */
+        float *k_head = d_k + kvh * head_dim;
+        float *v_head = d_v + kvh * head_dim;
+        float *out_head = d_out + qh * head_dim;
+
+        /* scores = Q @ K^T : [seq, seq]
+         * Q: [seq, head_dim] with stride q_dim
+         * K: [seq, head_dim] with stride kv_dim
+         */
+        float alpha = 1.0f, beta = 0.0f;
+        cublasSgemm(g_cublas,
+                    CUBLAS_OP_T, CUBLAS_OP_N,
+                    seq, seq, head_dim,
+                    &alpha,
+                    k_head, kv_dim,   /* K^T */
+                    q_head, q_dim,    /* Q */
+                    &beta,
+                    d_scores, seq);
+
+        /* Causal softmax with scale */
+        k_causal_softmax<<<seq, 256, 0, g_stream>>>(d_scores, d_mask, seq, scale);
+
+        /* out = scores @ V : [seq, head_dim]
+         * scores: [seq, seq]
+         * V: [seq, head_dim] with stride kv_dim
+         */
+        cublasSgemm(g_cublas,
+                    CUBLAS_OP_N, CUBLAS_OP_N,
+                    head_dim, seq, seq,
+                    &alpha,
+                    v_head, kv_dim,   /* V */
+                    d_scores, seq,    /* scores */
+                    &beta,
+                    out_head, q_dim); /* out (strided) */
+    }
+
+    /* Download result */
+    cudaMemcpy(out, d_out, sz_out, cudaMemcpyDeviceToHost);
+
+    cudaFree(d_q); cudaFree(d_k); cudaFree(d_v); cudaFree(d_out); cudaFree(d_scores);
+    if (d_mask) cudaFree(d_mask);
+
+    return 1;
 }
 
 /* ========================================================================
