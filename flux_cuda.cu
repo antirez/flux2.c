@@ -702,7 +702,8 @@ int flux_cuda_sgemm_gpu(int ta, int tb, int M, int N, int K,
 }
 
 /* GPU-to-GPU sgemm with bf16 weights: converts bf16→f32 on GPU, then matmul.
- * Uses weight cache to avoid repeated uploads/conversions. */
+ * Uses weight cache to avoid repeated uploads/conversions (mmap mode only).
+ * In no-mmap mode, cache is disabled because malloc'd pointers can be reused. */
 int flux_cuda_sgemm_gpu_bf16(int ta, int tb, int M, int N, int K,
                               float alpha, int A_id, int lda,
                               const uint16_t *B_bf16, int ldb,
@@ -715,19 +716,21 @@ int flux_cuda_sgemm_gpu_bf16(int ta, int tb, int M, int N, int K,
 
     int num_weights = tb ? N * K : K * N;
     size_t szB_f32 = (size_t)num_weights * sizeof(float);
-    float *dB;
+    float *dB = NULL;
+    int needs_free = 0;
 
-    /* BF16 weights with mmap: pointers are stable, so cache by pointer.
-     * Unlike f32 weights which get freed/reloaded in mmap mode, bf16 pointers
-     * are direct mmap pointers that remain valid. */
-    dB = (float*)weight_cache_get(B_bf16);
+    /* Check cache only if enabled (mmap mode has stable pointers) */
+    if (!g_weight_cache_disabled) {
+        dB = (float*)weight_cache_get(B_bf16);
+    }
+
     if (!dB) {
-        /* First time: allocate GPU buffer, upload bf16, convert to f32, cache */
+        /* Allocate GPU buffer, upload bf16, convert to f32 */
         void *gpu_ptr = NULL;
         if (cudaMalloc(&gpu_ptr, szB_f32) != cudaSuccess) return -1;
         dB = (float*)gpu_ptr;
 
-        /* Upload bf16 to scratch and convert to cached f32 */
+        /* Upload bf16 to scratch and convert to f32 */
         size_t szB_bf16 = (size_t)num_weights * sizeof(uint16_t);
         uint16_t *dB_bf16 = ensure_scratch_bf16(szB_bf16);
         if (!dB_bf16) { cudaFree(gpu_ptr); return -1; }
@@ -736,12 +739,14 @@ int flux_cuda_sgemm_gpu_bf16(int ta, int tb, int M, int N, int K,
         int blk = (num_weights + BLOCK_1D - 1) / BLOCK_1D;
         k_bf16_to_f32<<<blk, BLOCK_1D, 0, g_stream>>>(dB, dB_bf16, num_weights);
 
-        /* Add to cache (reusing weight_cache structure) */
-        if (g_weight_cache_count < WEIGHT_CACHE_SIZE) {
+        /* Cache only if enabled, otherwise mark for free after use */
+        if (!g_weight_cache_disabled && g_weight_cache_count < WEIGHT_CACHE_SIZE) {
             g_weight_cache[g_weight_cache_count].cpu_ptr = B_bf16;
             g_weight_cache[g_weight_cache_count].gpu_ptr = gpu_ptr;
             g_weight_cache[g_weight_cache_count].size = szB_f32;
             g_weight_cache_count++;
+        } else {
+            needs_free = 1;
         }
     }
 
@@ -757,6 +762,12 @@ int flux_cuda_sgemm_gpu_bf16(int ta, int tb, int M, int N, int K,
                                        dC, CUDA_R_32F, ldc,
                                        CUBLAS_COMPUTE_32F_FAST_16F,
                                        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+    if (needs_free) {
+        cudaStreamSynchronize(g_stream);
+        cudaFree(dB);
+    }
+
     return (err == CUBLAS_STATUS_SUCCESS) ? C_id : -1;
 }
 

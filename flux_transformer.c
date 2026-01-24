@@ -4826,6 +4826,9 @@ flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf) {
     if (tf->use_bf16) {
         printf("Using bf16 weights for CUDA GPU acceleration\n");
     }
+    /* Disable weight cache in no-mmap mode - bf16 pointers come from malloc'd
+     * buffers via safetensors_get_bf16() that can be reused after free. */
+    flux_cuda_weight_cache_disable(1);
 #else
     tf->use_bf16 = 0;
 #endif
