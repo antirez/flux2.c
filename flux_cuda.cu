@@ -118,9 +118,13 @@ void flux_cuda_weight_cache_disable(int disable) {
 static float *g_scratch_A = NULL;
 static float *g_scratch_B = NULL;  /* For weights when cache disabled */
 static float *g_scratch_C = NULL;
+static float *g_scratch_small1 = NULL;  /* For small uploads (gate, shift, scale, etc.) */
+static float *g_scratch_small2 = NULL;  /* Second small buffer for pair uploads */
 static size_t g_scratch_A_size = 0;
 static size_t g_scratch_B_size = 0;
 static size_t g_scratch_C_size = 0;
+static size_t g_scratch_small1_size = 0;
+static size_t g_scratch_small2_size = 0;
 
 static float* ensure_scratch(float **buf, size_t *current, size_t needed) {
     if (*current >= needed) return *buf;
@@ -138,6 +142,8 @@ static void free_scratch(void) {
     if (g_scratch_A) { cudaFree(g_scratch_A); g_scratch_A = NULL; g_scratch_A_size = 0; }
     if (g_scratch_B) { cudaFree(g_scratch_B); g_scratch_B = NULL; g_scratch_B_size = 0; }
     if (g_scratch_C) { cudaFree(g_scratch_C); g_scratch_C = NULL; g_scratch_C_size = 0; }
+    if (g_scratch_small1) { cudaFree(g_scratch_small1); g_scratch_small1 = NULL; g_scratch_small1_size = 0; }
+    if (g_scratch_small2) { cudaFree(g_scratch_small2); g_scratch_small2 = NULL; g_scratch_small2_size = 0; }
 }
 
 /* ========================================================================
@@ -694,158 +700,6 @@ void flux_cuda_sgemm_batch(int ta, int tb, int M, int N, int K,
 }
 
 /* ========================================================================
- * C API Wrappers for Kernels
- * ======================================================================== */
-
-void flux_cuda_silu(float *x, int n) {
-    if (!g_available) return;
-    float *dx; size_t sz = n * sizeof(float);
-    CUDA_CHECK(cudaMalloc(&dx, sz));
-    CUDA_CHECK(cudaMemcpyAsync(dx, x, sz, cudaMemcpyHostToDevice, g_stream));
-    int blk = (n + BLOCK_1D - 1) / BLOCK_1D;
-    k_silu<<<blk, BLOCK_1D, 0, g_stream>>>(dx, n);
-    CUDA_CHECK(cudaMemcpyAsync(x, dx, sz, cudaMemcpyDeviceToHost, g_stream));
-    if (!g_batch_mode) cudaStreamSynchronize(g_stream);
-    cudaFree(dx);
-}
-
-void flux_cuda_gelu(float *x, int n) {
-    if (!g_available) return;
-    float *dx; size_t sz = n * sizeof(float);
-    CUDA_CHECK(cudaMalloc(&dx, sz));
-    CUDA_CHECK(cudaMemcpyAsync(dx, x, sz, cudaMemcpyHostToDevice, g_stream));
-    int blk = (n + BLOCK_1D - 1) / BLOCK_1D;
-    k_gelu<<<blk, BLOCK_1D, 0, g_stream>>>(dx, n);
-    CUDA_CHECK(cudaMemcpyAsync(x, dx, sz, cudaMemcpyDeviceToHost, g_stream));
-    if (!g_batch_mode) cudaStreamSynchronize(g_stream);
-    cudaFree(dx);
-}
-
-void flux_cuda_silu_mul(float *gate, const float *up, int n) {
-    if (!g_available) return;
-    float *dg, *du; size_t sz = n * sizeof(float);
-    CUDA_CHECK(cudaMalloc(&dg, sz)); CUDA_CHECK(cudaMalloc(&du, sz));
-    CUDA_CHECK(cudaMemcpyAsync(dg, gate, sz, cudaMemcpyHostToDevice, g_stream));
-    CUDA_CHECK(cudaMemcpyAsync(du, up, sz, cudaMemcpyHostToDevice, g_stream));
-    int blk = (n + BLOCK_1D - 1) / BLOCK_1D;
-    k_silu_mul<<<blk, BLOCK_1D, 0, g_stream>>>(dg, du, n);
-    CUDA_CHECK(cudaMemcpyAsync(gate, dg, sz, cudaMemcpyDeviceToHost, g_stream));
-    if (!g_batch_mode) cudaStreamSynchronize(g_stream);
-    cudaFree(dg); cudaFree(du);
-}
-
-void flux_cuda_add_inplace(float *a, const float *b, int n) {
-    if (!g_available) return;
-    float *da, *db; size_t sz = n * sizeof(float);
-    CUDA_CHECK(cudaMalloc(&da, sz)); CUDA_CHECK(cudaMalloc(&db, sz));
-    CUDA_CHECK(cudaMemcpyAsync(da, a, sz, cudaMemcpyHostToDevice, g_stream));
-    CUDA_CHECK(cudaMemcpyAsync(db, b, sz, cudaMemcpyHostToDevice, g_stream));
-    k_add<<<(n + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(da, db, n);
-    CUDA_CHECK(cudaMemcpyAsync(a, da, sz, cudaMemcpyDeviceToHost, g_stream));
-    if (!g_batch_mode) cudaStreamSynchronize(g_stream);
-    cudaFree(da); cudaFree(db);
-}
-
-void flux_cuda_mul_inplace(float *a, const float *b, int n) {
-    if (!g_available) return;
-    float *da, *db; size_t sz = n * sizeof(float);
-    CUDA_CHECK(cudaMalloc(&da, sz)); CUDA_CHECK(cudaMalloc(&db, sz));
-    CUDA_CHECK(cudaMemcpyAsync(da, a, sz, cudaMemcpyHostToDevice, g_stream));
-    CUDA_CHECK(cudaMemcpyAsync(db, b, sz, cudaMemcpyHostToDevice, g_stream));
-    k_mul<<<(n + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(da, db, n);
-    CUDA_CHECK(cudaMemcpyAsync(a, da, sz, cudaMemcpyDeviceToHost, g_stream));
-    if (!g_batch_mode) cudaStreamSynchronize(g_stream);
-    cudaFree(da); cudaFree(db);
-}
-
-void flux_cuda_scale_inplace(float *a, float s, int n) {
-    if (!g_available) return;
-    float *da; size_t sz = n * sizeof(float);
-    CUDA_CHECK(cudaMalloc(&da, sz));
-    CUDA_CHECK(cudaMemcpyAsync(da, a, sz, cudaMemcpyHostToDevice, g_stream));
-    k_scale<<<(n + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(da, s, n);
-    CUDA_CHECK(cudaMemcpyAsync(a, da, sz, cudaMemcpyDeviceToHost, g_stream));
-    if (!g_batch_mode) cudaStreamSynchronize(g_stream);
-    cudaFree(da);
-}
-
-void flux_cuda_rms_norm(float *out, const float *x, const float *w,
-                        int seq, int hid, float eps) {
-    if (!g_available) return;
-    float *dout, *dx, *dw;
-    size_t szx = (size_t)seq * hid * sizeof(float), szw = hid * sizeof(float);
-    CUDA_CHECK(cudaMalloc(&dout, szx)); CUDA_CHECK(cudaMalloc(&dx, szx)); CUDA_CHECK(cudaMalloc(&dw, szw));
-    CUDA_CHECK(cudaMemcpyAsync(dx, x, szx, cudaMemcpyHostToDevice, g_stream));
-    CUDA_CHECK(cudaMemcpyAsync(dw, w, szw, cudaMemcpyHostToDevice, g_stream));
-    k_rms_norm<<<seq, BLOCK_NORM, 0, g_stream>>>(dout, dx, dw, seq, hid, eps);
-    CUDA_CHECK(cudaMemcpyAsync(out, dout, szx, cudaMemcpyDeviceToHost, g_stream));
-    if (!g_batch_mode) cudaStreamSynchronize(g_stream);
-    cudaFree(dout); cudaFree(dx); cudaFree(dw);
-}
-
-void flux_cuda_softmax(float *x, int rows, int cols) {
-    if (!g_available) return;
-    float *dx; size_t sz = (size_t)rows * cols * sizeof(float);
-    CUDA_CHECK(cudaMalloc(&dx, sz));
-    CUDA_CHECK(cudaMemcpyAsync(dx, x, sz, cudaMemcpyHostToDevice, g_stream));
-    k_softmax<<<rows, BLOCK_NORM, 0, g_stream>>>(dx, rows, cols);
-    CUDA_CHECK(cudaMemcpyAsync(x, dx, sz, cudaMemcpyDeviceToHost, g_stream));
-    if (!g_batch_mode) cudaStreamSynchronize(g_stream);
-    cudaFree(dx);
-}
-
-void flux_cuda_qk_rms_norm(float *q, float *k, const float *qw, const float *kw,
-                           int seq, int heads, int hdim, float eps) {
-    if (!g_available) return;
-    float *dq, *dk, *dqw, *dkw;
-    size_t szqk = (size_t)seq * heads * hdim * sizeof(float), szw = hdim * sizeof(float);
-    CUDA_CHECK(cudaMalloc(&dq, szqk)); CUDA_CHECK(cudaMalloc(&dk, szqk));
-    CUDA_CHECK(cudaMalloc(&dqw, szw)); CUDA_CHECK(cudaMalloc(&dkw, szw));
-    CUDA_CHECK(cudaMemcpyAsync(dq, q, szqk, cudaMemcpyHostToDevice, g_stream));
-    CUDA_CHECK(cudaMemcpyAsync(dk, k, szqk, cudaMemcpyHostToDevice, g_stream));
-    CUDA_CHECK(cudaMemcpyAsync(dqw, qw, szw, cudaMemcpyHostToDevice, g_stream));
-    CUDA_CHECK(cudaMemcpyAsync(dkw, kw, szw, cudaMemcpyHostToDevice, g_stream));
-    k_qk_rms_norm<<<seq * heads, BLOCK_NORM, 0, g_stream>>>(dq, dk, dqw, dkw, seq, heads, hdim, eps);
-    CUDA_CHECK(cudaMemcpyAsync(q, dq, szqk, cudaMemcpyDeviceToHost, g_stream));
-    CUDA_CHECK(cudaMemcpyAsync(k, dk, szqk, cudaMemcpyDeviceToHost, g_stream));
-    if (!g_batch_mode) cudaStreamSynchronize(g_stream);
-    cudaFree(dq); cudaFree(dk); cudaFree(dqw); cudaFree(dkw);
-}
-
-void flux_cuda_adaln_norm(float *out, const float *x, const float *shift,
-                          const float *scale, int seq, int hid, float eps) {
-    if (!g_available) return;
-    float *dout, *dx, *dsh, *dsc;
-    size_t szx = (size_t)seq * hid * sizeof(float), szm = hid * sizeof(float);
-    CUDA_CHECK(cudaMalloc(&dout, szx)); CUDA_CHECK(cudaMalloc(&dx, szx));
-    CUDA_CHECK(cudaMalloc(&dsh, szm)); CUDA_CHECK(cudaMalloc(&dsc, szm));
-    CUDA_CHECK(cudaMemcpyAsync(dx, x, szx, cudaMemcpyHostToDevice, g_stream));
-    CUDA_CHECK(cudaMemcpyAsync(dsh, shift, szm, cudaMemcpyHostToDevice, g_stream));
-    CUDA_CHECK(cudaMemcpyAsync(dsc, scale, szm, cudaMemcpyHostToDevice, g_stream));
-    k_adaln_norm<<<seq, BLOCK_NORM, 0, g_stream>>>(dout, dx, dsh, dsc, seq, hid, eps);
-    CUDA_CHECK(cudaMemcpyAsync(out, dout, szx, cudaMemcpyDeviceToHost, g_stream));
-    if (!g_batch_mode) cudaStreamSynchronize(g_stream);
-    cudaFree(dout); cudaFree(dx); cudaFree(dsh); cudaFree(dsc);
-}
-
-void flux_cuda_rope_2d(float *x, const float *cos_f, const float *sin_f,
-                       int seq, int heads, int hdim, int axis_dim) {
-    if (!g_available) return;
-    float *dx, *dc, *ds;
-    size_t szx = (size_t)seq * heads * hdim * sizeof(float);
-    size_t szf = (size_t)seq * (axis_dim / 2) * sizeof(float);
-    CUDA_CHECK(cudaMalloc(&dx, szx)); CUDA_CHECK(cudaMalloc(&dc, szf)); CUDA_CHECK(cudaMalloc(&ds, szf));
-    CUDA_CHECK(cudaMemcpyAsync(dx, x, szx, cudaMemcpyHostToDevice, g_stream));
-    CUDA_CHECK(cudaMemcpyAsync(dc, cos_f, szf, cudaMemcpyHostToDevice, g_stream));
-    CUDA_CHECK(cudaMemcpyAsync(ds, sin_f, szf, cudaMemcpyHostToDevice, g_stream));
-    int total = seq * heads * (axis_dim / 2);
-    k_rope_2d<<<(total + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(dx, dc, ds, seq, heads, hdim, axis_dim);
-    CUDA_CHECK(cudaMemcpyAsync(x, dx, szx, cudaMemcpyDeviceToHost, g_stream));
-    if (!g_batch_mode) cudaStreamSynchronize(g_stream);
-    cudaFree(dx); cudaFree(dc); cudaFree(ds);
-}
-
-/* ========================================================================
  * GPU Tensor Operations - Work on tensors already on GPU
  * ======================================================================== */
 
@@ -855,16 +709,14 @@ void flux_cuda_gated_add_t(int out_id, const float *gate, int x_id, int seq, int
     float *d_x = flux_cuda_tensor_ptr(x_id);
     if (!d_out || !d_x) return;
 
-    /* Upload gate (small: just hidden floats) */
-    float *d_gate;
+    /* Upload gate using scratch buffer */
     size_t gate_sz = hidden * sizeof(float);
-    CUDA_CHECK(cudaMalloc(&d_gate, gate_sz));
+    float *d_gate = ensure_scratch(&g_scratch_small1, &g_scratch_small1_size, gate_sz);
+    if (!d_gate) return;
     CUDA_CHECK(cudaMemcpyAsync(d_gate, gate, gate_sz, cudaMemcpyHostToDevice, g_stream));
 
     int total = seq * hidden;
     k_gated_add<<<(total + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(d_out, d_gate, d_x, seq, hidden);
-
-    cudaFree(d_gate);
 }
 
 void flux_cuda_split_fused_t(int fused_id, int q_id, int k_id, int v_id,
@@ -913,20 +765,15 @@ void flux_cuda_adaln_t(int out_id, int x_id, const float *shift, const float *sc
     float *d_x = flux_cuda_tensor_ptr(x_id);
     if (!d_out || !d_x) return;
 
-    /* Upload shift/scale (small) */
-    float *d_sh, *d_sc;
+    /* Upload shift/scale using scratch buffers */
     size_t sz = hid * sizeof(float);
-    CUDA_CHECK(cudaMalloc(&d_sh, sz)); CUDA_CHECK(cudaMalloc(&d_sc, sz));
+    float *d_sh = ensure_scratch(&g_scratch_small1, &g_scratch_small1_size, sz);
+    float *d_sc = ensure_scratch(&g_scratch_small2, &g_scratch_small2_size, sz);
+    if (!d_sh || !d_sc) return;
     CUDA_CHECK(cudaMemcpyAsync(d_sh, shift, sz, cudaMemcpyHostToDevice, g_stream));
     CUDA_CHECK(cudaMemcpyAsync(d_sc, scale, sz, cudaMemcpyHostToDevice, g_stream));
 
-    /* Ensure previous uploads are complete */
-    cudaStreamSynchronize(g_stream);
-
     k_adaln_norm<<<seq, BLOCK_NORM, 0, g_stream>>>(d_out, d_x, d_sh, d_sc, seq, hid, eps);
-
-    cudaStreamSynchronize(g_stream);  /* Wait for kernel completion before freeing */
-    cudaFree(d_sh); cudaFree(d_sc);
 }
 
 void flux_cuda_qk_norm_t(int q_id, int k_id, const float *qw, const float *kw,
@@ -936,16 +783,15 @@ void flux_cuda_qk_norm_t(int q_id, int k_id, const float *qw, const float *kw,
     float *d_k = flux_cuda_tensor_ptr(k_id);
     if (!d_q || !d_k) return;
 
-    /* Upload weights */
-    float *d_qw, *d_kw;
+    /* Upload weights using scratch buffers */
     size_t sz = hdim * sizeof(float);
-    CUDA_CHECK(cudaMalloc(&d_qw, sz)); CUDA_CHECK(cudaMalloc(&d_kw, sz));
+    float *d_qw = ensure_scratch(&g_scratch_small1, &g_scratch_small1_size, sz);
+    float *d_kw = ensure_scratch(&g_scratch_small2, &g_scratch_small2_size, sz);
+    if (!d_qw || !d_kw) return;
     CUDA_CHECK(cudaMemcpyAsync(d_qw, qw, sz, cudaMemcpyHostToDevice, g_stream));
     CUDA_CHECK(cudaMemcpyAsync(d_kw, kw, sz, cudaMemcpyHostToDevice, g_stream));
 
     k_qk_rms_norm<<<seq * heads, BLOCK_NORM, 0, g_stream>>>(d_q, d_k, d_qw, d_kw, seq, heads, hdim, eps);
-
-    cudaFree(d_qw); cudaFree(d_kw);
 }
 
 /* RoPE 2D using tensor pool for cos/sin - full head_dim version */
@@ -985,15 +831,24 @@ void flux_cuda_rope_t(int x_id, const float *cos_f, const float *sin_f,
     if (!d_x) return;
 
     size_t szf = (size_t)seq * (axis_dim / 2) * sizeof(float);
-    float *d_c, *d_s;
-    CUDA_CHECK(cudaMalloc(&d_c, szf)); CUDA_CHECK(cudaMalloc(&d_s, szf));
-    CUDA_CHECK(cudaMemcpyAsync(d_c, cos_f, szf, cudaMemcpyHostToDevice, g_stream));
-    CUDA_CHECK(cudaMemcpyAsync(d_s, sin_f, szf, cudaMemcpyHostToDevice, g_stream));
+    int t_c = flux_cuda_tensor_get(szf);
+    int t_s = flux_cuda_tensor_get(szf);
+    if (t_c < 0 || t_s < 0) {
+        flux_cuda_tensor_release(t_c);
+        flux_cuda_tensor_release(t_s);
+        return;
+    }
+
+    float *d_c = flux_cuda_tensor_ptr(t_c);
+    float *d_s = flux_cuda_tensor_ptr(t_s);
+    cudaMemcpyAsync(d_c, cos_f, szf, cudaMemcpyHostToDevice, g_stream);
+    cudaMemcpyAsync(d_s, sin_f, szf, cudaMemcpyHostToDevice, g_stream);
 
     int total = seq * heads * (axis_dim / 2);
     k_rope_2d<<<(total + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(d_x, d_c, d_s, seq, heads, hdim, axis_dim);
 
-    cudaFree(d_c); cudaFree(d_s);
+    flux_cuda_tensor_release(t_c);
+    flux_cuda_tensor_release(t_s);
 }
 
 /* RoPE with offset - applies to portion of tensor starting at seq_offset
