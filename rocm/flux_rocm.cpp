@@ -124,7 +124,40 @@ static void pool_clear() {
 struct weight_cache_entry {
     void *gpu_ptr;
     size_t bytes;
+    uint64_t content_hash;  /* Hash of first N bytes to detect content changes */
 };
+
+/* Simple hash of first N bytes to detect if tensor content changed.
+ * Needed for mmap mode where same address can hold different weights. */
+static uint64_t compute_content_hash(const void *data, size_t bytes) {
+    const uint8_t *p = (const uint8_t *)data;
+    /* Sample first 64 bytes, last 64 bytes, and a few in the middle */
+    size_t sample_size = 64;
+    uint64_t hash = bytes;  /* Include size in hash */
+    
+    /* Hash first bytes */
+    size_t n = (bytes < sample_size) ? bytes : sample_size;
+    for (size_t i = 0; i < n; i++) {
+        hash = hash * 31 + p[i];
+    }
+    
+    /* Hash some middle bytes if tensor is large enough */
+    if (bytes > sample_size * 3) {
+        size_t mid = bytes / 2;
+        for (size_t i = 0; i < sample_size; i++) {
+            hash = hash * 31 + p[mid + i];
+        }
+    }
+    
+    /* Hash last bytes */
+    if (bytes > sample_size) {
+        for (size_t i = 0; i < sample_size; i++) {
+            hash = hash * 31 + p[bytes - sample_size + i];
+        }
+    }
+    
+    return hash;
+}
 
 static std::unordered_map<const void*, weight_cache_entry> g_weight_cache;
 static std::mutex g_weight_mutex;
@@ -134,9 +167,20 @@ static std::mutex g_weight_mutex;
 void* get_cached_weight(const void *cpu_ptr, size_t bytes) {
     std::lock_guard<std::mutex> lock(g_weight_mutex);
     
+    /* Compute content hash to detect if data changed (needed for mmap mode
+     * where same virtual address can hold different weights) */
+    uint64_t hash = compute_content_hash(cpu_ptr, bytes);
+    
     auto it = g_weight_cache.find(cpu_ptr);
     if (it != g_weight_cache.end()) {
-        return it->second.gpu_ptr;
+        /* Check if this is the same tensor (size AND content must match) */
+        if (it->second.bytes == bytes && it->second.content_hash == hash) {
+            return it->second.gpu_ptr;
+        }
+        /* Different tensor at same address - evict old one */
+        hipFree(it->second.gpu_ptr);
+        g_memory_used -= it->second.bytes;
+        g_weight_cache.erase(it);
     }
     
     /* Upload to GPU */
@@ -154,7 +198,7 @@ void* get_cached_weight(const void *cpu_ptr, size_t bytes) {
         return nullptr;
     }
     
-    g_weight_cache[cpu_ptr] = {gpu_ptr, bytes};
+    g_weight_cache[cpu_ptr] = {gpu_ptr, bytes, hash};
     g_memory_used += bytes;
     
     return gpu_ptr;
@@ -640,6 +684,15 @@ extern "C" int flux_rocm_attention_fused(float *out,
     size_t qkv_size = num_heads * seq_q * head_dim;
     size_t scores_size = num_heads * seq_q * seq_k;
     
+    /* OOM guard: scores matrix can explode at large sizes
+     * E.g., 1024x1024 image: seq~16k, scores~24*16k*16k = 6.6B floats = 26GB
+     * Fall back to CPU path if scores would exceed 2GB */
+    size_t scores_bytes = scores_size * sizeof(float);
+    const size_t MAX_SCORES_BYTES = 2ULL * 1024 * 1024 * 1024;  /* 2GB limit */
+    if (scores_bytes > MAX_SCORES_BYTES) {
+        return 0;  /* Fall back to CPU */
+    }
+    
     float *Q_t = (float*)pool_alloc(qkv_size * sizeof(float));
     float *K_t = (float*)pool_alloc(num_heads * seq_k * head_dim * sizeof(float));
     float *V_t = (float*)pool_alloc(num_heads * seq_k * head_dim * sizeof(float));
@@ -708,4 +761,289 @@ extern "C" int flux_rocm_attention_fused(float *out,
     pool_free(out_t, qkv_size * sizeof(float));
     
     return 1;
+}
+
+/* ========================================================================
+ * GPU Tensor Wrapper Operations
+ * These operate on flux_rocm_tensor_t, keeping data on GPU throughout.
+ * ======================================================================== */
+
+extern "C" void flux_rocm_gpu_adaln_norm(flux_rocm_tensor_t out, flux_rocm_tensor_t x,
+                                         const float *shift, const float *scale,
+                                         int seq, int hidden, float eps) {
+    if (!g_initialized || !out || !x) return;
+    
+    /* Upload shift/scale to GPU - DON'T cache since they change per forward pass */
+    size_t param_size = hidden * sizeof(float);
+    float *shift_gpu = (float*)pool_alloc(param_size);
+    float *scale_gpu = (float*)pool_alloc(param_size);
+    
+    if (!shift_gpu || !scale_gpu) {
+        if (shift_gpu) pool_free(shift_gpu, param_size);
+        if (scale_gpu) pool_free(scale_gpu, param_size);
+        return;
+    }
+    
+    hipMemcpyAsync(shift_gpu, shift, param_size, hipMemcpyHostToDevice, g_stream);
+    hipMemcpyAsync(scale_gpu, scale, param_size, hipMemcpyHostToDevice, g_stream);
+    
+    flux_rocm_kernel_adaln_norm((float*)out->data, (float*)x->data,
+                                shift_gpu, scale_gpu,
+                                seq, hidden, eps, g_stream);
+    
+    pool_free(shift_gpu, param_size);
+    pool_free(scale_gpu, param_size);
+}
+
+extern "C" void flux_rocm_gpu_qk_rms_norm(flux_rocm_tensor_t q, flux_rocm_tensor_t k,
+                                          const float *q_weight, const float *k_weight,
+                                          int seq, int heads, int head_dim, float eps) {
+    if (!g_initialized || !q || !k) return;
+    
+    /* Upload weights to GPU (they're small, head_dim size) - cache OK since they're model weights */
+    float *q_w_gpu = (float*)get_cached_weight(q_weight, head_dim * sizeof(float));
+    float *k_w_gpu = (float*)get_cached_weight(k_weight, head_dim * sizeof(float));
+    if (!q_w_gpu || !k_w_gpu) return;
+    
+    flux_rocm_kernel_qk_rms_norm((float*)q->data, (float*)k->data,
+                                 q_w_gpu, k_w_gpu,
+                                 seq, heads, head_dim, eps, g_stream);
+}
+
+extern "C" void flux_rocm_gpu_rope_unified(flux_rocm_tensor_t q, flux_rocm_tensor_t k,
+                                           const float *txt_cos, const float *txt_sin,
+                                           const float *img_cos, const float *img_sin,
+                                           int seq, int img_offset, int heads, int head_dim, int axis_dim) {
+    if (!g_initialized || !q || !k) return;
+    
+    /* Upload RoPE frequencies to GPU - DON'T cache since they change per forward pass */
+    size_t txt_size = img_offset * head_dim * sizeof(float);
+    size_t img_size = (seq - img_offset) * head_dim * sizeof(float);
+    
+    float *txt_cos_gpu = (float*)pool_alloc(txt_size);
+    float *txt_sin_gpu = (float*)pool_alloc(txt_size);
+    float *img_cos_gpu = (float*)pool_alloc(img_size);
+    float *img_sin_gpu = (float*)pool_alloc(img_size);
+    
+    if (!txt_cos_gpu || !txt_sin_gpu || !img_cos_gpu || !img_sin_gpu) {
+        if (txt_cos_gpu) pool_free(txt_cos_gpu, txt_size);
+        if (txt_sin_gpu) pool_free(txt_sin_gpu, txt_size);
+        if (img_cos_gpu) pool_free(img_cos_gpu, img_size);
+        if (img_sin_gpu) pool_free(img_sin_gpu, img_size);
+        return;
+    }
+    
+    hipMemcpyAsync(txt_cos_gpu, txt_cos, txt_size, hipMemcpyHostToDevice, g_stream);
+    hipMemcpyAsync(txt_sin_gpu, txt_sin, txt_size, hipMemcpyHostToDevice, g_stream);
+    hipMemcpyAsync(img_cos_gpu, img_cos, img_size, hipMemcpyHostToDevice, g_stream);
+    hipMemcpyAsync(img_sin_gpu, img_sin, img_size, hipMemcpyHostToDevice, g_stream);
+    
+    flux_rocm_kernel_rope_unified((float*)q->data, (float*)k->data,
+                                  txt_cos_gpu, txt_sin_gpu,
+                                  img_cos_gpu, img_sin_gpu,
+                                  seq, img_offset, heads, head_dim, axis_dim, g_stream);
+    
+    pool_free(txt_cos_gpu, txt_size);
+    pool_free(txt_sin_gpu, txt_size);
+    pool_free(img_cos_gpu, img_size);
+    pool_free(img_sin_gpu, img_size);
+}
+
+extern "C" void flux_rocm_gpu_silu_mul(flux_rocm_tensor_t gate, flux_rocm_tensor_t up, int n) {
+    if (!g_initialized || !gate || !up) return;
+    flux_rocm_kernel_silu_mul((float*)gate->data, (float*)up->data, n, g_stream);
+}
+
+extern "C" void flux_rocm_gpu_gated_add(flux_rocm_tensor_t out, const float *gate,
+                                        flux_rocm_tensor_t proj, int seq, int hidden) {
+    if (!g_initialized || !out || !proj) return;
+    
+    /* Gate is small (hidden size), upload to GPU - DON'T cache since it changes */
+    size_t gate_size = hidden * sizeof(float);
+    float *gate_gpu = (float*)pool_alloc(gate_size);
+    if (!gate_gpu) return;
+    
+    hipMemcpyAsync(gate_gpu, gate, gate_size, hipMemcpyHostToDevice, g_stream);
+    
+    flux_rocm_kernel_gated_add((float*)out->data, gate_gpu, (float*)proj->data,
+                               seq, hidden, g_stream);
+    
+    pool_free(gate_gpu, gate_size);
+}
+
+extern "C" int flux_rocm_gpu_attention_fused(flux_rocm_tensor_t out,
+                                             flux_rocm_tensor_t Q, flux_rocm_tensor_t K, flux_rocm_tensor_t V,
+                                             int seq_q, int seq_k, int num_heads, int head_dim, float scale) {
+    if (!g_initialized || !out || !Q || !K || !V) return 0;
+    
+    return flux_rocm_attention_fused((float*)out->data,
+                                     (float*)Q->data, (float*)K->data, (float*)V->data,
+                                     seq_q, seq_k, num_heads, head_dim, scale);
+}
+
+extern "C" void flux_rocm_gpu_split_qkv_mlp(flux_rocm_tensor_t fused,
+                                            flux_rocm_tensor_t q, flux_rocm_tensor_t k, flux_rocm_tensor_t v,
+                                            flux_rocm_tensor_t gate, flux_rocm_tensor_t up,
+                                            int seq, int hidden, int mlp_hidden) {
+    if (!g_initialized || !fused || !q || !k || !v || !gate || !up) return;
+    
+    int fused_dim = hidden * 3 + mlp_hidden * 2;
+    float *src = (float*)fused->data;
+    
+    for (int s = 0; s < seq; s++) {
+        float *row = src + s * fused_dim;
+        hipMemcpyAsync((float*)q->data + s * hidden, row, hidden * sizeof(float),
+                       hipMemcpyDeviceToDevice, g_stream);
+        hipMemcpyAsync((float*)k->data + s * hidden, row + hidden, hidden * sizeof(float),
+                       hipMemcpyDeviceToDevice, g_stream);
+        hipMemcpyAsync((float*)v->data + s * hidden, row + hidden * 2, hidden * sizeof(float),
+                       hipMemcpyDeviceToDevice, g_stream);
+        hipMemcpyAsync((float*)gate->data + s * mlp_hidden, row + hidden * 3, mlp_hidden * sizeof(float),
+                       hipMemcpyDeviceToDevice, g_stream);
+        hipMemcpyAsync((float*)up->data + s * mlp_hidden, row + hidden * 3 + mlp_hidden, mlp_hidden * sizeof(float),
+                       hipMemcpyDeviceToDevice, g_stream);
+    }
+}
+
+extern "C" void flux_rocm_gpu_concat_attn_mlp(flux_rocm_tensor_t attn, flux_rocm_tensor_t mlp,
+                                              flux_rocm_tensor_t out, int seq, int hidden, int mlp_hidden) {
+    if (!g_initialized || !attn || !mlp || !out) return;
+    
+    int out_dim = hidden + mlp_hidden;
+    
+    for (int s = 0; s < seq; s++) {
+        hipMemcpyAsync((float*)out->data + s * out_dim, 
+                       (float*)attn->data + s * hidden, hidden * sizeof(float),
+                       hipMemcpyDeviceToDevice, g_stream);
+        hipMemcpyAsync((float*)out->data + s * out_dim + hidden,
+                       (float*)mlp->data + s * mlp_hidden, mlp_hidden * sizeof(float),
+                       hipMemcpyDeviceToDevice, g_stream);
+    }
+}
+
+extern "C" flux_rocm_tensor_t flux_rocm_gpu_linear(flux_rocm_tensor_t x,
+                                                   const float *W,
+                                                   int seq_len, int in_dim, int out_dim) {
+    if (!g_initialized || !x) return nullptr;
+    
+    flux_rocm_tensor_t out = flux_rocm_tensor_alloc(seq_len * out_dim);
+    if (!out) return nullptr;
+    
+    float *W_gpu = (float*)get_cached_weight(W, out_dim * in_dim * sizeof(float));
+    if (!W_gpu) {
+        flux_rocm_tensor_free(out);
+        return nullptr;
+    }
+    
+    flux_rocm_sgemm(0, 1,
+                    seq_len, out_dim, in_dim,
+                    1.0f,
+                    (float*)x->data, in_dim,
+                    W_gpu, in_dim,
+                    0.0f,
+                    (float*)out->data, out_dim);
+    
+    return out;
+}
+
+/* ========================================================================
+ * Double Block Support Functions
+ * ======================================================================== */
+
+extern "C" void flux_rocm_gpu_rope_2d(flux_rocm_tensor_t x,
+                                      const float *cos_freq, const float *sin_freq,
+                                      int seq, int heads, int head_dim) {
+    if (!g_initialized || !x) return;
+    
+    /* Upload RoPE frequencies to GPU - DON'T cache since they change */
+    size_t freq_size = seq * head_dim * sizeof(float);
+    float *cos_gpu = (float*)pool_alloc(freq_size);
+    float *sin_gpu = (float*)pool_alloc(freq_size);
+    
+    if (!cos_gpu || !sin_gpu) {
+        if (cos_gpu) pool_free(cos_gpu, freq_size);
+        if (sin_gpu) pool_free(sin_gpu, freq_size);
+        return;
+    }
+    
+    hipMemcpyAsync(cos_gpu, cos_freq, freq_size, hipMemcpyHostToDevice, g_stream);
+    hipMemcpyAsync(sin_gpu, sin_freq, freq_size, hipMemcpyHostToDevice, g_stream);
+    
+    flux_rocm_kernel_rope_2d((float*)x->data, cos_gpu, sin_gpu,
+                             seq, heads, head_dim, head_dim, g_stream);
+    
+    pool_free(cos_gpu, freq_size);
+    pool_free(sin_gpu, freq_size);
+}
+
+extern "C" void flux_rocm_gpu_concat_tensors(flux_rocm_tensor_t txt, flux_rocm_tensor_t img,
+                                             flux_rocm_tensor_t out,
+                                             int txt_seq, int img_seq, int hidden) {
+    if (!g_initialized || !txt || !img || !out) return;
+    
+    /* Copy txt first, then img (matches Python Flux2: [txt, img]) */
+    hipMemcpyAsync((float*)out->data, (float*)txt->data, 
+                   txt_seq * hidden * sizeof(float),
+                   hipMemcpyDeviceToDevice, g_stream);
+    hipMemcpyAsync((float*)out->data + txt_seq * hidden, (float*)img->data,
+                   img_seq * hidden * sizeof(float),
+                   hipMemcpyDeviceToDevice, g_stream);
+}
+
+extern "C" flux_rocm_tensor_t flux_rocm_gpu_swiglu_ffn(flux_rocm_tensor_t x,
+                                                       const float *gate_weight,
+                                                       const float *up_weight,
+                                                       const float *down_weight,
+                                                       int seq, int hidden, int mlp_hidden) {
+    if (!g_initialized || !x) return nullptr;
+    
+    /* Allocate intermediate tensors */
+    flux_rocm_tensor_t gate = flux_rocm_tensor_alloc(seq * mlp_hidden);
+    flux_rocm_tensor_t up = flux_rocm_tensor_alloc(seq * mlp_hidden);
+    flux_rocm_tensor_t out = flux_rocm_tensor_alloc(seq * hidden);
+    
+    if (!gate || !up || !out) {
+        if (gate) flux_rocm_tensor_free(gate);
+        if (up) flux_rocm_tensor_free(up);
+        if (out) flux_rocm_tensor_free(out);
+        return nullptr;
+    }
+    
+    /* Get cached weights */
+    float *gate_w_gpu = (float*)get_cached_weight(gate_weight, mlp_hidden * hidden * sizeof(float));
+    float *up_w_gpu = (float*)get_cached_weight(up_weight, mlp_hidden * hidden * sizeof(float));
+    float *down_w_gpu = (float*)get_cached_weight(down_weight, hidden * mlp_hidden * sizeof(float));
+    
+    if (!gate_w_gpu || !up_w_gpu || !down_w_gpu) {
+        flux_rocm_tensor_free(gate);
+        flux_rocm_tensor_free(up);
+        flux_rocm_tensor_free(out);
+        return nullptr;
+    }
+    
+    /* gate = x @ gate_weight.T, up = x @ up_weight.T */
+    flux_rocm_sgemm(0, 1, seq, mlp_hidden, hidden,
+                    1.0f, (float*)x->data, hidden,
+                    gate_w_gpu, hidden,
+                    0.0f, (float*)gate->data, mlp_hidden);
+    
+    flux_rocm_sgemm(0, 1, seq, mlp_hidden, hidden,
+                    1.0f, (float*)x->data, hidden,
+                    up_w_gpu, hidden,
+                    0.0f, (float*)up->data, mlp_hidden);
+    
+    /* SwiGLU: gate = silu(gate) * up */
+    flux_rocm_kernel_silu_mul((float*)gate->data, (float*)up->data, seq * mlp_hidden, g_stream);
+    
+    /* out = gate @ down_weight.T */
+    flux_rocm_sgemm(0, 1, seq, hidden, mlp_hidden,
+                    1.0f, (float*)gate->data, mlp_hidden,
+                    down_w_gpu, mlp_hidden,
+                    0.0f, (float*)out->data, hidden);
+    
+    /* Cleanup intermediates */
+    flux_rocm_tensor_free(gate);
+    flux_rocm_tensor_free(up);
+    
+    return out;
 }

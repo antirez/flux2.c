@@ -627,6 +627,9 @@ int main(int argc, char *argv[]) {
 #ifdef USE_METAL
     flux_metal_cleanup();
 #endif
+#ifdef USE_ROCM
+    flux_rocm_cleanup();
+#endif
 
     return 0;
 }

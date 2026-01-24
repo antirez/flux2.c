@@ -315,11 +315,20 @@ __global__ void kernel_gated_add(float *out, const float *gate,
  *   x_new[2i+1] = x[2i] * sin + x[2i+1] * cos
  * ======================================================================== */
 
+/* RoPE 2D kernel
+ * x: [seq, heads * head_dim]
+ * cos_freq, sin_freq: [seq, head_dim] - frequency tables per position
+ *
+ * Applies rotation to ALL head_dim elements (128), not just axis_dim (32).
+ * Each pair (d, d+1) is rotated by (cos[d], sin[d]).
+ */
 __global__ void kernel_rope_2d(float *x, const float *cos_freq, const float *sin_freq,
                                int seq, int heads, int head_dim, int axis_dim) {
+    (void)axis_dim;  /* Not used - we always process all head_dim elements */
+    
     /* Each thread handles one rotation pair */
     int pair_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int pairs_per_head = axis_dim / 2;
+    int pairs_per_head = head_dim / 2;  /* 64 pairs for head_dim=128 */
     int total_pairs = seq * heads * pairs_per_head;
     
     if (pair_idx >= total_pairs) return;
@@ -329,28 +338,38 @@ __global__ void kernel_rope_2d(float *x, const float *cos_freq, const float *sin
     int head = tmp % heads;
     int s = tmp / heads;
     
-    /* Position in x tensor */
+    /* Position in x tensor: [s, head, d] */
     int x_base = s * (heads * head_dim) + head * head_dim + p * 2;
     
-    /* Position in frequency tensor */
-    int freq_idx = s * axis_dim + p * 2;
+    /* Position in frequency tensor: [s, d] where d is element index */
+    int freq_idx = s * head_dim + p * 2;
     
     float x0 = x[x_base];
     float x1 = x[x_base + 1];
-    float cos_val = cos_freq[freq_idx / 2];  /* cos is stored per pair */
-    float sin_val = sin_freq[freq_idx / 2];
+    float cos_val = cos_freq[freq_idx];  /* cos[d] == cos[d+1] due to repeat_interleave */
+    float sin_val = sin_freq[freq_idx];
     
     x[x_base]     = x0 * cos_val - x1 * sin_val;
     x[x_base + 1] = x0 * sin_val + x1 * cos_val;
 }
 
 /* Unified RoPE for text + image (different frequencies) */
+/* Unified RoPE for text + image (different frequencies)
+ * q, k: [seq, heads * head_dim]
+ * cos/sin tables: [local_seq, head_dim] where local_seq is txt_seq or img_seq
+ *
+ * The CPU code applies RoPE to ALL head_dim elements (128), not just axis_dim (32).
+ * For text positions: axes 0-2 have cos=1, sin=0 (identity), axis 3 has rotation
+ * For image positions: all 4 axes have rotations based on 2D position
+ */
 __global__ void kernel_rope_unified(float *q, float *k,
                                     const float *txt_cos, const float *txt_sin,
                                     const float *img_cos, const float *img_sin,
                                     int seq, int img_offset, int heads, int head_dim, int axis_dim) {
+    (void)axis_dim;  /* Not used - we always process all head_dim elements */
+    
     int pair_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int pairs_per_head = axis_dim / 2;
+    int pairs_per_head = head_dim / 2;  /* 64 pairs for head_dim=128 */
     int total_pairs = seq * heads * pairs_per_head;
     
     if (pair_idx >= total_pairs) return;
@@ -367,8 +386,9 @@ __global__ void kernel_rope_unified(float *q, float *k,
     const float *cos_tbl = is_img ? img_cos : txt_cos;
     const float *sin_tbl = is_img ? img_sin : txt_sin;
     
-    int freq_idx = local_s * pairs_per_head + p;
-    float cos_val = cos_tbl[freq_idx];
+    /* Frequency index: [local_s, d] where d is the pair's element index */
+    int freq_idx = local_s * head_dim + p * 2;
+    float cos_val = cos_tbl[freq_idx];  /* cos[d] == cos[d+1] due to repeat_interleave */
     float sin_val = sin_tbl[freq_idx];
     
     /* Apply to Q */
@@ -481,7 +501,8 @@ void flux_rocm_kernel_gated_add(float *out, const float *gate, const float *proj
 
 void flux_rocm_kernel_rope_2d(float *x, const float *cos_freq, const float *sin_freq,
                               int seq, int heads, int head_dim, int axis_dim, hipStream_t stream) {
-    int pairs_per_head = axis_dim / 2;
+    (void)axis_dim;  /* Not used - we process all head_dim elements */
+    int pairs_per_head = head_dim / 2;  /* 64 pairs for head_dim=128 */
     int total_pairs = seq * heads * pairs_per_head;
     int threads = 256;
     int blocks = (total_pairs + threads - 1) / threads;
@@ -493,7 +514,8 @@ void flux_rocm_kernel_rope_unified(float *q, float *k,
                                    const float *img_cos, const float *img_sin,
                                    int seq, int img_offset, int heads, int head_dim, int axis_dim,
                                    hipStream_t stream) {
-    int pairs_per_head = axis_dim / 2;
+    (void)axis_dim;  /* Not used - we process all head_dim elements */
+    int pairs_per_head = head_dim / 2;  /* 64 pairs for head_dim=128 */
     int total_pairs = seq * heads * pairs_per_head;
     int threads = 256;
     int blocks = (total_pairs + threads - 1) / threads;

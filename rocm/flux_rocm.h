@@ -324,6 +324,35 @@ void flux_rocm_gpu_split_qkv_mlp(flux_rocm_tensor_t fused,
 void flux_rocm_gpu_concat_attn_mlp(flux_rocm_tensor_t attn, flux_rocm_tensor_t mlp,
                                    flux_rocm_tensor_t out, int seq, int hidden, int mlp_hidden);
 
+/* Linear layer on GPU tensors - returns new tensor */
+flux_rocm_tensor_t flux_rocm_gpu_linear(flux_rocm_tensor_t x, const float *W,
+                                        int seq_len, int in_dim, int out_dim);
+
+/* ========================================================================
+ * Double Block Support (GPU tensor operations)
+ * ======================================================================== */
+
+/* RoPE 2D on single tensor (for separate img/txt RoPE) */
+void flux_rocm_gpu_rope_2d(flux_rocm_tensor_t x,
+                           const float *cos_freq, const float *sin_freq,
+                           int seq, int heads, int head_dim);
+
+/* Concatenate K or V tensors from img and txt streams
+ * Order: [txt, img] (matches Python Flux2 implementation)
+ */
+void flux_rocm_gpu_concat_tensors(flux_rocm_tensor_t txt, flux_rocm_tensor_t img,
+                                  flux_rocm_tensor_t out,
+                                  int txt_seq, int img_seq, int hidden);
+
+/* SwiGLU FFN: out = down(silu(gate(x)) * up(x))
+ * All three projections executed on GPU
+ */
+flux_rocm_tensor_t flux_rocm_gpu_swiglu_ffn(flux_rocm_tensor_t x,
+                                            const float *gate_weight,
+                                            const float *up_weight,
+                                            const float *down_weight,
+                                            int seq, int hidden, int mlp_hidden);
+
 /* ========================================================================
  * Batch/Chain API (for operation fusion)
  * ======================================================================== */

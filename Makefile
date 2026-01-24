@@ -50,18 +50,18 @@ endif
 	@echo ""
 	@echo "Example: make mps && ./flux -d flux-klein-model -p \"a cat\" -o cat.png"
 
-# =============================================================================
+# ======================================================================
 # Backend: generic (pure C, no BLAS)
-# =============================================================================
+# ======================================================================
 generic: CFLAGS = $(CFLAGS_BASE) -DGENERIC_BUILD
 generic: clean $(TARGET)
 	@echo ""
 	@echo "Built with GENERIC backend (pure C, no BLAS)"
 	@echo "This will be slow but has zero dependencies."
 
-# =============================================================================
+# ======================================================================
 # Backend: blas (Accelerate on macOS, OpenBLAS on Linux)
-# =============================================================================
+# ======================================================================
 ifeq ($(UNAME_S),Darwin)
 blas: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DACCELERATE_NEW_LAPACK
 blas: LDFLAGS += -framework Accelerate
@@ -73,9 +73,9 @@ blas: clean $(TARGET)
 	@echo ""
 	@echo "Built with BLAS backend (~30x faster than generic)"
 
-# =============================================================================
+# ======================================================================
 # Backend: mps (Apple Silicon Metal GPU)
-# =============================================================================
+# ======================================================================
 ifeq ($(UNAME_S),Darwin)
 ifeq ($(UNAME_M),arm64)
 MPS_CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_METAL -DACCELERATE_NEW_LAPACK
@@ -110,9 +110,9 @@ mps:
 	@exit 1
 endif
 
-# =============================================================================
+# ======================================================================
 # Backend: rocm (AMD GPUs with ROCm/HIP)
-# =============================================================================
+# ======================================================================
 ifeq ($(shell command -v hipcc 2> /dev/null),)
 rocm:
 	@echo "Error: ROCm/hipcc not found. Install ROCm toolkit first."
@@ -152,9 +152,9 @@ rocm/flux_rocm_kernels.o: rocm/flux_rocm_kernels.hip rocm/flux_rocm.h
 
 endif
 
-# =============================================================================
+# ======================================================================
 # Build rules
-# =============================================================================
+# ======================================================================
 $(TARGET): $(OBJS) $(CLI_OBJS) main.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
@@ -171,9 +171,9 @@ debug: CFLAGS = $(DEBUG_CFLAGS)
 debug: LDFLAGS += -fsanitize=address
 debug: clean $(TARGET)
 
-# =============================================================================
+# ======================================================================
 # Test and utilities
-# =============================================================================
+# ======================================================================
 test:
 	@python3 run_test.py --flux-binary ./$(TARGET)
 
@@ -200,6 +200,7 @@ install: $(TARGET) $(LIB)
 clean:
 	rm -f $(OBJS) $(CLI_OBJS) *.mps.o flux_metal.o main.o $(TARGET) $(LIB)
 	rm -f flux_shaders_source.h
+	rm -f *.rocm.o rocm/*.o rocm/*.a
 
 info:
 	@echo "Platform: $(UNAME_S) $(UNAME_M)"
@@ -216,9 +217,9 @@ else
 	@echo "  blas    - OpenBLAS (requires libopenblas-dev)"
 endif
 
-# =============================================================================
+# ======================================================================
 # Dependencies
-# =============================================================================
+# ======================================================================
 flux.o: flux.c flux.h flux_kernels.h flux_safetensors.h flux_qwen3.h
 flux_kernels.o: flux_kernels.c flux_kernels.h
 flux_tokenizer.o: flux_tokenizer.c flux.h
