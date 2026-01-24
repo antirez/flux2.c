@@ -657,7 +657,9 @@ void flux_cuda_sgemm(int ta, int tb, int M, int N, int K,
     if (!g_batch_mode) cudaStreamSynchronize(g_stream);
 }
 
-/* GPU-to-GPU sgemm: works on tensor IDs, no CPU copies! */
+/* GPU-to-GPU sgemm: works on tensor IDs, no CPU copies!
+ * Uses cublasGemmEx with TF32 math mode (set at init for Ampere+).
+ * Inputs/outputs are F32. */
 int flux_cuda_sgemm_gpu(int ta, int tb, int M, int N, int K,
                         float alpha, int A_id, int lda,
                         const float *B, int ldb,
@@ -687,8 +689,15 @@ int flux_cuda_sgemm_gpu(int ta, int tb, int M, int N, int K,
     cublasOperation_t opA = ta ? CUBLAS_OP_T : CUBLAS_OP_N;
     cublasOperation_t opB = tb ? CUBLAS_OP_T : CUBLAS_OP_N;
 
-    cublasStatus_t err = cublasSgemm(g_cublas, opB, opA, N, M, K, &alpha,
-                                      dB, ldb, dA, lda, &beta, dC, ldc);
+    /* Use cublasGemmEx with FP16 fast path for tensor cores */
+    cublasStatus_t err = cublasGemmEx(g_cublas, opB, opA, N, M, K,
+                                       &alpha,
+                                       dB, CUDA_R_32F, ldb,
+                                       dA, CUDA_R_32F, lda,
+                                       &beta,
+                                       dC, CUDA_R_32F, ldc,
+                                       CUBLAS_COMPUTE_32F_FAST_16F,
+                                       CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     return (err == CUBLAS_STATUS_SUCCESS) ? C_id : -1;
 }
 
@@ -739,8 +748,15 @@ int flux_cuda_sgemm_gpu_bf16(int ta, int tb, int M, int N, int K,
     cublasOperation_t opA = ta ? CUBLAS_OP_T : CUBLAS_OP_N;
     cublasOperation_t opB = tb ? CUBLAS_OP_T : CUBLAS_OP_N;
 
-    cublasStatus_t err = cublasSgemm(g_cublas, opB, opA, N, M, K, &alpha,
-                                      dB, ldb, dA, lda, &beta, dC, ldc);
+    /* Use cublasGemmEx with FP16 fast path for tensor cores */
+    cublasStatus_t err = cublasGemmEx(g_cublas, opB, opA, N, M, K,
+                                       &alpha,
+                                       dB, CUDA_R_32F, ldb,
+                                       dA, CUDA_R_32F, lda,
+                                       &beta,
+                                       dC, CUDA_R_32F, ldc,
+                                       CUBLAS_COMPUTE_32F_FAST_16F,
+                                       CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     return (err == CUBLAS_STATUS_SUCCESS) ? C_id : -1;
 }
 
@@ -1358,15 +1374,17 @@ int flux_cuda_attention_t(int out_id, int q_id, int k_id, int v_id,
     long long strideK = seq * hdim;
     long long strideS = seq * seq;
 
-    cublasSgemmStridedBatched(g_cublas,
+    cublasGemmStridedBatchedEx(g_cublas,
         CUBLAS_OP_T, CUBLAS_OP_N,
         seq, seq, hdim,
         &alpha,
-        d_kt, hdim, strideK,
-        d_qt, hdim, strideQ,
+        d_kt, CUDA_R_32F, hdim, strideK,
+        d_qt, CUDA_R_32F, hdim, strideQ,
         &beta,
-        d_scores, seq, strideS,
-        heads);
+        d_scores, CUDA_R_32F, seq, strideS,
+        heads,
+        CUBLAS_COMPUTE_32F_FAST_16F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 
     /* Softmax with scale */
     k_softmax_attention<<<heads * seq, 256, 0, g_stream>>>(d_scores, heads, seq, seq, scale);
@@ -1375,15 +1393,17 @@ int flux_cuda_attention_t(int out_id, int q_id, int k_id, int v_id,
     long long strideV = seq * hdim;
     long long strideO = seq * hdim;
 
-    cublasSgemmStridedBatched(g_cublas,
+    cublasGemmStridedBatchedEx(g_cublas,
         CUBLAS_OP_N, CUBLAS_OP_N,
         hdim, seq, seq,
         &alpha,
-        d_vt, hdim, strideV,
-        d_scores, seq, strideS,
+        d_vt, CUDA_R_32F, hdim, strideV,
+        d_scores, CUDA_R_32F, seq, strideS,
         &beta,
-        d_ot, hdim, strideO,
-        heads);
+        d_ot, CUDA_R_32F, hdim, strideO,
+        heads,
+        CUBLAS_COMPUTE_32F_FAST_16F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 
     /* Transpose output back */
     k_transpose_hsd_to_shd<<<(total + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(d_out, d_ot, seq, heads, hdim);
@@ -1463,54 +1483,62 @@ int flux_cuda_joint_attention_t(int img_out_id, int txt_out_id,
     float alpha = 1.0f, beta = 0.0f;
 
     /* Image attention: img_Q @ cat_K^T -> [heads, img_seq, total_seq] */
-    cublasSgemmStridedBatched(g_cublas,
+    cublasGemmStridedBatchedEx(g_cublas,
         CUBLAS_OP_T, CUBLAS_OP_N,
         total_seq, img_seq, hdim,
         &alpha,
-        d_cat_kt, hdim, (long long)total_seq * hdim,
-        d_img_qt, hdim, (long long)img_seq * hdim,
+        d_cat_kt, CUDA_R_32F, hdim, (long long)total_seq * hdim,
+        d_img_qt, CUDA_R_32F, hdim, (long long)img_seq * hdim,
         &beta,
-        d_img_scores, total_seq, (long long)img_seq * total_seq,
-        heads);
+        d_img_scores, CUDA_R_32F, total_seq, (long long)img_seq * total_seq,
+        heads,
+        CUBLAS_COMPUTE_32F_FAST_16F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 
     /* Softmax for image scores */
     k_softmax_attention<<<heads * img_seq, 256, 0, g_stream>>>(d_img_scores, heads, img_seq, total_seq, scale);
 
     /* Image output: scores @ cat_V -> [heads, img_seq, hdim] */
-    cublasSgemmStridedBatched(g_cublas,
+    cublasGemmStridedBatchedEx(g_cublas,
         CUBLAS_OP_N, CUBLAS_OP_N,
         hdim, img_seq, total_seq,
         &alpha,
-        d_cat_vt, hdim, (long long)total_seq * hdim,
-        d_img_scores, total_seq, (long long)img_seq * total_seq,
+        d_cat_vt, CUDA_R_32F, hdim, (long long)total_seq * hdim,
+        d_img_scores, CUDA_R_32F, total_seq, (long long)img_seq * total_seq,
         &beta,
-        d_img_ot, hdim, (long long)img_seq * hdim,
-        heads);
+        d_img_ot, CUDA_R_32F, hdim, (long long)img_seq * hdim,
+        heads,
+        CUBLAS_COMPUTE_32F_FAST_16F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 
     /* Text attention: txt_Q @ cat_K^T -> [heads, txt_seq, total_seq] */
-    cublasSgemmStridedBatched(g_cublas,
+    cublasGemmStridedBatchedEx(g_cublas,
         CUBLAS_OP_T, CUBLAS_OP_N,
         total_seq, txt_seq, hdim,
         &alpha,
-        d_cat_kt, hdim, (long long)total_seq * hdim,
-        d_txt_qt, hdim, (long long)txt_seq * hdim,
+        d_cat_kt, CUDA_R_32F, hdim, (long long)total_seq * hdim,
+        d_txt_qt, CUDA_R_32F, hdim, (long long)txt_seq * hdim,
         &beta,
-        d_txt_scores, total_seq, (long long)txt_seq * total_seq,
-        heads);
+        d_txt_scores, CUDA_R_32F, total_seq, (long long)txt_seq * total_seq,
+        heads,
+        CUBLAS_COMPUTE_32F_FAST_16F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 
     /* Softmax for text scores */
     k_softmax_attention<<<heads * txt_seq, 256, 0, g_stream>>>(d_txt_scores, heads, txt_seq, total_seq, scale);
 
     /* Text output: scores @ cat_V -> [heads, txt_seq, hdim] */
-    cublasSgemmStridedBatched(g_cublas,
+    cublasGemmStridedBatchedEx(g_cublas,
         CUBLAS_OP_N, CUBLAS_OP_N,
         hdim, txt_seq, total_seq,
         &alpha,
-        d_cat_vt, hdim, (long long)total_seq * hdim,
-        d_txt_scores, total_seq, (long long)txt_seq * total_seq,
+        d_cat_vt, CUDA_R_32F, hdim, (long long)total_seq * hdim,
+        d_txt_scores, CUDA_R_32F, total_seq, (long long)txt_seq * total_seq,
         &beta,
-        d_txt_ot, hdim, (long long)txt_seq * hdim,
-        heads);
+        d_txt_ot, CUDA_R_32F, hdim, (long long)txt_seq * hdim,
+        heads,
+        CUBLAS_COMPUTE_32F_FAST_16F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 
     /* Transpose outputs back */
     k_transpose_hsd_to_shd<<<(img_total + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(d_img_out, d_img_ot, img_seq, heads, hdim);
