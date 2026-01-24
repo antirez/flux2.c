@@ -201,6 +201,16 @@ int flux_cuda_sgemm_gpu(int ta, int tb, int M, int N, int K,
                         const float *B, int ldb,
                         float beta, int C_id, int ldc);
 
+/*
+ * GPU-to-GPU sgemm with bf16 weights. Converts bf16→f32 on GPU then matmul.
+ * A_id and C_id are tensor IDs, B_bf16 is bf16 weight pointer.
+ * Returns C_id on success, -1 on error.
+ */
+int flux_cuda_sgemm_gpu_bf16(int ta, int tb, int M, int N, int K,
+                              float alpha, int A_id, int lda,
+                              const uint16_t *B_bf16, int ldb,
+                              float beta, int C_id, int ldc);
+
 /* GPU Tensor operations - work directly on GPU tensors */
 void flux_cuda_gated_add_t(int out_id, const float *gate, int x_id, int seq, int hidden);
 void flux_cuda_split_fused_t(int fused_id, int q_id, int k_id, int v_id,
