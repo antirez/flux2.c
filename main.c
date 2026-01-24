@@ -35,6 +35,10 @@
 #include "flux_metal.h"
 #endif
 
+#ifdef USE_ROCM
+#include "rocm/flux_rocm.h"
+#endif
+
 /* ========================================================================
  * Verbosity Levels
  * ======================================================================== */
@@ -239,6 +243,12 @@ static void print_usage(const char *prog) {
 int main(int argc, char *argv[]) {
 #ifdef USE_METAL
     flux_metal_init();
+#elif defined(USE_ROCM)
+    if (flux_rocm_init()) {
+        /* ROCm initialized successfully - message printed by init */
+    } else {
+        fprintf(stderr, "ROCm: Falling back to BLAS\n");
+    }
 #elif defined(USE_BLAS)
     fprintf(stderr, "BLAS: CPU acceleration enabled (Accelerate/OpenBLAS)\n");
 #else

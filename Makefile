@@ -37,6 +37,9 @@ ifeq ($(UNAME_M),arm64)
 	@echo "  make mps      - Apple Silicon with Metal GPU (fastest)"
 endif
 endif
+ifneq ($(shell command -v hipcc 2> /dev/null),)
+	@echo "  make rocm     - AMD GPU with ROCm/HIP (fast)"
+endif
 	@echo ""
 	@echo "Other targets:"
 	@echo "  make clean    - Remove build artifacts"
@@ -105,6 +108,48 @@ else
 mps:
 	@echo "Error: MPS backend requires macOS"
 	@exit 1
+endif
+
+# =============================================================================
+# Backend: rocm (AMD GPUs with ROCm/HIP)
+# =============================================================================
+ifeq ($(shell command -v hipcc 2> /dev/null),)
+rocm:
+	@echo "Error: ROCm/hipcc not found. Install ROCm toolkit first."
+	@echo "Visit: https://rocm.docs.amd.com/"
+	@exit 1
+else
+ROCM_PATH ?= /opt/rocm
+HIPCC = hipcc
+GPU_ARCH := $(shell rocminfo 2>/dev/null | grep -o 'gfx[0-9]*' | head -1)
+ifeq ($(GPU_ARCH),)
+GPU_ARCH = native
+endif
+
+ROCM_CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_ROCM -I$(ROCM_PATH)/include -I/usr/include/openblas
+ROCM_LDFLAGS = $(LDFLAGS) -L$(ROCM_PATH)/lib -lopenblas -lhipblas -lamdhip64
+HIPCC_FLAGS = -O3 -fPIC -std=c++17 --offload-arch=$(GPU_ARCH)
+
+# ROCm object files
+ROCM_HIP_OBJS = rocm/flux_rocm.o rocm/flux_rocm_kernels.o
+
+rocm: clean rocm-build
+	@echo ""
+	@echo "Built with ROCm backend (AMD GPU acceleration)"
+	@echo "GPU Architecture: $(GPU_ARCH)"
+
+rocm-build: $(SRCS:.c=.rocm.o) $(CLI_SRCS:.c=.rocm.o) $(ROCM_HIP_OBJS) main.rocm.o
+	$(CC) $(ROCM_CFLAGS) -o $(TARGET) $^ $(ROCM_LDFLAGS) -lstdc++
+
+%.rocm.o: %.c flux.h flux_kernels.h
+	$(CC) $(ROCM_CFLAGS) -c -o $@ $<
+
+rocm/flux_rocm.o: rocm/flux_rocm.cpp rocm/flux_rocm.h
+	$(HIPCC) $(HIPCC_FLAGS) -c -o $@ $<
+
+rocm/flux_rocm_kernels.o: rocm/flux_rocm_kernels.hip rocm/flux_rocm.h
+	$(HIPCC) $(HIPCC_FLAGS) -c -o $@ $<
+
 endif
 
 # =============================================================================
