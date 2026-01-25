@@ -1,0 +1,1463 @@
+/*
+ * FLUX CUDA Acceleration - Implementation
+ *
+ * GPU-accelerated operations using NVIDIA CUDA and cuBLAS.
+ * Inspired by ggml-cuda from stable-diffusion.cpp, but standalone.
+ */
+
+#include "flux_cuda.h"
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+/* ========================================================================
+ * Error Handling Macros
+ * ======================================================================== */
+
+#define CUDA_CHECK(err) do { \
+    cudaError_t e = (err); \
+    if (e != cudaSuccess) { \
+        fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(e)); \
+        return; \
+    } \
+} while(0)
+
+#define CUDA_CHECK_RET(err, ret) do { \
+    cudaError_t e = (err); \
+    if (e != cudaSuccess) { \
+        fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(e)); \
+        return ret; \
+    } \
+} while(0)
+
+#define CUBLAS_CHECK(err) do { \
+    cublasStatus_t e = (err); \
+    if (e != CUBLAS_STATUS_SUCCESS) { \
+        fprintf(stderr, "cuBLAS error %s:%d: %d\n", __FILE__, __LINE__, (int)e); \
+        return; \
+    } \
+} while(0)
+
+/* ========================================================================
+ * Global State
+ * ======================================================================== */
+
+static int g_initialized = 0;
+static int g_available = 0;
+static cublasHandle_t g_cublas = NULL;
+static cudaStream_t g_stream = NULL;
+static int g_batch_mode = 0;
+static char g_device_name[256] = "Unknown";
+static int g_compute_cap = 0;
+
+/* ========================================================================
+ * Weight Cache - Keep weights on GPU permanently
+ * ======================================================================== */
+
+#define WEIGHT_CACHE_SIZE 2048
+
+typedef struct {
+    const void *cpu_ptr;  /* Key: CPU address of weight */
+    void *gpu_ptr;        /* Value: GPU copy */
+    size_t size;
+} weight_cache_entry_t;
+
+static weight_cache_entry_t g_weight_cache[WEIGHT_CACHE_SIZE];
+static int g_weight_cache_count = 0;
+static int g_weight_cache_disabled = 0;  /* Disable cache for mmap mode */
+
+static void* weight_cache_get(const void *cpu_ptr) {
+    for (int i = 0; i < g_weight_cache_count; i++) {
+        if (g_weight_cache[i].cpu_ptr == cpu_ptr) {
+            return g_weight_cache[i].gpu_ptr;
+        }
+    }
+    return NULL;
+}
+
+static void* weight_cache_add(const void *cpu_ptr, size_t size) {
+    if (g_weight_cache_count >= WEIGHT_CACHE_SIZE) return NULL;
+
+    void *gpu_ptr = NULL;
+    if (cudaMalloc(&gpu_ptr, size) != cudaSuccess) return NULL;
+    if (cudaMemcpy(gpu_ptr, cpu_ptr, size, cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaFree(gpu_ptr);
+        return NULL;
+    }
+
+    g_weight_cache[g_weight_cache_count].cpu_ptr = cpu_ptr;
+    g_weight_cache[g_weight_cache_count].gpu_ptr = gpu_ptr;
+    g_weight_cache[g_weight_cache_count].size = size;
+    g_weight_cache_count++;
+
+    return gpu_ptr;
+}
+
+static void flux_cuda_weight_cache_clear(void) {
+    for (int i = 0; i < g_weight_cache_count; i++) {
+        if (g_weight_cache[i].gpu_ptr) cudaFree(g_weight_cache[i].gpu_ptr);
+    }
+    g_weight_cache_count = 0;
+    memset(g_weight_cache, 0, sizeof(g_weight_cache));
+}
+
+void flux_cuda_weight_cache_disable(int disable) {
+    g_weight_cache_disabled = disable;
+    if (disable) {
+        flux_cuda_weight_cache_clear();
+    }
+}
+
+/* ========================================================================
+ * Scratch Buffers - Reusable GPU memory for activations
+ * ======================================================================== */
+
+static float *g_scratch_A = NULL;
+static float *g_scratch_B = NULL;  /* For weights when cache disabled */
+static float *g_scratch_C = NULL;
+static float *g_scratch_small1 = NULL;  /* For small uploads (gate, shift, scale, etc.) */
+static float *g_scratch_small2 = NULL;  /* Second small buffer for pair uploads */
+static uint16_t *g_scratch_bf16 = NULL; /* For bf16 weight uploads */
+static size_t g_scratch_A_size = 0;
+static size_t g_scratch_B_size = 0;
+static size_t g_scratch_C_size = 0;
+static size_t g_scratch_small1_size = 0;
+static size_t g_scratch_small2_size = 0;
+static size_t g_scratch_bf16_size = 0;
+
+static float* ensure_scratch(float **buf, size_t *current, size_t needed) {
+    if (*current >= needed) return *buf;
+    if (*buf) cudaFree(*buf);
+    if (cudaMalloc((void**)buf, needed) != cudaSuccess) {
+        *buf = NULL;
+        *current = 0;
+        return NULL;
+    }
+    *current = needed;
+    return *buf;
+}
+
+static uint16_t* ensure_scratch_bf16(size_t needed) {
+    if (g_scratch_bf16_size >= needed) return g_scratch_bf16;
+    if (g_scratch_bf16) cudaFree(g_scratch_bf16);
+    if (cudaMalloc((void**)&g_scratch_bf16, needed) != cudaSuccess) {
+        g_scratch_bf16 = NULL;
+        g_scratch_bf16_size = 0;
+        return NULL;
+    }
+    g_scratch_bf16_size = needed;
+    return g_scratch_bf16;
+}
+
+/* ========================================================================
+ * GPU Tensor Pool - Keep activations on GPU between operations
+ * ======================================================================== */
+
+#define GPU_TENSOR_POOL_SIZE 64
+
+static struct {
+    float *ptr;
+    size_t size;
+    int in_use;
+} g_tensor_pool[GPU_TENSOR_POOL_SIZE];
+
+int flux_cuda_tensor_get(size_t size) {
+    if (!g_available) return -1;
+
+    /* Find existing free tensor that fits */
+    for (int i = 0; i < GPU_TENSOR_POOL_SIZE; i++) {
+        if (!g_tensor_pool[i].in_use && g_tensor_pool[i].size >= size) {
+            g_tensor_pool[i].in_use = 1;
+            return i;
+        }
+    }
+
+    /* Find empty slot and allocate */
+    for (int i = 0; i < GPU_TENSOR_POOL_SIZE; i++) {
+        if (g_tensor_pool[i].ptr == NULL) {
+            if (cudaMalloc((void**)&g_tensor_pool[i].ptr, size) != cudaSuccess) {
+                return -1;
+            }
+            g_tensor_pool[i].size = size;
+            g_tensor_pool[i].in_use = 1;
+            return i;
+        }
+    }
+
+    return -1;  /* Pool full */
+}
+
+void flux_cuda_tensor_release(int id) {
+    if (id >= 0 && id < GPU_TENSOR_POOL_SIZE) {
+        g_tensor_pool[id].in_use = 0;
+    }
+}
+
+float* flux_cuda_tensor_ptr(int id) {
+    if (id < 0 || id >= GPU_TENSOR_POOL_SIZE) return NULL;
+    return g_tensor_pool[id].ptr;
+}
+
+void flux_cuda_tensor_upload(int id, const float *data, size_t size) {
+    if (id < 0 || id >= GPU_TENSOR_POOL_SIZE || !g_tensor_pool[id].ptr) return;
+    cudaMemcpyAsync(g_tensor_pool[id].ptr, data, size, cudaMemcpyHostToDevice, g_stream);
+}
+
+void flux_cuda_tensor_download(int id, float *data, size_t size) {
+    if (id < 0 || id >= GPU_TENSOR_POOL_SIZE || !g_tensor_pool[id].ptr) return;
+    cudaMemcpyAsync(data, g_tensor_pool[id].ptr, size, cudaMemcpyDeviceToHost, g_stream);
+    cudaStreamSynchronize(g_stream);
+}
+
+/* Copy between GPU tensors (device to device) */
+void flux_cuda_memcpy_d2d(int dst_id, size_t dst_offset, int src_id, size_t src_offset, size_t size) {
+    if (dst_id < 0 || dst_id >= GPU_TENSOR_POOL_SIZE || !g_tensor_pool[dst_id].ptr) return;
+    if (src_id < 0 || src_id >= GPU_TENSOR_POOL_SIZE || !g_tensor_pool[src_id].ptr) return;
+    float *dst = g_tensor_pool[dst_id].ptr + dst_offset / sizeof(float);
+    float *src = g_tensor_pool[src_id].ptr + src_offset / sizeof(float);
+    cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToDevice, g_stream);
+}
+
+/* ========================================================================
+ * Kernel Constants
+ * ======================================================================== */
+
+#define WARP_SIZE 32
+#define BLOCK_1D 256
+#define BLOCK_NORM 256
+
+/* ========================================================================
+ * Initialization
+ * ======================================================================== */
+
+int flux_cuda_init(void) {
+    if (g_initialized) return g_available;
+    g_initialized = 1;
+
+    int count = 0;
+    if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) {
+        fprintf(stderr, "CUDA: No devices found\n");
+        return 0;
+    }
+
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties(&prop, 0) != cudaSuccess) return 0;
+
+    snprintf(g_device_name, sizeof(g_device_name), "%s", prop.name);
+    g_compute_cap = prop.major * 10 + prop.minor;
+
+    printf("CUDA: %s (SM %d.%d, %zu MB)\n", prop.name, prop.major, prop.minor,
+           prop.totalGlobalMem / (1024 * 1024));
+
+    if (cublasCreate(&g_cublas) != CUBLAS_STATUS_SUCCESS) return 0;
+    if (cudaStreamCreate(&g_stream) != cudaSuccess) {
+        cublasDestroy(g_cublas);
+        return 0;
+    }
+
+    cublasSetStream(g_cublas, g_stream);
+    /* TF32 only available on Ampere (sm_80) and newer, not Turing (sm_75) */
+    if (g_compute_cap >= 80) cublasSetMathMode(g_cublas, CUBLAS_TF32_TENSOR_OP_MATH);
+
+    g_available = 1;
+    return 1;
+}
+
+int flux_cuda_available(void) { return g_available; }
+const char* flux_cuda_device_name(void) { return g_device_name; }
+
+void flux_cuda_sync(void) {
+    if (g_available) cudaStreamSynchronize(g_stream);
+}
+
+void flux_cuda_begin_batch(void) { g_batch_mode = 1; }
+void flux_cuda_end_batch(void) { g_batch_mode = 0; flux_cuda_sync(); }
+int flux_cuda_in_batch(void) { return g_batch_mode; }
+size_t flux_cuda_memory_used(void) { return 0; }
+
+/* ========================================================================
+ * CUDA Kernels
+ * ======================================================================== */
+
+__global__ void k_silu(float *x, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = x[i];
+        x[i] = v / (1.0f + expf(-v));
+    }
+}
+
+__global__ void k_silu_mul(float *gate, const float *up, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float g = gate[i];
+        gate[i] = (g / (1.0f + expf(-g))) * up[i];
+    }
+}
+
+__global__ void k_mul(float *a, const float *b, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) a[i] *= b[i];
+}
+
+/* Gated residual: out[i] += gate[i % hidden] * x[i] */
+__global__ void k_gated_add(float *out, const float *gate, const float *x,
+                            int seq, int hidden) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = seq * hidden;
+    if (i < total) {
+        int h = i % hidden;
+        out[i] += gate[h] * x[i];
+    }
+}
+
+/* Split fused output: [seq, fused_dim] -> Q,K,V,gate,up
+ * fused_dim = h*3 + mlp*2, layout per row: [Q(h), K(h), V(h), gate(mlp), up(mlp)]
+ */
+__global__ void k_split_fused(const float *fused, float *q, float *k, float *v,
+                               float *gate, float *up,
+                               int seq, int h, int mlp) {
+    int s = blockIdx.x;
+    if (s >= seq) return;
+
+    int fused_dim = h * 3 + mlp * 2;
+    const float *row = fused + s * fused_dim;
+
+    /* Each thread handles multiple elements */
+    for (int i = threadIdx.x; i < h; i += blockDim.x) {
+        q[s * h + i] = row[i];
+        k[s * h + i] = row[h + i];
+        v[s * h + i] = row[h * 2 + i];
+    }
+    for (int i = threadIdx.x; i < mlp; i += blockDim.x) {
+        gate[s * mlp + i] = row[h * 3 + i];
+        up[s * mlp + i] = row[h * 3 + mlp + i];
+    }
+}
+
+/* Concat: [attn_out, mlp_out] -> concat
+ * concat layout per row: [attn(h), mlp(mlp)]
+ */
+__global__ void k_concat(float *concat, const float *attn, const float *mlp_out,
+                         int seq, int h, int mlp) {
+    int s = blockIdx.x;
+    if (s >= seq) return;
+
+    int concat_dim = h + mlp;
+    float *out_row = concat + s * concat_dim;
+
+    for (int i = threadIdx.x; i < h; i += blockDim.x) {
+        out_row[i] = attn[s * h + i];
+    }
+    for (int i = threadIdx.x; i < mlp; i += blockDim.x) {
+        out_row[h + i] = mlp_out[s * mlp + i];
+    }
+}
+
+__global__ void k_rms_norm(float *out, const float *x, const float *w,
+                            int seq, int hid, float eps) {
+    int row = blockIdx.x;
+    if (row >= seq) return;
+
+    const float *xr = x + row * hid;
+    float *outr = out + row * hid;
+
+    __shared__ float ssum[BLOCK_NORM];
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < hid; i += blockDim.x) {
+        float v = xr[i];
+        sum += v * v;
+    }
+    ssum[threadIdx.x] = sum;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) ssum[threadIdx.x] += ssum[threadIdx.x + s];
+        __syncthreads();
+    }
+
+    float rms = rsqrtf(ssum[0] / hid + eps);
+    for (int i = threadIdx.x; i < hid; i += blockDim.x) {
+        outr[i] = xr[i] * rms * w[i];
+    }
+}
+
+__global__ void k_softmax(float *x, int rows, int cols) {
+    int row = blockIdx.x;
+    if (row >= rows) return;
+
+    float *xr = x + row * cols;
+    __shared__ float smax[BLOCK_NORM], ssum[BLOCK_NORM];
+
+    float mx = -INFINITY;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x)
+        mx = fmaxf(mx, xr[i]);
+    smax[threadIdx.x] = mx;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) smax[threadIdx.x] = fmaxf(smax[threadIdx.x], smax[threadIdx.x + s]);
+        __syncthreads();
+    }
+    mx = smax[0];
+
+    float sm = 0.0f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        float e = expf(xr[i] - mx);
+        xr[i] = e;
+        sm += e;
+    }
+    ssum[threadIdx.x] = sm;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) ssum[threadIdx.x] += ssum[threadIdx.x + s];
+        __syncthreads();
+    }
+    sm = ssum[0];
+
+    for (int i = threadIdx.x; i < cols; i += blockDim.x)
+        xr[i] /= sm;
+}
+
+__global__ void k_qk_rms_norm(float *q, float *k, const float *qw, const float *kw,
+                               int seq, int heads, int hdim, float eps) {
+    int idx = blockIdx.x;
+    int s = idx / heads, h = idx % heads;
+    if (s >= seq) return;
+
+    float *qh = q + s * heads * hdim + h * hdim;
+    float *kh = k + s * heads * hdim + h * hdim;
+
+    __shared__ float sq[BLOCK_NORM], sk[BLOCK_NORM];
+    float sumq = 0, sumk = 0;
+    for (int i = threadIdx.x; i < hdim; i += blockDim.x) {
+        sumq += qh[i] * qh[i];
+        sumk += kh[i] * kh[i];
+    }
+    sq[threadIdx.x] = sumq;
+    sk[threadIdx.x] = sumk;
+    __syncthreads();
+
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+        if (threadIdx.x < st) {
+            sq[threadIdx.x] += sq[threadIdx.x + st];
+            sk[threadIdx.x] += sk[threadIdx.x + st];
+        }
+        __syncthreads();
+    }
+
+    float rmsq = rsqrtf(sq[0] / hdim + eps);
+    float rmsk = rsqrtf(sk[0] / hdim + eps);
+
+    for (int i = threadIdx.x; i < hdim; i += blockDim.x) {
+        qh[i] = qh[i] * rmsq * qw[i];
+        kh[i] = kh[i] * rmsk * kw[i];
+    }
+}
+
+__global__ void k_adaln_norm(float *out, const float *x, const float *shift,
+                              const float *scale, int seq, int hid, float eps) {
+    int row = blockIdx.x;
+    if (row >= seq) return;
+
+    const float *xr = x + row * hid;
+    float *outr = out + row * hid;
+
+    __shared__ float smean[BLOCK_NORM], svar[BLOCK_NORM];
+    float sm = 0, sv = 0;
+    for (int i = threadIdx.x; i < hid; i += blockDim.x) sm += xr[i];
+    smean[threadIdx.x] = sm;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) smean[threadIdx.x] += smean[threadIdx.x + s];
+        __syncthreads();
+    }
+    float mean = smean[0] / hid;
+
+    for (int i = threadIdx.x; i < hid; i += blockDim.x) {
+        float d = xr[i] - mean;
+        sv += d * d;
+    }
+    svar[threadIdx.x] = sv;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) svar[threadIdx.x] += svar[threadIdx.x + s];
+        __syncthreads();
+    }
+    float rstd = rsqrtf(svar[0] / hid + eps);
+
+    for (int i = threadIdx.x; i < hid; i += blockDim.x) {
+        float norm = (xr[i] - mean) * rstd;
+        outr[i] = (1.0f + scale[i]) * norm + shift[i];
+    }
+}
+
+__global__ void k_rope_2d(float *x, const float *cos_f, const float *sin_f,
+                           int seq, int heads, int hdim, int axis_dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = seq * heads * (axis_dim / 2);
+    if (idx >= total) return;
+
+    int s = idx / (heads * (axis_dim / 2));
+    int rem = idx % (heads * (axis_dim / 2));
+    int h = rem / (axis_dim / 2);
+    int p = rem % (axis_dim / 2);
+
+    int freq_idx = s * (axis_dim / 2) + p;
+    float c = cos_f[freq_idx], sn = sin_f[freq_idx];
+
+    int base = s * heads * hdim + h * hdim + p * 2;
+    float x0 = x[base], x1 = x[base + 1];
+    x[base] = x0 * c - x1 * sn;
+    x[base + 1] = x0 * sn + x1 * c;
+}
+
+/* RoPE with sequence offset - applies to x starting at seq_offset
+ * x layout: [total_seq, heads, head_dim]
+ * cos/sin layout: [seq_len, head_dim] (full head_dim, not axis_dim)
+ */
+__global__ void k_rope_2d_offset(float *x, const float *cos_f, const float *sin_f,
+                                  int seq_len, int seq_offset, int heads, int hdim, int axis_dim) {
+    (void)axis_dim;  /* Not used - we apply to all head_dim pairs */
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = seq_len * heads * (hdim / 2);
+    if (idx >= total) return;
+
+    int s = idx / (heads * (hdim / 2));
+    int rem = idx % (heads * (hdim / 2));
+    int h = rem / (hdim / 2);
+    int d = rem % (hdim / 2);  /* pair index: 0..63 for hdim=128 */
+
+    /* cos/sin index: [s, d*2] */
+    int freq_idx = s * hdim + d * 2;
+    float c = cos_f[freq_idx];
+    float sn = sin_f[freq_idx];
+
+    /* x index with offset */
+    int base = (seq_offset + s) * heads * hdim + h * hdim + d * 2;
+    float x0 = x[base], x1 = x[base + 1];
+
+    /* Complex rotation: (x0 + i*x1) * (cos + i*sin) */
+    x[base] = x0 * c - x1 * sn;
+    x[base + 1] = x1 * c + x0 * sn;  /* Note: x1*cos + x0*sin, not x0*sin + x1*cos */
+}
+
+/* BF16 to F32 conversion kernel */
+__global__ void k_bf16_to_f32(float *out, const uint16_t *in, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        uint32_t bits = ((uint32_t)in[i]) << 16;
+        out[i] = __int_as_float(bits);
+    }
+}
+
+/* ========================================================================
+ * cuBLAS Matrix Multiplication
+ * ======================================================================== */
+
+void flux_cuda_sgemm(int ta, int tb, int M, int N, int K,
+                     float alpha, const float *A, int lda,
+                     const float *B, int ldb, float beta, float *C, int ldc) {
+    if (!g_available) return;
+
+    size_t szA = (size_t)(ta ? K * M : M * K) * sizeof(float);
+    size_t szB = (size_t)(tb ? N * K : K * N) * sizeof(float);
+    size_t szC = (size_t)M * N * sizeof(float);
+
+    /* A = activations, use scratch buffer */
+    float *dA = ensure_scratch(&g_scratch_A, &g_scratch_A_size, szA);
+    if (!dA) return;
+    CUDA_CHECK(cudaMemcpyAsync(dA, A, szA, cudaMemcpyHostToDevice, g_stream));
+
+    /* B = weights - use cache if enabled, scratch buffer otherwise */
+    float *dB;
+    if (g_weight_cache_disabled) {
+        dB = ensure_scratch(&g_scratch_B, &g_scratch_B_size, szB);
+        if (!dB) return;
+        CUDA_CHECK(cudaMemcpyAsync(dB, B, szB, cudaMemcpyHostToDevice, g_stream));
+    } else {
+        dB = (float*)weight_cache_get(B);
+        if (!dB) {
+            dB = (float*)weight_cache_add(B, szB);
+            if (!dB) return;  /* Cache full and can't allocate */
+        }
+    }
+
+    /* C = output, use scratch buffer */
+    float *dC = ensure_scratch(&g_scratch_C, &g_scratch_C_size, szC);
+    if (!dC) return;
+    if (beta != 0.0f) CUDA_CHECK(cudaMemcpyAsync(dC, C, szC, cudaMemcpyHostToDevice, g_stream));
+
+    cublasOperation_t opA = ta ? CUBLAS_OP_T : CUBLAS_OP_N;
+    cublasOperation_t opB = tb ? CUBLAS_OP_T : CUBLAS_OP_N;
+
+    CUBLAS_CHECK(cublasSgemm(g_cublas, opB, opA, N, M, K, &alpha,
+                             dB, ldb, dA, lda, &beta, dC, ldc));
+
+    CUDA_CHECK(cudaMemcpyAsync(C, dC, szC, cudaMemcpyDeviceToHost, g_stream));
+    if (!g_batch_mode) cudaStreamSynchronize(g_stream);
+}
+
+/* GPU-to-GPU sgemm: works on tensor IDs, no CPU copies!
+ * Uses cublasGemmEx with TF32 math mode (set at init for Ampere+).
+ * Inputs/outputs are F32. */
+int flux_cuda_sgemm_gpu(int ta, int tb, int M, int N, int K,
+                        float alpha, int A_id, int lda,
+                        const float *B, int ldb,
+                        float beta, int C_id, int ldc) {
+    if (!g_available) return -1;
+
+    float *dA = flux_cuda_tensor_ptr(A_id);
+    float *dC = flux_cuda_tensor_ptr(C_id);
+    if (!dA || !dC) return -1;
+
+    /* B = weights - use cache if enabled, scratch buffer otherwise */
+    size_t szB = (size_t)(tb ? N * K : K * N) * sizeof(float);
+    float *dB;
+    if (g_weight_cache_disabled) {
+        dB = ensure_scratch(&g_scratch_B, &g_scratch_B_size, szB);
+        if (!dB) return -1;
+        cudaError_t e = cudaMemcpyAsync(dB, B, szB, cudaMemcpyHostToDevice, g_stream);
+        if (e != cudaSuccess) return -1;
+    } else {
+        dB = (float*)weight_cache_get(B);
+        if (!dB) {
+            dB = (float*)weight_cache_add(B, szB);
+            if (!dB) return -1;
+        }
+    }
+
+    cublasOperation_t opA = ta ? CUBLAS_OP_T : CUBLAS_OP_N;
+    cublasOperation_t opB = tb ? CUBLAS_OP_T : CUBLAS_OP_N;
+
+    /* Use cublasGemmEx with FP16 fast path for tensor cores */
+    cublasStatus_t err = cublasGemmEx(g_cublas, opB, opA, N, M, K,
+                                       &alpha,
+                                       dB, CUDA_R_32F, ldb,
+                                       dA, CUDA_R_32F, lda,
+                                       &beta,
+                                       dC, CUDA_R_32F, ldc,
+                                       CUBLAS_COMPUTE_32F_FAST_16F,
+                                       CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    return (err == CUBLAS_STATUS_SUCCESS) ? C_id : -1;
+}
+
+/* GPU-to-GPU sgemm with bf16 weights: converts bf16->f32 on GPU, then matmul.
+ * Uses weight cache to avoid repeated uploads/conversions (mmap mode only).
+ * In no-mmap mode, cache is disabled because malloc'd pointers can be reused. */
+int flux_cuda_sgemm_gpu_bf16(int ta, int tb, int M, int N, int K,
+                              float alpha, int A_id, int lda,
+                              const uint16_t *B_bf16, int ldb,
+                              float beta, int C_id, int ldc) {
+    if (!g_available) return -1;
+
+    float *dA = flux_cuda_tensor_ptr(A_id);
+    float *dC = flux_cuda_tensor_ptr(C_id);
+    if (!dA || !dC) return -1;
+
+    int num_weights = tb ? N * K : K * N;
+    size_t szB_f32 = (size_t)num_weights * sizeof(float);
+    float *dB = NULL;
+    int needs_free = 0;
+
+    /* Check cache only if enabled (mmap mode has stable pointers) */
+    if (!g_weight_cache_disabled) {
+        dB = (float*)weight_cache_get(B_bf16);
+    }
+
+    if (!dB) {
+        /* Allocate GPU buffer, upload bf16, convert to f32 */
+        void *gpu_ptr = NULL;
+        if (cudaMalloc(&gpu_ptr, szB_f32) != cudaSuccess) return -1;
+        dB = (float*)gpu_ptr;
+
+        /* Upload bf16 to scratch and convert to f32 */
+        size_t szB_bf16 = (size_t)num_weights * sizeof(uint16_t);
+        uint16_t *dB_bf16 = ensure_scratch_bf16(szB_bf16);
+        if (!dB_bf16) { cudaFree(gpu_ptr); return -1; }
+
+        cudaMemcpyAsync(dB_bf16, B_bf16, szB_bf16, cudaMemcpyHostToDevice, g_stream);
+        int blk = (num_weights + BLOCK_1D - 1) / BLOCK_1D;
+        k_bf16_to_f32<<<blk, BLOCK_1D, 0, g_stream>>>(dB, dB_bf16, num_weights);
+
+        /* Cache only if enabled, otherwise mark for free after use */
+        if (!g_weight_cache_disabled && g_weight_cache_count < WEIGHT_CACHE_SIZE) {
+            g_weight_cache[g_weight_cache_count].cpu_ptr = B_bf16;
+            g_weight_cache[g_weight_cache_count].gpu_ptr = gpu_ptr;
+            g_weight_cache[g_weight_cache_count].size = szB_f32;
+            g_weight_cache_count++;
+        } else {
+            needs_free = 1;
+        }
+    }
+
+    cublasOperation_t opA = ta ? CUBLAS_OP_T : CUBLAS_OP_N;
+    cublasOperation_t opB = tb ? CUBLAS_OP_T : CUBLAS_OP_N;
+
+    /* Use cublasGemmEx with FP16 fast path for tensor cores */
+    cublasStatus_t err = cublasGemmEx(g_cublas, opB, opA, N, M, K,
+                                       &alpha,
+                                       dB, CUDA_R_32F, ldb,
+                                       dA, CUDA_R_32F, lda,
+                                       &beta,
+                                       dC, CUDA_R_32F, ldc,
+                                       CUBLAS_COMPUTE_32F_FAST_16F,
+                                       CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+    if (needs_free) {
+        cudaStreamSynchronize(g_stream);
+        cudaFree(dB);
+    }
+
+    return (err == CUBLAS_STATUS_SUCCESS) ? C_id : -1;
+}
+
+void flux_cuda_sgemm_bf16(int ta, int tb, int M, int N, int K,
+                          float alpha, const float *A, int lda,
+                          const uint16_t *B_bf16, int ldb,
+                          float beta, float *C, int ldc) {
+    if (!g_available) return;
+
+    /* Convert bf16 to f32 */
+    size_t szB = (size_t)(tb ? N * K : K * N);
+    float *B_f32 = (float *)malloc(szB * sizeof(float));
+    if (!B_f32) return;
+
+    for (size_t i = 0; i < szB; i++) {
+        uint32_t bits = ((uint32_t)B_bf16[i]) << 16;
+        memcpy(&B_f32[i], &bits, sizeof(float));
+    }
+
+    flux_cuda_sgemm(ta, tb, M, N, K, alpha, A, lda, B_f32, ldb, beta, C, ldc);
+    free(B_f32);
+}
+
+/* ========================================================================
+ * GPU Tensor Operations - Work on tensors already on GPU
+ * ======================================================================== */
+
+void flux_cuda_gated_add_t(int out_id, const float *gate, int x_id, int seq, int hidden) {
+    if (!g_available) return;
+    float *d_out = flux_cuda_tensor_ptr(out_id);
+    float *d_x = flux_cuda_tensor_ptr(x_id);
+    if (!d_out || !d_x) return;
+
+    /* Upload gate using scratch buffer */
+    size_t gate_sz = hidden * sizeof(float);
+    float *d_gate = ensure_scratch(&g_scratch_small1, &g_scratch_small1_size, gate_sz);
+    if (!d_gate) return;
+    CUDA_CHECK(cudaMemcpyAsync(d_gate, gate, gate_sz, cudaMemcpyHostToDevice, g_stream));
+
+    int total = seq * hidden;
+    k_gated_add<<<(total + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(d_out, d_gate, d_x, seq, hidden);
+}
+
+void flux_cuda_split_fused_t(int fused_id, int q_id, int k_id, int v_id,
+                             int gate_id, int up_id, int seq, int h, int mlp) {
+    if (!g_available) return;
+    float *d_fused = flux_cuda_tensor_ptr(fused_id);
+    float *d_q = flux_cuda_tensor_ptr(q_id);
+    float *d_k = flux_cuda_tensor_ptr(k_id);
+    float *d_v = flux_cuda_tensor_ptr(v_id);
+    float *d_gate = flux_cuda_tensor_ptr(gate_id);
+    float *d_up = flux_cuda_tensor_ptr(up_id);
+    if (!d_fused || !d_q || !d_k || !d_v || !d_gate || !d_up) return;
+
+    k_split_fused<<<seq, BLOCK_1D, 0, g_stream>>>(d_fused, d_q, d_k, d_v, d_gate, d_up, seq, h, mlp);
+}
+
+void flux_cuda_concat_t(int concat_id, int attn_id, int mlp_id, int seq, int h, int mlp) {
+    if (!g_available) return;
+    float *d_concat = flux_cuda_tensor_ptr(concat_id);
+    float *d_attn = flux_cuda_tensor_ptr(attn_id);
+    float *d_mlp = flux_cuda_tensor_ptr(mlp_id);
+    if (!d_concat || !d_attn || !d_mlp) return;
+
+    k_concat<<<seq, BLOCK_1D, 0, g_stream>>>(d_concat, d_attn, d_mlp, seq, h, mlp);
+}
+
+void flux_cuda_silu_t(int tensor_id, int n) {
+    if (!g_available) return;
+    float *d = flux_cuda_tensor_ptr(tensor_id);
+    if (!d) return;
+    k_silu<<<(n + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(d, n);
+}
+
+void flux_cuda_mul_t(int a_id, int b_id, int n) {
+    if (!g_available) return;
+    float *d_a = flux_cuda_tensor_ptr(a_id);
+    float *d_b = flux_cuda_tensor_ptr(b_id);
+    if (!d_a || !d_b) return;
+    k_mul<<<(n + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(d_a, d_b, n);
+}
+
+void flux_cuda_adaln_t(int out_id, int x_id, const float *shift, const float *scale,
+                       int seq, int hid, float eps) {
+    if (!g_available) return;
+    float *d_out = flux_cuda_tensor_ptr(out_id);
+    float *d_x = flux_cuda_tensor_ptr(x_id);
+    if (!d_out || !d_x) return;
+
+    /* Upload shift/scale using scratch buffers */
+    size_t sz = hid * sizeof(float);
+    float *d_sh = ensure_scratch(&g_scratch_small1, &g_scratch_small1_size, sz);
+    float *d_sc = ensure_scratch(&g_scratch_small2, &g_scratch_small2_size, sz);
+    if (!d_sh || !d_sc) return;
+    CUDA_CHECK(cudaMemcpyAsync(d_sh, shift, sz, cudaMemcpyHostToDevice, g_stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_sc, scale, sz, cudaMemcpyHostToDevice, g_stream));
+
+    k_adaln_norm<<<seq, BLOCK_NORM, 0, g_stream>>>(d_out, d_x, d_sh, d_sc, seq, hid, eps);
+}
+
+void flux_cuda_qk_norm_t(int q_id, int k_id, const float *qw, const float *kw,
+                         int seq, int heads, int hdim, float eps) {
+    if (!g_available) return;
+    float *d_q = flux_cuda_tensor_ptr(q_id);
+    float *d_k = flux_cuda_tensor_ptr(k_id);
+    if (!d_q || !d_k) return;
+
+    /* Upload weights using scratch buffers */
+    size_t sz = hdim * sizeof(float);
+    float *d_qw = ensure_scratch(&g_scratch_small1, &g_scratch_small1_size, sz);
+    float *d_kw = ensure_scratch(&g_scratch_small2, &g_scratch_small2_size, sz);
+    if (!d_qw || !d_kw) return;
+    CUDA_CHECK(cudaMemcpyAsync(d_qw, qw, sz, cudaMemcpyHostToDevice, g_stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_kw, kw, sz, cudaMemcpyHostToDevice, g_stream));
+
+    k_qk_rms_norm<<<seq * heads, BLOCK_NORM, 0, g_stream>>>(d_q, d_k, d_qw, d_kw, seq, heads, hdim, eps);
+}
+
+/* RoPE 2D using tensor pool for cos/sin - full head_dim version */
+void flux_cuda_rope_2d_full_t(int x_id, const float *cos_f, const float *sin_f,
+                               int seq, int heads, int hdim) {
+    if (!g_available) return;
+    float *d_x = flux_cuda_tensor_ptr(x_id);
+    if (!d_x) return;
+
+    size_t szf = (size_t)seq * hdim * sizeof(float);
+    int t_c = flux_cuda_tensor_get(szf);
+    int t_s = flux_cuda_tensor_get(szf);
+    if (t_c < 0 || t_s < 0) {
+        flux_cuda_tensor_release(t_c);
+        flux_cuda_tensor_release(t_s);
+        return;
+    }
+
+    float *d_c = flux_cuda_tensor_ptr(t_c);
+    float *d_s = flux_cuda_tensor_ptr(t_s);
+    cudaMemcpyAsync(d_c, cos_f, szf, cudaMemcpyHostToDevice, g_stream);
+    cudaMemcpyAsync(d_s, sin_f, szf, cudaMemcpyHostToDevice, g_stream);
+
+    /* Apply to all pairs in head_dim */
+    int total = seq * heads * (hdim / 2);
+    k_rope_2d_offset<<<(total + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(
+        d_x, d_c, d_s, seq, 0, heads, hdim, hdim);
+
+    flux_cuda_tensor_release(t_c);
+    flux_cuda_tensor_release(t_s);
+}
+
+/* RoPE with offset - applies to portion of tensor starting at seq_offset
+ * Uses tensor pool instead of malloc/free */
+void flux_cuda_rope_offset_t(int x_id, const float *cos_f, const float *sin_f,
+                              int seq_len, int seq_offset, int heads, int hdim, int axis_dim) {
+    (void)axis_dim;  /* We use hdim directly */
+    if (!g_available) return;
+    float *d_x = flux_cuda_tensor_ptr(x_id);
+    if (!d_x) return;
+
+    /* cos/sin are [seq_len, hdim] */
+    size_t szf = (size_t)seq_len * hdim * sizeof(float);
+    int t_c = flux_cuda_tensor_get(szf);
+    int t_s = flux_cuda_tensor_get(szf);
+    if (t_c < 0 || t_s < 0) {
+        flux_cuda_tensor_release(t_c);
+        flux_cuda_tensor_release(t_s);
+        return;
+    }
+
+    float *d_c = flux_cuda_tensor_ptr(t_c);
+    float *d_s = flux_cuda_tensor_ptr(t_s);
+    cudaMemcpyAsync(d_c, cos_f, szf, cudaMemcpyHostToDevice, g_stream);
+    cudaMemcpyAsync(d_s, sin_f, szf, cudaMemcpyHostToDevice, g_stream);
+
+    int total = seq_len * heads * (hdim / 2);
+    k_rope_2d_offset<<<(total + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(
+        d_x, d_c, d_s, seq_len, seq_offset, heads, hdim, axis_dim);
+
+    flux_cuda_tensor_release(t_c);
+    flux_cuda_tensor_release(t_s);
+}
+
+/* ========================================================================
+ * Conv2D with im2col + cuBLAS
+ * ======================================================================== */
+
+/* im2col kernel: extract patches for convolution */
+__global__ void k_im2col(float *col, const float *in,
+                         int in_ch, int H, int W,
+                         int kH, int kW, int outH, int outW,
+                         int stride, int padding, size_t total) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    /* Decode index: col is [in_ch*kH*kW, outH*outW] */
+    size_t spatial = (size_t)outH * outW;
+    int ow = idx % outW;
+    int oh = (idx / outW) % outH;
+    int kw = (idx / spatial) % kW;
+    int kh = (idx / spatial / kW) % kH;
+    int ic = idx / spatial / kW / kH;
+
+    int ih = oh * stride - padding + kh;
+    int iw = ow * stride - padding + kw;
+
+    float val = 0.0f;
+    if (ih >= 0 && ih < H && iw >= 0 && iw < W) {
+        val = in[ic * H * W + ih * W + iw];
+    }
+
+    /* col layout: [in_ch*kH*kW, outH*outW] row-major */
+    int col_row = ic * kH * kW + kh * kW + kw;
+    size_t col_col = (size_t)oh * outW + ow;
+    col[(size_t)col_row * spatial + col_col] = val;
+}
+
+/* Add bias kernel */
+__global__ void k_add_bias_conv(float *out, const float *bias,
+                                 int out_ch, int spatial) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = out_ch * spatial;
+    if (idx >= total) return;
+
+    int oc = idx / spatial;
+    out[idx] += bias[oc];
+}
+
+int flux_cuda_conv2d(float *out, const float *in, const float *weight, const float *bias,
+                     int batch, int in_ch, int out_ch, int H, int W, int kH, int kW,
+                     int stride, int padding) {
+    if (!g_available) return 0;
+
+    int outH = (H + 2 * padding - kH) / stride + 1;
+    int outW = (W + 2 * padding - kW) / stride + 1;
+    int col_rows = in_ch * kH * kW;
+    int col_cols = outH * outW;
+
+    /* Allocate GPU buffers */
+    size_t sz_in = (size_t)in_ch * H * W * sizeof(float);
+    size_t sz_out = (size_t)out_ch * outH * outW * sizeof(float);
+    size_t sz_col = (size_t)col_rows * col_cols * sizeof(float);
+    size_t sz_weight = (size_t)out_ch * col_rows * sizeof(float);
+
+    float *d_in, *d_out, *d_col, *d_weight, *d_bias = NULL;
+    if (cudaMalloc(&d_in, sz_in) != cudaSuccess) return 0;
+    if (cudaMalloc(&d_out, sz_out) != cudaSuccess) { cudaFree(d_in); return 0; }
+    if (cudaMalloc(&d_col, sz_col) != cudaSuccess) { cudaFree(d_in); cudaFree(d_out); return 0; }
+    if (cudaMalloc(&d_weight, sz_weight) != cudaSuccess) { cudaFree(d_in); cudaFree(d_out); cudaFree(d_col); return 0; }
+    if (bias) {
+        if (cudaMalloc(&d_bias, out_ch * sizeof(float)) != cudaSuccess) {
+            cudaFree(d_in); cudaFree(d_out); cudaFree(d_col); cudaFree(d_weight);
+            return 0;
+        }
+        cudaMemcpy(d_bias, bias, out_ch * sizeof(float), cudaMemcpyHostToDevice);
+    }
+
+    /* Upload weight once (same for all batches) */
+    cudaMemcpy(d_weight, weight, sz_weight, cudaMemcpyHostToDevice);
+
+    for (int b = 0; b < batch; b++) {
+        const float *in_b = in + b * in_ch * H * W;
+        float *out_b = out + b * out_ch * outH * outW;
+
+        /* Upload input */
+        cudaMemcpy(d_in, in_b, sz_in, cudaMemcpyHostToDevice);
+
+        /* im2col with 64-bit indexing for large convolutions */
+        size_t total_col = (size_t)in_ch * kH * kW * outH * outW;
+        size_t grid_size = (total_col + BLOCK_1D - 1) / BLOCK_1D;
+        k_im2col<<<grid_size, BLOCK_1D, 0, g_stream>>>(
+            d_col, d_in, in_ch, H, W, kH, kW, outH, outW, stride, padding, total_col);
+
+        /* GEMM: out = weight @ col
+         * weight: [out_ch, col_rows], col: [col_rows, col_cols]
+         * out: [out_ch, col_cols] = [out_ch, outH*outW]
+         */
+        float alpha = 1.0f, beta = 0.0f;
+        cublasSgemm(g_cublas,
+                    CUBLAS_OP_N, CUBLAS_OP_N,
+                    col_cols, out_ch, col_rows,  /* m, n, k for col-major */
+                    &alpha,
+                    d_col, col_cols,             /* A = col */
+                    d_weight, col_rows,          /* B = weight */
+                    &beta,
+                    d_out, col_cols);            /* C = out */
+
+        /* Add bias if present */
+        if (d_bias) {
+            int spatial = outH * outW;
+            k_add_bias_conv<<<(out_ch * spatial + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(
+                d_out, d_bias, out_ch, spatial);
+        }
+
+        /* Download output */
+        cudaMemcpy(out_b, d_out, sz_out, cudaMemcpyDeviceToHost);
+    }
+
+    cudaFree(d_in); cudaFree(d_out); cudaFree(d_col); cudaFree(d_weight);
+    if (d_bias) cudaFree(d_bias);
+    return 1;
+}
+
+/* Causal softmax kernel with attention mask */
+__global__ void k_causal_softmax(float *scores, const int *mask, int seq, float scale) {
+    int row = blockIdx.x;  /* One block per row */
+    if (row >= seq) return;
+
+    float *row_data = scores + row * seq;
+
+    /* Apply scale and causal mask, find max */
+    __shared__ float smax[256];
+    float mx = -INFINITY;
+    for (int i = threadIdx.x; i < seq; i += blockDim.x) {
+        float val = row_data[i] * scale;
+        /* Causal mask: can only attend to positions <= row */
+        if (i > row) val = -INFINITY;
+        /* Attention mask: 0 = masked, 1 = allowed */
+        if (mask && mask[i] == 0) val = -INFINITY;
+        row_data[i] = val;
+        mx = fmaxf(mx, val);
+    }
+    smax[threadIdx.x] = mx;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) smax[threadIdx.x] = fmaxf(smax[threadIdx.x], smax[threadIdx.x + s]);
+        __syncthreads();
+    }
+    mx = smax[0];
+
+    /* Exp and sum */
+    __shared__ float ssum[256];
+    float sm = 0;
+    for (int i = threadIdx.x; i < seq; i += blockDim.x) {
+        float e = expf(row_data[i] - mx);
+        row_data[i] = e;
+        sm += e;
+    }
+    ssum[threadIdx.x] = sm;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) ssum[threadIdx.x] += ssum[threadIdx.x + s];
+        __syncthreads();
+    }
+    sm = ssum[0];
+
+    /* Normalize */
+    for (int i = threadIdx.x; i < seq; i += blockDim.x) {
+        row_data[i] /= sm;
+    }
+}
+
+int flux_cuda_causal_attention(float *out, const float *Q, const float *K, const float *V,
+                               const int *attention_mask, int seq, int num_q_heads,
+                               int num_kv_heads, int head_dim, float scale) {
+    if (!g_available) return 0;
+
+    int heads_per_kv = num_q_heads / num_kv_heads;
+    int q_dim = num_q_heads * head_dim;
+    int kv_dim = num_kv_heads * head_dim;
+
+    /* Allocate GPU buffers */
+    size_t sz_q = (size_t)seq * q_dim * sizeof(float);
+    size_t sz_kv = (size_t)seq * kv_dim * sizeof(float);
+    size_t sz_out = sz_q;
+    size_t sz_scores = (size_t)seq * seq * sizeof(float);
+
+    float *d_q, *d_k, *d_v, *d_out, *d_scores;
+    int *d_mask = NULL;
+
+    if (cudaMalloc(&d_q, sz_q) != cudaSuccess) return 0;
+    if (cudaMalloc(&d_k, sz_kv) != cudaSuccess) { cudaFree(d_q); return 0; }
+    if (cudaMalloc(&d_v, sz_kv) != cudaSuccess) { cudaFree(d_q); cudaFree(d_k); return 0; }
+    if (cudaMalloc(&d_out, sz_out) != cudaSuccess) { cudaFree(d_q); cudaFree(d_k); cudaFree(d_v); return 0; }
+    if (cudaMalloc(&d_scores, sz_scores) != cudaSuccess) { cudaFree(d_q); cudaFree(d_k); cudaFree(d_v); cudaFree(d_out); return 0; }
+
+    if (attention_mask) {
+        if (cudaMalloc(&d_mask, seq * sizeof(int)) != cudaSuccess) {
+            cudaFree(d_q); cudaFree(d_k); cudaFree(d_v); cudaFree(d_out); cudaFree(d_scores);
+            return 0;
+        }
+        cudaMemcpy(d_mask, attention_mask, seq * sizeof(int), cudaMemcpyHostToDevice);
+    }
+
+    /* Upload Q, K, V */
+    cudaMemcpy(d_q, Q, sz_q, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_k, K, sz_kv, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_v, V, sz_kv, cudaMemcpyHostToDevice);
+
+    /* Zero output */
+    cudaMemset(d_out, 0, sz_out);
+
+    /* Process each query head */
+    for (int qh = 0; qh < num_q_heads; qh++) {
+        int kvh = qh / heads_per_kv;  /* GQA: which KV head to use */
+
+        float *q_head = d_q + qh * head_dim;  /* strided access */
+        float *k_head = d_k + kvh * head_dim;
+        float *v_head = d_v + kvh * head_dim;
+        float *out_head = d_out + qh * head_dim;
+
+        /* scores = Q @ K^T : [seq, seq]
+         * Q: [seq, head_dim] with stride q_dim
+         * K: [seq, head_dim] with stride kv_dim
+         */
+        float alpha = 1.0f, beta = 0.0f;
+        cublasSgemm(g_cublas,
+                    CUBLAS_OP_T, CUBLAS_OP_N,
+                    seq, seq, head_dim,
+                    &alpha,
+                    k_head, kv_dim,   /* K^T */
+                    q_head, q_dim,    /* Q */
+                    &beta,
+                    d_scores, seq);
+
+        /* Causal softmax with scale */
+        k_causal_softmax<<<seq, 256, 0, g_stream>>>(d_scores, d_mask, seq, scale);
+
+        /* out = scores @ V : [seq, head_dim]
+         * scores: [seq, seq]
+         * V: [seq, head_dim] with stride kv_dim
+         */
+        cublasSgemm(g_cublas,
+                    CUBLAS_OP_N, CUBLAS_OP_N,
+                    head_dim, seq, seq,
+                    &alpha,
+                    v_head, kv_dim,   /* V */
+                    d_scores, seq,    /* scores */
+                    &beta,
+                    out_head, q_dim); /* out (strided) */
+    }
+
+    /* Download result */
+    cudaMemcpy(out, d_out, sz_out, cudaMemcpyDeviceToHost);
+
+    cudaFree(d_q); cudaFree(d_k); cudaFree(d_v); cudaFree(d_out); cudaFree(d_scores);
+    if (d_mask) cudaFree(d_mask);
+
+    return 1;
+}
+
+/* ========================================================================
+ * GPU Tensor Attention - operates on tensor IDs
+ * Q,K,V layout: [seq, heads, head_dim] (packed as [seq, hidden])
+ * Uses cuBLAS batched gemm for all heads in parallel
+ * ======================================================================== */
+
+/* Transpose kernel: [seq, heads, hdim] -> [heads, seq, hdim] */
+__global__ void k_transpose_shd_to_hsd(float *out, const float *in,
+                                        int seq, int heads, int hdim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = seq * heads * hdim;
+    if (idx >= total) return;
+
+    int s = idx / (heads * hdim);
+    int rem = idx % (heads * hdim);
+    int h = rem / hdim;
+    int d = rem % hdim;
+
+    /* in: [s, h, d], out: [h, s, d] */
+    int out_idx = h * seq * hdim + s * hdim + d;
+    out[out_idx] = in[idx];
+}
+
+/* Transpose kernel: [heads, seq, hdim] -> [seq, heads, hdim] */
+__global__ void k_transpose_hsd_to_shd(float *out, const float *in,
+                                        int seq, int heads, int hdim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = seq * heads * hdim;
+    if (idx >= total) return;
+
+    int h = idx / (seq * hdim);
+    int rem = idx % (seq * hdim);
+    int s = rem / hdim;
+    int d = rem % hdim;
+
+    /* in: [h, s, d], out: [s, h, d] */
+    int out_idx = s * heads * hdim + h * hdim + d;
+    out[out_idx] = in[idx];
+}
+
+/* Softmax per row for attention scores [heads, seq_q, seq_k] */
+__global__ void k_softmax_attention(float *scores, int heads, int seq_q, int seq_k, float scale) {
+    int idx = blockIdx.x;  /* One block per row */
+    if (idx >= heads * seq_q) return;
+
+    float *row = scores + idx * seq_k;
+
+    /* Scale and find max */
+    __shared__ float smax[256];
+    float mx = -INFINITY;
+    for (int i = threadIdx.x; i < seq_k; i += blockDim.x) {
+        row[i] *= scale;
+        mx = fmaxf(mx, row[i]);
+    }
+    smax[threadIdx.x] = mx;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) smax[threadIdx.x] = fmaxf(smax[threadIdx.x], smax[threadIdx.x + s]);
+        __syncthreads();
+    }
+    mx = smax[0];
+
+    /* Exp and sum */
+    __shared__ float ssum[256];
+    float sm = 0;
+    for (int i = threadIdx.x; i < seq_k; i += blockDim.x) {
+        float e = expf(row[i] - mx);
+        row[i] = e;
+        sm += e;
+    }
+    ssum[threadIdx.x] = sm;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) ssum[threadIdx.x] += ssum[threadIdx.x + s];
+        __syncthreads();
+    }
+    sm = ssum[0];
+
+    /* Normalize */
+    for (int i = threadIdx.x; i < seq_k; i += blockDim.x) {
+        row[i] /= sm;
+    }
+}
+
+int flux_cuda_attention_t(int out_id, int q_id, int k_id, int v_id,
+                          int seq, int heads, int hdim, float scale) {
+    if (!g_available) return 0;
+
+    float *d_q = flux_cuda_tensor_ptr(q_id);
+    float *d_k = flux_cuda_tensor_ptr(k_id);
+    float *d_v = flux_cuda_tensor_ptr(v_id);
+    float *d_out = flux_cuda_tensor_ptr(out_id);
+    if (!d_q || !d_k || !d_v || !d_out) return 0;
+
+    size_t sz_qkv = (size_t)seq * heads * hdim * sizeof(float);
+    size_t sz_scores = (size_t)heads * seq * seq * sizeof(float);
+
+    /* Use tensor pool for transposed buffers */
+    int t_qt = flux_cuda_tensor_get(sz_qkv);
+    int t_kt = flux_cuda_tensor_get(sz_qkv);
+    int t_vt = flux_cuda_tensor_get(sz_qkv);
+    int t_ot = flux_cuda_tensor_get(sz_qkv);
+    int t_scores = flux_cuda_tensor_get(sz_scores);
+
+    if (t_qt < 0 || t_kt < 0 || t_vt < 0 || t_ot < 0 || t_scores < 0) {
+        flux_cuda_tensor_release(t_qt); flux_cuda_tensor_release(t_kt);
+        flux_cuda_tensor_release(t_vt); flux_cuda_tensor_release(t_ot);
+        flux_cuda_tensor_release(t_scores);
+        return 0;
+    }
+
+    float *d_qt = flux_cuda_tensor_ptr(t_qt);
+    float *d_kt = flux_cuda_tensor_ptr(t_kt);
+    float *d_vt = flux_cuda_tensor_ptr(t_vt);
+    float *d_ot = flux_cuda_tensor_ptr(t_ot);
+    float *d_scores = flux_cuda_tensor_ptr(t_scores);
+
+    int total = seq * heads * hdim;
+
+    /* Transpose Q,K,V from [seq, heads, hdim] to [heads, seq, hdim] */
+    k_transpose_shd_to_hsd<<<(total + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(d_qt, d_q, seq, heads, hdim);
+    k_transpose_shd_to_hsd<<<(total + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(d_kt, d_k, seq, heads, hdim);
+    k_transpose_shd_to_hsd<<<(total + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(d_vt, d_v, seq, heads, hdim);
+
+    /* Batched GEMM: scores = Q @ K^T for all heads */
+    float alpha = 1.0f, beta = 0.0f;
+    long long strideQ = seq * hdim;
+    long long strideK = seq * hdim;
+    long long strideS = seq * seq;
+
+    cublasGemmStridedBatchedEx(g_cublas,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        seq, seq, hdim,
+        &alpha,
+        d_kt, CUDA_R_32F, hdim, strideK,
+        d_qt, CUDA_R_32F, hdim, strideQ,
+        &beta,
+        d_scores, CUDA_R_32F, seq, strideS,
+        heads,
+        CUBLAS_COMPUTE_32F_FAST_16F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+    /* Softmax with scale */
+    k_softmax_attention<<<heads * seq, 256, 0, g_stream>>>(d_scores, heads, seq, seq, scale);
+
+    /* Batched GEMM: out = scores @ V for all heads */
+    long long strideV = seq * hdim;
+    long long strideO = seq * hdim;
+
+    cublasGemmStridedBatchedEx(g_cublas,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        hdim, seq, seq,
+        &alpha,
+        d_vt, CUDA_R_32F, hdim, strideV,
+        d_scores, CUDA_R_32F, seq, strideS,
+        &beta,
+        d_ot, CUDA_R_32F, hdim, strideO,
+        heads,
+        CUBLAS_COMPUTE_32F_FAST_16F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+    /* Transpose output back */
+    k_transpose_hsd_to_shd<<<(total + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(d_out, d_ot, seq, heads, hdim);
+
+    flux_cuda_tensor_release(t_qt); flux_cuda_tensor_release(t_kt);
+    flux_cuda_tensor_release(t_vt); flux_cuda_tensor_release(t_ot);
+    flux_cuda_tensor_release(t_scores);
+    return 1;
+}
+
+/* Joint attention for double blocks: Q attends to concatenated K,V
+ * img_q: [img_seq, heads, hdim], txt_q: [txt_seq, heads, hdim]
+ * cat_k, cat_v: [total_seq, heads, hdim] where total_seq = txt_seq + img_seq
+ * Returns 1 on success
+ */
+int flux_cuda_joint_attention_t(int img_out_id, int txt_out_id,
+                                 int img_q_id, int txt_q_id,
+                                 int cat_k_id, int cat_v_id,
+                                 int img_seq, int txt_seq, int heads, int hdim, float scale) {
+    if (!g_available) return 0;
+
+    int total_seq = img_seq + txt_seq;
+
+    float *d_img_q = flux_cuda_tensor_ptr(img_q_id);
+    float *d_txt_q = flux_cuda_tensor_ptr(txt_q_id);
+    float *d_cat_k = flux_cuda_tensor_ptr(cat_k_id);
+    float *d_cat_v = flux_cuda_tensor_ptr(cat_v_id);
+    float *d_img_out = flux_cuda_tensor_ptr(img_out_id);
+    float *d_txt_out = flux_cuda_tensor_ptr(txt_out_id);
+
+    if (!d_img_q || !d_txt_q || !d_cat_k || !d_cat_v || !d_img_out || !d_txt_out) return 0;
+
+    /* Use tensor pool for transposed buffers */
+    size_t sz_img_q = (size_t)img_seq * heads * hdim * sizeof(float);
+    size_t sz_txt_q = (size_t)txt_seq * heads * hdim * sizeof(float);
+    size_t sz_cat = (size_t)total_seq * heads * hdim * sizeof(float);
+    size_t sz_img_scores = (size_t)heads * img_seq * total_seq * sizeof(float);
+    size_t sz_txt_scores = (size_t)heads * txt_seq * total_seq * sizeof(float);
+
+    int t_img_qt = flux_cuda_tensor_get(sz_img_q);
+    int t_txt_qt = flux_cuda_tensor_get(sz_txt_q);
+    int t_cat_kt = flux_cuda_tensor_get(sz_cat);
+    int t_cat_vt = flux_cuda_tensor_get(sz_cat);
+    int t_img_ot = flux_cuda_tensor_get(sz_img_q);
+    int t_txt_ot = flux_cuda_tensor_get(sz_txt_q);
+    int t_img_scores = flux_cuda_tensor_get(sz_img_scores);
+    int t_txt_scores = flux_cuda_tensor_get(sz_txt_scores);
+
+    if (t_img_qt < 0 || t_txt_qt < 0 || t_cat_kt < 0 || t_cat_vt < 0 ||
+        t_img_ot < 0 || t_txt_ot < 0 || t_img_scores < 0 || t_txt_scores < 0) {
+        flux_cuda_tensor_release(t_img_qt); flux_cuda_tensor_release(t_txt_qt);
+        flux_cuda_tensor_release(t_cat_kt); flux_cuda_tensor_release(t_cat_vt);
+        flux_cuda_tensor_release(t_img_ot); flux_cuda_tensor_release(t_txt_ot);
+        flux_cuda_tensor_release(t_img_scores); flux_cuda_tensor_release(t_txt_scores);
+        return 0;
+    }
+
+    float *d_img_qt = flux_cuda_tensor_ptr(t_img_qt);
+    float *d_txt_qt = flux_cuda_tensor_ptr(t_txt_qt);
+    float *d_cat_kt = flux_cuda_tensor_ptr(t_cat_kt);
+    float *d_cat_vt = flux_cuda_tensor_ptr(t_cat_vt);
+    float *d_img_ot = flux_cuda_tensor_ptr(t_img_ot);
+    float *d_txt_ot = flux_cuda_tensor_ptr(t_txt_ot);
+    float *d_img_scores = flux_cuda_tensor_ptr(t_img_scores);
+    float *d_txt_scores = flux_cuda_tensor_ptr(t_txt_scores);
+
+    /* Transpose all inputs */
+    int img_total = img_seq * heads * hdim;
+    int txt_total = txt_seq * heads * hdim;
+    int cat_total = total_seq * heads * hdim;
+
+    k_transpose_shd_to_hsd<<<(img_total + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(d_img_qt, d_img_q, img_seq, heads, hdim);
+    k_transpose_shd_to_hsd<<<(txt_total + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(d_txt_qt, d_txt_q, txt_seq, heads, hdim);
+    k_transpose_shd_to_hsd<<<(cat_total + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(d_cat_kt, d_cat_k, total_seq, heads, hdim);
+    k_transpose_shd_to_hsd<<<(cat_total + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(d_cat_vt, d_cat_v, total_seq, heads, hdim);
+
+    float alpha = 1.0f, beta = 0.0f;
+
+    /* Image attention: img_Q @ cat_K^T -> [heads, img_seq, total_seq] */
+    cublasGemmStridedBatchedEx(g_cublas,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        total_seq, img_seq, hdim,
+        &alpha,
+        d_cat_kt, CUDA_R_32F, hdim, (long long)total_seq * hdim,
+        d_img_qt, CUDA_R_32F, hdim, (long long)img_seq * hdim,
+        &beta,
+        d_img_scores, CUDA_R_32F, total_seq, (long long)img_seq * total_seq,
+        heads,
+        CUBLAS_COMPUTE_32F_FAST_16F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+    /* Softmax for image scores */
+    k_softmax_attention<<<heads * img_seq, 256, 0, g_stream>>>(d_img_scores, heads, img_seq, total_seq, scale);
+
+    /* Image output: scores @ cat_V -> [heads, img_seq, hdim] */
+    cublasGemmStridedBatchedEx(g_cublas,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        hdim, img_seq, total_seq,
+        &alpha,
+        d_cat_vt, CUDA_R_32F, hdim, (long long)total_seq * hdim,
+        d_img_scores, CUDA_R_32F, total_seq, (long long)img_seq * total_seq,
+        &beta,
+        d_img_ot, CUDA_R_32F, hdim, (long long)img_seq * hdim,
+        heads,
+        CUBLAS_COMPUTE_32F_FAST_16F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+    /* Text attention: txt_Q @ cat_K^T -> [heads, txt_seq, total_seq] */
+    cublasGemmStridedBatchedEx(g_cublas,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        total_seq, txt_seq, hdim,
+        &alpha,
+        d_cat_kt, CUDA_R_32F, hdim, (long long)total_seq * hdim,
+        d_txt_qt, CUDA_R_32F, hdim, (long long)txt_seq * hdim,
+        &beta,
+        d_txt_scores, CUDA_R_32F, total_seq, (long long)txt_seq * total_seq,
+        heads,
+        CUBLAS_COMPUTE_32F_FAST_16F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+    /* Softmax for text scores */
+    k_softmax_attention<<<heads * txt_seq, 256, 0, g_stream>>>(d_txt_scores, heads, txt_seq, total_seq, scale);
+
+    /* Text output: scores @ cat_V -> [heads, txt_seq, hdim] */
+    cublasGemmStridedBatchedEx(g_cublas,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        hdim, txt_seq, total_seq,
+        &alpha,
+        d_cat_vt, CUDA_R_32F, hdim, (long long)total_seq * hdim,
+        d_txt_scores, CUDA_R_32F, total_seq, (long long)txt_seq * total_seq,
+        &beta,
+        d_txt_ot, CUDA_R_32F, hdim, (long long)txt_seq * hdim,
+        heads,
+        CUBLAS_COMPUTE_32F_FAST_16F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+    /* Transpose outputs back */
+    k_transpose_hsd_to_shd<<<(img_total + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(d_img_out, d_img_ot, img_seq, heads, hdim);
+    k_transpose_hsd_to_shd<<<(txt_total + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(d_txt_out, d_txt_ot, txt_seq, heads, hdim);
+
+    flux_cuda_tensor_release(t_img_qt); flux_cuda_tensor_release(t_txt_qt);
+    flux_cuda_tensor_release(t_cat_kt); flux_cuda_tensor_release(t_cat_vt);
+    flux_cuda_tensor_release(t_img_ot); flux_cuda_tensor_release(t_txt_ot);
+    flux_cuda_tensor_release(t_img_scores); flux_cuda_tensor_release(t_txt_scores);
+    return 1;
+}

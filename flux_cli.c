@@ -26,6 +26,7 @@
 
 #define CLI_HISTORY_FILE ".flux_history"
 #define CLI_MAX_PATH 4096
+#define CLI_TMPDIR_SIZE 32    /* /tmp/flux-XXXXXX + margin */
 #define CLI_DEFAULT_WIDTH 256
 #define CLI_DEFAULT_HEIGHT 256
 #define CLI_DEFAULT_STEPS 4
@@ -47,7 +48,7 @@ typedef struct {
 typedef struct {
     flux_ctx *ctx;
     char model_dir[CLI_MAX_PATH];
-    char tmpdir[CLI_MAX_PATH];
+    char tmpdir[CLI_TMPDIR_SIZE];
     char last_image[CLI_MAX_PATH];
     int width;
     int height;
@@ -307,7 +308,7 @@ static int generate_image(const char *prompt, const char *ref_image,
     flux_image_free(img);
 
     /* Update last image and register as reference */
-    strncpy(state.last_image, path, sizeof(state.last_image) - 1);
+    snprintf(state.last_image, sizeof(state.last_image), "%s", path);
     int ref_id = ref_add(path);
 
     printf("Done -> %s (ref $%d) [%.2fs]\n", path, ref_id, elapsed);
@@ -385,7 +386,7 @@ static int generate_multiref(const char *prompt, const char **ref_paths, int num
     flux_image_free(img);
 
     /* Update last image and register as reference */
-    strncpy(state.last_image, path, sizeof(state.last_image) - 1);
+    snprintf(state.last_image, sizeof(state.last_image), "%s", path);
     int ref_id = ref_add(path);
 
     printf("Done -> %s (ref $%d) [%.2fs]\n", path, ref_id, elapsed);
@@ -475,7 +476,7 @@ static void cmd_load(char *arg) {
     flux_image_save(img, path);
 
     /* Update state and register as reference */
-    strncpy(state.last_image, path, sizeof(state.last_image) - 1);
+    snprintf(state.last_image, sizeof(state.last_image), "%s", path);
     int ref_id = ref_add(path);
     state.width = img->width;
     state.height = img->height;
