@@ -251,7 +251,7 @@ make clean      # Clean build artifacts
 make info       # Show available backends for this platform
 ```
 
-## Testing
+## Testing Flux
 
 Run the test suite to verify your build produces correct output:
 
@@ -379,7 +379,54 @@ This reduces peak memory from ~16GB to ~4-5GB, making inference possible on 16GB
 
 - **Generic (pure C):** Same tradeoffs as BLAS, but slower overall.
 
-## C Library API
+# Qwen3 Text Generation
+
+As a bonus, since FLUX.2-klein uses Qwen3-4B as its text encoder, and you need the weights anyway, this repository also provides a standalone Qwen3 chatbot with interactive line editing.
+
+```bash
+make qwen3-blas     # Recommended (uses Accelerate/OpenBLAS)
+make qwen3-generic  # Pure C fallback (slower)
+```
+
+Then:
+
+```bash
+# Interactive chat
+./qwen3 -d flux-klein-model
+
+# One-shot generation
+./qwen3 -d flux-klein-model -p "Explain quantum computing in simple terms"
+
+# With Q8 quantization (faster, uses less memory)
+./qwen3 -d flux-klein-model -q
+```
+
+In interactive mode, type `!help` to see available commands:
+
+- `!temp <value>` - Set temperature (default: 0.7)
+- `!topk <value>` - Set top-k sampling (default: 40)
+- `!max <value>` - Set max tokens (default: 0 = unlimited)
+- `!reset` - Clear conversation history
+- `!quit` - Exit
+
+This is more a programming example than anything else. It provides:
+
+- **Dynamic context**: KV cache grows automatically from 256 to 128K tokens
+- **Q8 quantization**: `-q` flag quantizes weights to int8, reducing memory and improving speed on ARM (uses NEON dot product instructions)
+- **Unlimited generation**: Generates until the model emits `<|im_end|>` or hits context limit
+- **Multi-turn conversations**: KV cache preserves context between turns
+- **Streaming output**: Tokens printed as they're generated
+
+### Memory Usage
+
+| Mode | Memory |
+|------|--------|
+| Default (f32) | ~16GB |
+| With `-q` (Q8) | ~10GB |
+
+The Q8 mode is particularly effective on Apple Silicon where the NEON `vdotq_s32` instruction provides fast int8 dot products.
+
+# C Library API
 
 The library can be integrated into your own C/C++ projects. Link against `libflux.a` and include `flux.h`.
 

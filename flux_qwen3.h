@@ -61,11 +61,37 @@ qwen3_tokenizer_t *qwen3_tokenizer_load(const char *tokenizer_json_path);
 void qwen3_tokenizer_free(qwen3_tokenizer_t *tok);
 
 /*
- * Tokenize text with chat template.
+ * Tokenize text (raw, no template).
+ */
+int *qwen3_tokenize(qwen3_tokenizer_t *tok, const char *text,
+                    int *num_tokens, int max_len);
+
+/*
+ * Tokenize text with chat template (first turn).
  * Format: <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n
  */
 int *qwen3_tokenize_chat(qwen3_tokenizer_t *tok, const char *prompt,
                          int *num_tokens, int max_len);
+
+/*
+ * Tokenize text for multi-turn continuation.
+ * Closes previous assistant turn and adds new user turn.
+ * Format: <|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n
+ */
+int *qwen3_tokenize_chat_continue(qwen3_tokenizer_t *tok, const char *prompt,
+                                   int *num_tokens, int max_len);
+
+/*
+ * Detokenize array of token IDs to string.
+ * Caller must free the returned string.
+ */
+char *qwen3_detokenize(qwen3_tokenizer_t *tok, const int *tokens, int num_tokens);
+
+/*
+ * Detokenize a single token ID.
+ * Returns pointer to internal buffer (valid until next call).
+ */
+const char *qwen3_detokenize_single(qwen3_tokenizer_t *tok, int token_id);
 
 /*
  * Pad tokens to max_len with PAD token.

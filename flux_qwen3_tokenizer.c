@@ -1054,6 +1054,140 @@ int *qwen3_tokenize_chat(qwen3_tokenizer_t *tok, const char *prompt,
 }
 
 /*
+ * Tokenize for multi-turn continuation.
+ * Adds <|im_end|> to close previous assistant turn, then new user turn.
+ * Format: <|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n
+ */
+int *qwen3_tokenize_chat_continue(qwen3_tokenizer_t *tok, const char *prompt,
+                                   int *num_tokens, int max_len) {
+    if (max_len <= 0) max_len = QWEN3_MAX_SEQ_LEN;
+
+    int capacity = 256;
+    int *tokens = malloc(capacity * sizeof(int));
+    int total = 0;
+
+    /* <|im_end|> to close previous assistant response */
+    tokens[total++] = QWEN3_IM_END_ID;
+
+    /* "\n<|im_start|>" */
+    int n;
+    int *nl_tokens = qwen3_tokenize(tok, "\n", &n, max_len - total);
+    for (int i = 0; i < n && total < max_len; i++) {
+        if (total >= capacity) {
+            capacity *= 2;
+            tokens = realloc(tokens, capacity * sizeof(int));
+        }
+        tokens[total++] = nl_tokens[i];
+    }
+    free(nl_tokens);
+
+    if (total < max_len) {
+        if (total >= capacity) {
+            capacity *= 2;
+            tokens = realloc(tokens, capacity * sizeof(int));
+        }
+        tokens[total++] = QWEN3_IM_START_ID;
+    }
+
+    /* "user\n" */
+    int *user_tokens = qwen3_tokenize(tok, "user\n", &n, max_len - total);
+    for (int i = 0; i < n && total < max_len; i++) {
+        if (total >= capacity) {
+            capacity *= 2;
+            tokens = realloc(tokens, capacity * sizeof(int));
+        }
+        tokens[total++] = user_tokens[i];
+    }
+    free(user_tokens);
+
+    /* prompt */
+    int *prompt_tokens = qwen3_tokenize(tok, prompt, &n, max_len - total);
+    for (int i = 0; i < n && total < max_len; i++) {
+        if (total >= capacity) {
+            capacity *= 2;
+            tokens = realloc(tokens, capacity * sizeof(int));
+        }
+        tokens[total++] = prompt_tokens[i];
+    }
+    free(prompt_tokens);
+
+    /* <|im_end|>\n */
+    if (total < max_len) {
+        if (total >= capacity) {
+            capacity *= 2;
+            tokens = realloc(tokens, capacity * sizeof(int));
+        }
+        tokens[total++] = QWEN3_IM_END_ID;
+    }
+    int *newline_tokens = qwen3_tokenize(tok, "\n", &n, max_len - total);
+    for (int i = 0; i < n && total < max_len; i++) {
+        if (total >= capacity) {
+            capacity *= 2;
+            tokens = realloc(tokens, capacity * sizeof(int));
+        }
+        tokens[total++] = newline_tokens[i];
+    }
+    free(newline_tokens);
+
+    /* <|im_start|>assistant\n */
+    if (total < max_len) {
+        if (total >= capacity) {
+            capacity *= 2;
+            tokens = realloc(tokens, capacity * sizeof(int));
+        }
+        tokens[total++] = QWEN3_IM_START_ID;
+    }
+    int *asst_tokens = qwen3_tokenize(tok, "assistant\n", &n, max_len - total);
+    for (int i = 0; i < n && total < max_len; i++) {
+        if (total >= capacity) {
+            capacity *= 2;
+            tokens = realloc(tokens, capacity * sizeof(int));
+        }
+        tokens[total++] = asst_tokens[i];
+    }
+    free(asst_tokens);
+
+    /* <think>\n\n</think>\n\n */
+    if (total < max_len) {
+        if (total >= capacity) {
+            capacity *= 2;
+            tokens = realloc(tokens, capacity * sizeof(int));
+        }
+        tokens[total++] = QWEN3_THINK_START_ID;
+    }
+    int *think_newlines = qwen3_tokenize(tok, "\n\n", &n, max_len - total);
+    for (int i = 0; i < n && total < max_len; i++) {
+        if (total >= capacity) {
+            capacity *= 2;
+            tokens = realloc(tokens, capacity * sizeof(int));
+        }
+        tokens[total++] = think_newlines[i];
+    }
+    free(think_newlines);
+
+    if (total < max_len) {
+        if (total >= capacity) {
+            capacity *= 2;
+            tokens = realloc(tokens, capacity * sizeof(int));
+        }
+        tokens[total++] = QWEN3_THINK_END_ID;
+    }
+
+    think_newlines = qwen3_tokenize(tok, "\n\n", &n, max_len - total);
+    for (int i = 0; i < n && total < max_len; i++) {
+        if (total >= capacity) {
+            capacity *= 2;
+            tokens = realloc(tokens, capacity * sizeof(int));
+        }
+        tokens[total++] = think_newlines[i];
+    }
+    free(think_newlines);
+
+    *num_tokens = total;
+    return tokens;
+}
+
+/*
  * Pad token sequence to max_len with PAD tokens.
  * Returns new array, caller must free original.
  */
@@ -1088,4 +1222,106 @@ const char *qwen3_get_token(qwen3_tokenizer_t *tok, int id) {
 int qwen3_get_id(qwen3_tokenizer_t *tok, const char *token) {
     if (!tok || !token) return -1;
     return vocab_hash_lookup(tok->vocab_hash, tok->hash_size, token);
+}
+
+/* ========================================================================
+ * Detokenization
+ * ======================================================================== */
+
+/* Decode byte-level BPE back to UTF-8 */
+static void decode_bpe_bytes(const char *bpe_str, char *out, int max_out) {
+    init_byte_encoder();  /* Ensure tables are initialized */
+
+    int out_idx = 0;
+    const unsigned char *p = (const unsigned char *)bpe_str;
+
+    while (*p && out_idx < max_out - 1) {
+        /* Decode UTF-8 codepoint */
+        int codepoint;
+        int bytes;
+
+        if ((*p & 0x80) == 0) {
+            /* Single byte (ASCII) */
+            codepoint = *p;
+            bytes = 1;
+        } else if ((*p & 0xE0) == 0xC0) {
+            /* Two bytes */
+            codepoint = ((*p & 0x1F) << 6) | (p[1] & 0x3F);
+            bytes = 2;
+        } else if ((*p & 0xF0) == 0xE0) {
+            /* Three bytes */
+            codepoint = ((*p & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F);
+            bytes = 3;
+        } else {
+            /* Four bytes or invalid - skip */
+            p++;
+            continue;
+        }
+
+        /* Look up in unicode_to_byte table */
+        if (codepoint < 512 && unicode_to_byte[codepoint] != 0) {
+            out[out_idx++] = (char)unicode_to_byte[codepoint];
+        } else if (codepoint < 256) {
+            /* Direct mapping */
+            out[out_idx++] = (char)codepoint;
+        }
+        /* else: skip unmapped characters */
+
+        p += bytes;
+    }
+    out[out_idx] = '\0';
+}
+
+/* Static buffer for single token decode */
+static char g_decode_buf[512];
+
+const char *qwen3_detokenize_single(qwen3_tokenizer_t *tok, int token_id) {
+    if (!tok || token_id < 0 || token_id >= tok->vocab_size) {
+        return "";
+    }
+
+    const char *token = tok->vocab[token_id];
+    if (!token) return "";
+
+    /* Decode byte-level BPE */
+    decode_bpe_bytes(token, g_decode_buf, sizeof(g_decode_buf));
+    return g_decode_buf;
+}
+
+char *qwen3_detokenize(qwen3_tokenizer_t *tok, const int *tokens, int num_tokens) {
+    if (!tok || !tokens || num_tokens <= 0) return NULL;
+
+    /* Estimate output size */
+    int capacity = num_tokens * 8 + 1;
+    char *result = malloc(capacity);
+    if (!result) return NULL;
+
+    int out_idx = 0;
+
+    for (int i = 0; i < num_tokens; i++) {
+        int token_id = tokens[i];
+        if (token_id < 0 || token_id >= tok->vocab_size) continue;
+
+        const char *token = tok->vocab[token_id];
+        if (!token) continue;
+
+        /* Decode this token */
+        char decoded[256];
+        decode_bpe_bytes(token, decoded, sizeof(decoded));
+
+        int dec_len = strlen(decoded);
+
+        /* Expand buffer if needed */
+        while (out_idx + dec_len + 1 > capacity) {
+            capacity *= 2;
+            result = realloc(result, capacity);
+            if (!result) return NULL;
+        }
+
+        memcpy(result + out_idx, decoded, dec_len);
+        out_idx += dec_len;
+    }
+
+    result[out_idx] = '\0';
+    return result;
 }

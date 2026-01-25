@@ -18,6 +18,12 @@ MAIN = main.c
 TARGET = flux
 LIB = libflux.a
 
+# Qwen3 standalone text generation
+QWEN3_SRCS = qwen3_generate.c flux_qwen3_tokenizer.c flux_safetensors.c flux_kernels.c linenoise.c
+QWEN3_OBJS = $(QWEN3_SRCS:.c=.o)
+QWEN3_MAIN = qwen3_main.c
+QWEN3_TARGET = qwen3
+
 # Debug build flags
 DEBUG_CFLAGS = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address
 
@@ -38,6 +44,10 @@ ifeq ($(UNAME_M),arm64)
 endif
 endif
 	@echo ""
+	@echo "Qwen3 text generation:"
+	@echo "  make qwen3-generic  - Pure C, no dependencies"
+	@echo "  make qwen3-blas     - With BLAS acceleration (default)"
+	@echo ""
 	@echo "Other targets:"
 	@echo "  make clean    - Remove build artifacts"
 	@echo "  make test     - Run inference test"
@@ -46,6 +56,7 @@ endif
 	@echo "  make lib      - Build static library"
 	@echo ""
 	@echo "Example: make mps && ./flux -d flux-klein-model -p \"a cat\" -o cat.png"
+	@echo "Example: make qwen3-blas && ./qwen3 -d flux-klein-model -p \"Hello!\""
 
 # =============================================================================
 # Backend: generic (pure C, no BLAS)
@@ -108,6 +119,41 @@ mps:
 endif
 
 # =============================================================================
+# Qwen3 text generation (standalone binary)
+# =============================================================================
+
+# Qwen3 generic (pure C, no BLAS)
+qwen3-generic: QWEN3_CFLAGS = $(CFLAGS_BASE) -DGENERIC_BUILD
+qwen3-generic: QWEN3_LDFLAGS = $(LDFLAGS)
+qwen3-generic: qwen3-clean qwen3-build
+	@echo ""
+	@echo "Built Qwen3 with GENERIC backend (pure C, slow)"
+
+# Qwen3 BLAS (default)
+ifeq ($(UNAME_S),Darwin)
+qwen3-blas: QWEN3_CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DACCELERATE_NEW_LAPACK
+qwen3-blas: QWEN3_LDFLAGS = $(LDFLAGS) -framework Accelerate
+else
+qwen3-blas: QWEN3_CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_OPENBLAS -I/usr/include/openblas
+qwen3-blas: QWEN3_LDFLAGS = $(LDFLAGS) -lopenblas
+endif
+qwen3-blas: qwen3-clean qwen3-build
+	@echo ""
+	@echo "Built Qwen3 with BLAS backend"
+
+# Default qwen3 target uses BLAS
+qwen3: qwen3-blas
+
+qwen3-build: $(QWEN3_SRCS:.c=.qwen3.o) qwen3_main.qwen3.o
+	$(CC) $(QWEN3_CFLAGS) -o $(QWEN3_TARGET) $^ $(QWEN3_LDFLAGS)
+
+qwen3-clean:
+	rm -f *.qwen3.o $(QWEN3_TARGET)
+
+%.qwen3.o: %.c flux_kernels.h
+	$(CC) $(QWEN3_CFLAGS) -c -o $@ $<
+
+# =============================================================================
 # Build rules
 # =============================================================================
 $(TARGET): $(OBJS) $(CLI_OBJS) main.o
@@ -153,7 +199,7 @@ install: $(TARGET) $(LIB)
 	install -m 644 flux_kernels.h /usr/local/include/
 
 clean:
-	rm -f $(OBJS) $(CLI_OBJS) *.mps.o flux_metal.o main.o $(TARGET) $(LIB)
+	rm -f $(OBJS) $(CLI_OBJS) *.mps.o *.qwen3.o flux_metal.o main.o $(TARGET) $(LIB) $(QWEN3_TARGET)
 	rm -f flux_shaders_source.h
 
 info:
