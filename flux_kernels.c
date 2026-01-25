@@ -16,6 +16,11 @@
 #include "flux_metal.h"
 #endif
 
+/* Use ROCm for GPU acceleration on AMD GPUs */
+#ifdef USE_ROCM
+#include "rocm/flux_rocm.h"
+#endif
+
 /* Use BLAS for matrix operations when enabled via Makefile */
 #ifdef USE_BLAS
 #ifdef __APPLE__
@@ -234,6 +239,32 @@ void flux_linear(float *y, const float *x, const float *W, const float *b,
             }
         }
         return;
+    }
+#endif
+
+#ifdef USE_ROCM
+    /* Use ROCm GPU for large matrices */
+    {
+        size_t matrix_elements = (size_t)seq_len * out_dim;
+        if (flux_rocm_available() && matrix_elements >= MIN_GPU_ELEMENTS) {
+            flux_rocm_tensor_t t_x = flux_rocm_tensor_create(x, seq_len * in_dim);
+            flux_rocm_tensor_t t_y = flux_rocm_linear(t_x, W, seq_len, in_dim, out_dim);
+            if (t_y) {
+                flux_rocm_tensor_read(t_y, y, seq_len * out_dim);
+                flux_rocm_tensor_free(t_y);
+            }
+            flux_rocm_tensor_free(t_x);
+
+            /* Add bias if present */
+            if (b != NULL) {
+                for (int s = 0; s < seq_len; s++) {
+                    for (int o = 0; o < out_dim; o++) {
+                        y[s * out_dim + o] += b[o];
+                    }
+                }
+            }
+            return;
+        }
     }
 #endif
 
@@ -486,6 +517,26 @@ void flux_rms_norm(float *out, const float *x, const float *weight,
     }
 #endif
 
+#ifdef USE_ROCM
+    size_t elements = (size_t)seq_len * hidden;
+    if (flux_rocm_available() && elements >= 256 * 1024) {
+        flux_rocm_tensor_t t_x = flux_rocm_tensor_create(x, elements);
+        flux_rocm_tensor_t t_out = flux_rocm_tensor_alloc(elements);
+        flux_rocm_tensor_t t_w = flux_rocm_tensor_create(weight, hidden);
+        
+        flux_rocm_rms_norm((float*)flux_rocm_tensor_gpu_ptr(t_out),
+                          (float*)flux_rocm_tensor_gpu_ptr(t_x),
+                          (float*)flux_rocm_tensor_gpu_ptr(t_w),
+                          seq_len, hidden, eps);
+        flux_rocm_tensor_read(t_out, out, elements);
+        
+        flux_rocm_tensor_free(t_x);
+        flux_rocm_tensor_free(t_out);
+        flux_rocm_tensor_free(t_w);
+        return;
+    }
+#endif
+
     for (int s = 0; s < seq_len; s++) {
         const float *x_row = x + s * hidden;
         float *out_row = out + s * hidden;
@@ -584,6 +635,16 @@ void flux_silu(float *x, int n) {
     }
 #endif
 
+#ifdef USE_ROCM
+    if (flux_rocm_available() && n >= 1024 * 1024) {
+        flux_rocm_tensor_t t_x = flux_rocm_tensor_create(x, n);
+        flux_rocm_silu((float*)flux_rocm_tensor_gpu_ptr(t_x), n);
+        flux_rocm_tensor_read(t_x, x, n);
+        flux_rocm_tensor_free(t_x);
+        return;
+    }
+#endif
+
     for (int i = 0; i < n; i++) {
         float val = x[i];
         x[i] = val / (1.0f + expf(-val));
@@ -596,6 +657,17 @@ void flux_softmax(float *x, int rows, int cols) {
      * Sync overhead usually dominates for smaller ops */
     if (flux_metal_shaders_available() && (size_t)rows * cols >= 4 * 1024 * 1024) {
         flux_metal_softmax(x, rows, cols);
+        return;
+    }
+#endif
+
+#ifdef USE_ROCM
+    if (flux_rocm_available() && (size_t)rows * cols >= 256 * 1024) {
+        size_t n = (size_t)rows * cols;
+        flux_rocm_tensor_t t_x = flux_rocm_tensor_create(x, n);
+        flux_rocm_softmax((float*)flux_rocm_tensor_gpu_ptr(t_x), rows, cols);
+        flux_rocm_tensor_read(t_x, x, n);
+        flux_rocm_tensor_free(t_x);
         return;
     }
 #endif

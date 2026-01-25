@@ -37,6 +37,9 @@ ifeq ($(UNAME_M),arm64)
 	@echo "  make mps      - Apple Silicon with Metal GPU (fastest)"
 endif
 endif
+ifneq ($(shell command -v hipcc 2> /dev/null),)
+	@echo "  make rocm     - AMD GPU with ROCm/HIP (fast)"
+endif
 	@echo ""
 	@echo "Other targets:"
 	@echo "  make clean    - Remove build artifacts"
@@ -47,18 +50,18 @@ endif
 	@echo ""
 	@echo "Example: make mps && ./flux -d flux-klein-model -p \"a cat\" -o cat.png"
 
-# =============================================================================
+# ======================================================================
 # Backend: generic (pure C, no BLAS)
-# =============================================================================
+# ======================================================================
 generic: CFLAGS = $(CFLAGS_BASE) -DGENERIC_BUILD
 generic: clean $(TARGET)
 	@echo ""
 	@echo "Built with GENERIC backend (pure C, no BLAS)"
 	@echo "This will be slow but has zero dependencies."
 
-# =============================================================================
+# ======================================================================
 # Backend: blas (Accelerate on macOS, OpenBLAS on Linux)
-# =============================================================================
+# ======================================================================
 ifeq ($(UNAME_S),Darwin)
 blas: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DACCELERATE_NEW_LAPACK
 blas: LDFLAGS += -framework Accelerate
@@ -70,9 +73,9 @@ blas: clean $(TARGET)
 	@echo ""
 	@echo "Built with BLAS backend (~30x faster than generic)"
 
-# =============================================================================
+# ======================================================================
 # Backend: mps (Apple Silicon Metal GPU)
-# =============================================================================
+# ======================================================================
 ifeq ($(UNAME_S),Darwin)
 ifeq ($(UNAME_M),arm64)
 MPS_CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_METAL -DACCELERATE_NEW_LAPACK
@@ -107,9 +110,51 @@ mps:
 	@exit 1
 endif
 
-# =============================================================================
+# ======================================================================
+# Backend: rocm (AMD GPUs with ROCm/HIP)
+# ======================================================================
+ifeq ($(shell command -v hipcc 2> /dev/null),)
+rocm:
+	@echo "Error: ROCm/hipcc not found. Install ROCm toolkit first."
+	@echo "Visit: https://rocm.docs.amd.com/"
+	@exit 1
+else
+ROCM_PATH ?= /opt/rocm
+HIPCC = hipcc
+GPU_ARCH := $(shell rocminfo 2>/dev/null | grep -o 'gfx[0-9]*' | head -1)
+ifeq ($(GPU_ARCH),)
+GPU_ARCH = native
+endif
+
+ROCM_CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_ROCM -I$(ROCM_PATH)/include -I/usr/include/openblas
+ROCM_LDFLAGS = $(LDFLAGS) -L$(ROCM_PATH)/lib -lopenblas -lhipblas -lamdhip64
+HIPCC_FLAGS = -O3 -fPIC -std=c++17 --offload-arch=$(GPU_ARCH)
+
+# ROCm object files
+ROCM_HIP_OBJS = rocm/flux_rocm.o rocm/flux_rocm_kernels.o
+
+rocm: clean rocm-build
+	@echo ""
+	@echo "Built with ROCm backend (AMD GPU acceleration)"
+	@echo "GPU Architecture: $(GPU_ARCH)"
+
+rocm-build: $(SRCS:.c=.rocm.o) $(CLI_SRCS:.c=.rocm.o) $(ROCM_HIP_OBJS) main.rocm.o
+	$(CC) $(ROCM_CFLAGS) -o $(TARGET) $^ $(ROCM_LDFLAGS) -lstdc++
+
+%.rocm.o: %.c flux.h flux_kernels.h
+	$(CC) $(ROCM_CFLAGS) -c -o $@ $<
+
+rocm/flux_rocm.o: rocm/flux_rocm.cpp rocm/flux_rocm.h
+	$(HIPCC) $(HIPCC_FLAGS) -c -o $@ $<
+
+rocm/flux_rocm_kernels.o: rocm/flux_rocm_kernels.hip rocm/flux_rocm.h
+	$(HIPCC) $(HIPCC_FLAGS) -c -o $@ $<
+
+endif
+
+# ======================================================================
 # Build rules
-# =============================================================================
+# ======================================================================
 $(TARGET): $(OBJS) $(CLI_OBJS) main.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
@@ -126,9 +171,9 @@ debug: CFLAGS = $(DEBUG_CFLAGS)
 debug: LDFLAGS += -fsanitize=address
 debug: clean $(TARGET)
 
-# =============================================================================
+# ======================================================================
 # Test and utilities
-# =============================================================================
+# ======================================================================
 test:
 	@python3 run_test.py --flux-binary ./$(TARGET)
 
@@ -155,6 +200,7 @@ install: $(TARGET) $(LIB)
 clean:
 	rm -f $(OBJS) $(CLI_OBJS) *.mps.o flux_metal.o main.o $(TARGET) $(LIB)
 	rm -f flux_shaders_source.h
+	rm -f *.rocm.o rocm/*.o rocm/*.a
 
 info:
 	@echo "Platform: $(UNAME_S) $(UNAME_M)"
@@ -171,9 +217,9 @@ else
 	@echo "  blas    - OpenBLAS (requires libopenblas-dev)"
 endif
 
-# =============================================================================
+# ======================================================================
 # Dependencies
-# =============================================================================
+# ======================================================================
 flux.o: flux.c flux.h flux_kernels.h flux_safetensors.h flux_qwen3.h
 flux_kernels.o: flux_kernels.c flux_kernels.h
 flux_tokenizer.o: flux_tokenizer.c flux.h
