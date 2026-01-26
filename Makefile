@@ -45,8 +45,7 @@ endif
 endif
 	@echo ""
 	@echo "Qwen3 text generation:"
-	@echo "  make qwen3-generic  - Pure C, no dependencies"
-	@echo "  make qwen3-blas     - With BLAS acceleration (default)"
+	@echo "  make qwen3    - Build Qwen3 chat/completion CLI"
 	@echo ""
 	@echo "Other targets:"
 	@echo "  make clean    - Remove build artifacts"
@@ -56,7 +55,7 @@ endif
 	@echo "  make lib      - Build static library"
 	@echo ""
 	@echo "Example: make mps && ./flux -d flux-klein-model -p \"a cat\" -o cat.png"
-	@echo "Example: make qwen3-blas && ./qwen3 -d flux-klein-model -p \"Hello!\""
+	@echo "Example: make qwen3 && ./qwen3 -d flux-klein-model -p \"Hello!\""
 
 # =============================================================================
 # Backend: generic (pure C, no BLAS)
@@ -122,27 +121,13 @@ endif
 # Qwen3 text generation (standalone binary)
 # =============================================================================
 
-# Qwen3 generic (pure C, no BLAS)
-qwen3-generic: QWEN3_CFLAGS = $(CFLAGS_BASE) -DGENERIC_BUILD
-qwen3-generic: QWEN3_LDFLAGS = $(LDFLAGS)
-qwen3-generic: qwen3-clean qwen3-build
-	@echo ""
-	@echo "Built Qwen3 with GENERIC backend (pure C, slow)"
+# Qwen3 uses Q8 quantization throughout - no BLAS needed
+QWEN3_CFLAGS = $(CFLAGS_BASE)
+QWEN3_LDFLAGS = $(LDFLAGS)
 
-# Qwen3 BLAS (default)
-ifeq ($(UNAME_S),Darwin)
-qwen3-blas: QWEN3_CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DACCELERATE_NEW_LAPACK
-qwen3-blas: QWEN3_LDFLAGS = $(LDFLAGS) -framework Accelerate
-else
-qwen3-blas: QWEN3_CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_OPENBLAS -I/usr/include/openblas
-qwen3-blas: QWEN3_LDFLAGS = $(LDFLAGS) -lopenblas
-endif
-qwen3-blas: qwen3-clean qwen3-build
+qwen3: qwen3-clean qwen3-build
 	@echo ""
-	@echo "Built Qwen3 with BLAS backend"
-
-# Default qwen3 target uses BLAS
-qwen3: qwen3-blas
+	@echo "Built Qwen3 text generation"
 
 qwen3-build: $(QWEN3_SRCS:.c=.qwen3.o) qwen3_main.qwen3.o
 	$(CC) $(QWEN3_CFLAGS) -o $(QWEN3_TARGET) $^ $(QWEN3_LDFLAGS)

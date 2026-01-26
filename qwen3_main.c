@@ -255,23 +255,21 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -t <temp>     Temperature (default: 0.7)\n");
     fprintf(stderr, "  -k <topk>     Top-k sampling (default: 40, 0=disabled)\n");
     fprintf(stderr, "  -n <tokens>   Max tokens to generate (default: 0=unlimited)\n");
-    fprintf(stderr, "  -q            Quantize to int8 (4x less memory, faster)\n");
     fprintf(stderr, "  -r            Raw mode (no chat template)\n");
     fprintf(stderr, "  -v            Verbose output\n");
     fprintf(stderr, "  -h            Show this help\n");
     fprintf(stderr, "\nExamples:\n");
     fprintf(stderr, "  %s -d ~/model -p \"What is the capital of France?\"\n", prog);
-    fprintf(stderr, "  %s -d ~/model -q  # Interactive mode with Q8 quantization\n", prog);
+    fprintf(stderr, "  %s -d ~/model  # Interactive chat mode\n", prog);
 }
 
 int main(int argc, char **argv) {
     const char *model_dir = NULL;
     const char *prompt = NULL;
-    int use_q8 = 0;
 
     /* Parse arguments */
     int opt;
-    while ((opt = getopt(argc, argv, "d:p:t:k:n:qrvh")) != -1) {
+    while ((opt = getopt(argc, argv, "d:p:t:k:n:rvh")) != -1) {
         switch (opt) {
             case 'd':
                 model_dir = optarg;
@@ -287,9 +285,6 @@ int main(int argc, char **argv) {
                 break;
             case 'n':
                 g_params.max_tokens = atoi(optarg);
-                break;
-            case 'q':
-                use_q8 = 1;
                 break;
             case 'r':
                 g_params.use_chat = 0;
@@ -319,11 +314,6 @@ int main(int argc, char **argv) {
     if (!g_gen) {
         fprintf(stderr, "Failed to load model\n");
         return 1;
-    }
-
-    /* Optionally quantize to Q8 */
-    if (use_q8) {
-        qwen3_generator_quantize(g_gen);
     }
 
     fprintf(stderr, "Model loaded.\n\n");

@@ -58,13 +58,6 @@ void qwen3_generator_free(qwen3_generator_t *gen);
  */
 void qwen3_generator_reset(qwen3_generator_t *gen);
 
-/*
- * Quantize model weights to int8 (Q8_0 format).
- * Reduces memory bandwidth by 4x for faster inference.
- * Call after qwen3_generator_create() to enable quantization.
- */
-int qwen3_generator_quantize(qwen3_generator_t *gen);
-
 /* ========================================================================
  * Generation API
  * ======================================================================== */

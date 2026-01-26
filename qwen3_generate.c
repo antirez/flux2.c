@@ -11,12 +11,6 @@
 #include <math.h>
 #include <time.h>
 
-#ifdef __APPLE__
-#include <Accelerate/Accelerate.h>
-#else
-#include <cblas.h>
-#endif
-
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
@@ -24,7 +18,6 @@
 #include "qwen3_generate.h"
 #include "flux_qwen3.h"
 #include "flux_safetensors.h"
-#include "flux_kernels.h"
 
 /* ========================================================================
  * Constants
@@ -467,9 +460,6 @@ struct qwen3_generator {
     /* Safetensors files (keep open for mmap) */
     safetensors_file_t *files[2];
     int num_files;
-
-    /* Quantization flag */
-    int use_q8;  /* 1 if using Q8 quantized weights */
 };
 
 /* ========================================================================
@@ -507,28 +497,20 @@ static void head_rms_norm(float *x, const float *weight,
     }
 }
 
-/* Dot product with BLAS or generic fallback */
+/* Dot product */
 static inline float vec_dot(const float *a, const float *b, int n) {
-#ifdef USE_BLAS
-    return cblas_sdot(n, a, 1, b, 1);
-#else
     float sum = 0.0f;
     for (int i = 0; i < n; i++) {
         sum += a[i] * b[i];
     }
     return sum;
-#endif
 }
 
-/* y += alpha * x with BLAS or generic fallback */
+/* y += alpha * x */
 static inline void vec_axpy(float *y, float alpha, const float *x, int n) {
-#ifdef USE_BLAS
-    cblas_saxpy(n, alpha, x, 1, y, 1);
-#else
     for (int i = 0; i < n; i++) {
         y[i] += alpha * x[i];
     }
-#endif
 }
 
 static void apply_rope_single(float *q, float *k, int pos,
@@ -813,15 +795,9 @@ static void forward_token(qwen3_generator_t *gen, int token_id, int pos) {
     /* Final norm */
     rms_norm(gen->norm_buf, gen->hidden_state, gen->norm_weight, hidden, QWEN3_RMS_NORM_EPS);
 
-    /* LM head: logits = norm_buf @ embed_tokens^T (weight tying) */
-    if (gen->use_q8 && gen->embed_tokens_q8) {
-        /* Q8 LM head - largest operation, benefits greatly from quantization */
-        quantize_vector_q8(gen->norm_buf, gen->x_q8_cache, &gen->x_q8_scale, hidden);
-        linear_q8_preq(gen->logits, gen->x_q8_cache, gen->x_q8_scale, gen->embed_tokens_q8);
-    } else {
-        /* BLAS fallback */
-        flux_linear_nobias(gen->logits, gen->norm_buf, gen->embed_tokens, 1, hidden, QWEN3_VOCAB_SIZE);
-    }
+    /* LM head: logits = norm_buf @ embed_tokens^T (weight tying, Q8) */
+    quantize_vector_q8(gen->norm_buf, gen->x_q8_cache, &gen->x_q8_scale, hidden);
+    linear_q8_preq(gen->logits, gen->x_q8_cache, gen->x_q8_scale, gen->embed_tokens_q8);
 }
 
 /* Forward pass for multiple tokens (prefill) */
@@ -1097,6 +1073,14 @@ qwen3_generator_t *qwen3_generator_create(const char *model_dir) {
         return NULL;
     }
 
+    /* Quantize embedding matrix for LM head (weight tying) */
+    gen->embed_tokens_q8 = q8_quantize(gen->embed_tokens, QWEN3_VOCAB_SIZE, QWEN3_HIDDEN_SIZE);
+    if (!gen->embed_tokens_q8) {
+        fprintf(stderr, "Failed to quantize embedding matrix\n");
+        qwen3_generator_free(gen);
+        return NULL;
+    }
+
     /* Load layers */
     gen->num_layers = QWEN3_NUM_LAYERS;
     gen->layers = calloc(gen->num_layers, sizeof(gen_layer_t));
@@ -1219,23 +1203,6 @@ void qwen3_generator_reset(qwen3_generator_t *gen) {
     if (gen) {
         kv_cache_reset(&gen->cache);
     }
-}
-
-int qwen3_generator_quantize(qwen3_generator_t *gen) {
-    if (!gen || gen->use_q8) return 0;  /* Already quantized */
-
-    fprintf(stderr, "Quantizing embedding matrix...");
-    fflush(stderr);
-
-    /* Layer weights are already Q8 from load time.
-     * We only need to quantize the embedding matrix for LM head projection.
-     * (Embeddings are kept as f32 for embedding lookup, Q8 for LM head) */
-    gen->embed_tokens_q8 = q8_quantize(gen->embed_tokens,
-                                        QWEN3_VOCAB_SIZE, QWEN3_HIDDEN_SIZE);
-
-    gen->use_q8 = 1;
-    fprintf(stderr, " done\n");
-    return 0;
 }
 
 float *qwen3_forward_token(qwen3_generator_t *gen, int token_id) {
