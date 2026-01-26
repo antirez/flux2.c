@@ -66,6 +66,14 @@ typedef struct {
     int in_dim;
 } q8_weight_t;
 
+/* Convert bf16 to f32 */
+static inline float bf16_to_f32(uint16_t bf16) {
+    uint32_t f32_bits = (uint32_t)bf16 << 16;
+    float result;
+    memcpy(&result, &f32_bits, sizeof(float));
+    return result;
+}
+
 /* Quantize f32 weights to Q8_0 format */
 static q8_weight_t *q8_quantize(const float *weights, int out_dim, int in_dim) {
     q8_weight_t *q = malloc(sizeof(q8_weight_t));
@@ -124,6 +132,104 @@ static void q8_free(q8_weight_t *q) {
         free(q->scale);
         free(q);
     }
+}
+
+/* Quantize bf16 weights directly to Q8_0 format (no intermediate f32 allocation) */
+static q8_weight_t *q8_quantize_bf16(const uint16_t *weights_bf16, int out_dim, int in_dim) {
+    q8_weight_t *q = malloc(sizeof(q8_weight_t));
+    if (!q) return NULL;
+
+    q->out_dim = out_dim;
+    q->in_dim = in_dim;
+    q->data = malloc((size_t)out_dim * in_dim * sizeof(int8_t));
+    q->scale = malloc(out_dim * sizeof(float));
+
+    if (!q->data || !q->scale) {
+        free(q->data);
+        free(q->scale);
+        free(q);
+        return NULL;
+    }
+
+    /* Quantize each row independently */
+    for (int i = 0; i < out_dim; i++) {
+        const uint16_t *row_bf16 = weights_bf16 + i * in_dim;
+        int8_t *qrow = q->data + i * in_dim;
+
+        /* Find max absolute value in row (convert bf16->f32 on the fly) */
+        float max_abs = 0.0f;
+#if defined(__ARM_NEON)
+        float32x4_t max_v = vdupq_n_f32(0.0f);
+        int j = 0;
+        for (; j + 7 < in_dim; j += 8) {
+            uint16x8_t bf16_v = vld1q_u16(row_bf16 + j);
+            uint32x4_t lo = vshll_n_u16(vget_low_u16(bf16_v), 16);
+            uint32x4_t hi = vshll_n_u16(vget_high_u16(bf16_v), 16);
+            float32x4_t f0 = vreinterpretq_f32_u32(lo);
+            float32x4_t f1 = vreinterpretq_f32_u32(hi);
+            max_v = vmaxq_f32(max_v, vabsq_f32(f0));
+            max_v = vmaxq_f32(max_v, vabsq_f32(f1));
+        }
+        max_abs = vmaxvq_f32(max_v);
+        for (; j < in_dim; j++) {
+            float val = bf16_to_f32(row_bf16[j]);
+            float abs_val = fabsf(val);
+            if (abs_val > max_abs) max_abs = abs_val;
+        }
+#else
+        for (int j = 0; j < in_dim; j++) {
+            float val = bf16_to_f32(row_bf16[j]);
+            float abs_val = fabsf(val);
+            if (abs_val > max_abs) max_abs = abs_val;
+        }
+#endif
+
+        /* Compute scale (map max to 127) */
+        float scale = max_abs / 127.0f;
+        q->scale[i] = scale;
+
+        /* Quantize row */
+        if (scale > 0) {
+            float inv_scale = 1.0f / scale;
+#if defined(__ARM_NEON)
+            float32x4_t inv_scale_v = vdupq_n_f32(inv_scale);
+            j = 0;
+            for (; j + 7 < in_dim; j += 8) {
+                uint16x8_t bf16_v = vld1q_u16(row_bf16 + j);
+                uint32x4_t lo = vshll_n_u16(vget_low_u16(bf16_v), 16);
+                uint32x4_t hi = vshll_n_u16(vget_high_u16(bf16_v), 16);
+                float32x4_t f0 = vreinterpretq_f32_u32(lo);
+                float32x4_t f1 = vreinterpretq_f32_u32(hi);
+                /* Scale and convert to int32 */
+                int32x4_t i0 = vcvtnq_s32_f32(vmulq_f32(f0, inv_scale_v));
+                int32x4_t i1 = vcvtnq_s32_f32(vmulq_f32(f1, inv_scale_v));
+                /* Narrow to int16 then int8 with saturation */
+                int16x4_t s0 = vqmovn_s32(i0);
+                int16x4_t s1 = vqmovn_s32(i1);
+                int8x8_t b = vqmovn_s16(vcombine_s16(s0, s1));
+                vst1_s8(qrow + j, b);
+            }
+            for (; j < in_dim; j++) {
+                float val = bf16_to_f32(row_bf16[j]) * inv_scale;
+                if (val > 127.0f) val = 127.0f;
+                if (val < -127.0f) val = -127.0f;
+                qrow[j] = (int8_t)roundf(val);
+            }
+#else
+            for (int j = 0; j < in_dim; j++) {
+                float val = bf16_to_f32(row_bf16[j]) * inv_scale;
+                if (val > 127.0f) val = 127.0f;
+                if (val < -127.0f) val = -127.0f;
+                qrow[j] = (int8_t)roundf(val);
+            }
+#endif
+        } else {
+            /* All zeros */
+            memset(qrow, 0, in_dim);
+        }
+    }
+
+    return q;
 }
 
 /* Quantize float vector to int8 with scale - for use with vdot */
@@ -351,19 +457,6 @@ struct qwen3_generator {
     float *norm_buf;
     float *logits;           /* [vocab_size] */
 
-    /* Batch prefill buffers (allocated on demand) */
-    float *batch_hidden;     /* [max_batch, hidden] */
-    float *batch_residual;
-    float *batch_q;
-    float *batch_k;
-    float *batch_v;
-    float *batch_attn_out;
-    float *batch_mlp_gate;
-    float *batch_mlp_up;
-    float *batch_mlp_out;
-    float *batch_norm;
-    int batch_size;          /* Current batch allocation size */
-
     /* Token decode buffer */
     char decode_buf[256];
 
@@ -412,12 +505,6 @@ static void head_rms_norm(float *x, const float *weight,
             head[i] = head[i] * inv_rms * weight[i];
         }
     }
-}
-
-static void linear(float *y, const float *x, const float *W,
-                   int in_dim, int out_dim) {
-    /* Use BLAS-accelerated linear from flux_kernels (or generic fallback) */
-    flux_linear_nobias(y, x, W, 1, in_dim, out_dim);
 }
 
 /* Dot product with BLAS or generic fallback */
@@ -584,53 +671,6 @@ static void kv_cache_reset(kv_cache_t *cache) {
 }
 
 /* ========================================================================
- * Batch Buffer Management
- * ======================================================================== */
-
-static int ensure_batch_buffers(qwen3_generator_t *gen, int seq_len) {
-    if (gen->batch_size >= seq_len) return 0;  /* Already big enough */
-
-    int hidden = QWEN3_HIDDEN_SIZE;
-    int q_dim = QWEN3_NUM_HEADS * QWEN3_HEAD_DIM;
-    int kv_dim = QWEN3_NUM_KV_HEADS * QWEN3_HEAD_DIM;
-    int intermediate = QWEN3_INTERMEDIATE_SIZE;
-
-    /* Free old buffers if any */
-    free(gen->batch_hidden);
-    free(gen->batch_residual);
-    free(gen->batch_q);
-    free(gen->batch_k);
-    free(gen->batch_v);
-    free(gen->batch_attn_out);
-    free(gen->batch_mlp_gate);
-    free(gen->batch_mlp_up);
-    free(gen->batch_mlp_out);
-    free(gen->batch_norm);
-
-    /* Allocate new buffers */
-    gen->batch_hidden = malloc(seq_len * hidden * sizeof(float));
-    gen->batch_residual = malloc(seq_len * hidden * sizeof(float));
-    gen->batch_q = malloc(seq_len * q_dim * sizeof(float));
-    gen->batch_k = malloc(seq_len * kv_dim * sizeof(float));
-    gen->batch_v = malloc(seq_len * kv_dim * sizeof(float));
-    gen->batch_attn_out = malloc(seq_len * q_dim * sizeof(float));
-    gen->batch_mlp_gate = malloc(seq_len * intermediate * sizeof(float));
-    gen->batch_mlp_up = malloc(seq_len * intermediate * sizeof(float));
-    gen->batch_mlp_out = malloc(seq_len * hidden * sizeof(float));
-    gen->batch_norm = malloc(seq_len * hidden * sizeof(float));
-
-    if (!gen->batch_hidden || !gen->batch_residual || !gen->batch_q ||
-        !gen->batch_k || !gen->batch_v || !gen->batch_attn_out ||
-        !gen->batch_mlp_gate || !gen->batch_mlp_up || !gen->batch_mlp_out ||
-        !gen->batch_norm) {
-        return -1;
-    }
-
-    gen->batch_size = seq_len;
-    return 0;
-}
-
-/* ========================================================================
  * Single Token Forward Pass
  * ======================================================================== */
 
@@ -645,19 +685,11 @@ static void attention_with_cache(qwen3_generator_t *gen, gen_layer_t *layer,
     int heads_per_kv = num_heads / num_kv_heads;
     float scale = 1.0f / sqrtf((float)head_dim);
 
-    /* Q, K, V projections for single token */
-    if (gen->use_q8 && layer->attn.q_proj_q8) {
-        /* Quantize norm_buf once, reuse for Q/K/V projections (saves ~2 quantizations) */
-        quantize_vector_q8(gen->norm_buf, gen->x_q8_cache, &gen->x_q8_scale, hidden);
-        linear_q8_preq(gen->q_buf, gen->x_q8_cache, gen->x_q8_scale, layer->attn.q_proj_q8);
-        linear_q8_preq(gen->k_buf, gen->x_q8_cache, gen->x_q8_scale, layer->attn.k_proj_q8);
-        linear_q8_preq(gen->v_buf, gen->x_q8_cache, gen->x_q8_scale, layer->attn.v_proj_q8);
-    } else {
-        /* Use f32 BLAS */
-        linear(gen->q_buf, gen->norm_buf, layer->attn.q_proj_weight, hidden, q_dim);
-        linear(gen->k_buf, gen->norm_buf, layer->attn.k_proj_weight, hidden, kv_dim);
-        linear(gen->v_buf, gen->norm_buf, layer->attn.v_proj_weight, hidden, kv_dim);
-    }
+    /* Q, K, V projections for single token (always Q8) */
+    quantize_vector_q8(gen->norm_buf, gen->x_q8_cache, &gen->x_q8_scale, hidden);
+    linear_q8_preq(gen->q_buf, gen->x_q8_cache, gen->x_q8_scale, layer->attn.q_proj_q8);
+    linear_q8_preq(gen->k_buf, gen->x_q8_cache, gen->x_q8_scale, layer->attn.k_proj_q8);
+    linear_q8_preq(gen->v_buf, gen->x_q8_cache, gen->x_q8_scale, layer->attn.v_proj_q8);
 
     /* Q/K RMS normalization */
     head_rms_norm(gen->q_buf, layer->attn.q_norm_weight, num_heads, head_dim, QWEN3_RMS_NORM_EPS);
@@ -712,44 +744,28 @@ static void attention_with_cache(qwen3_generator_t *gen, gen_layer_t *layer,
         }
     }
 
-    /* Output projection */
-    if (gen->use_q8 && layer->attn.o_proj_q8) {
-        /* Quantize attn_out using pre-allocated cache (avoids malloc) */
-        quantize_vector_q8(gen->attn_out, gen->x_q8_cache, &gen->x_q8_scale, q_dim);
-        linear_q8_preq(gen->mlp_out, gen->x_q8_cache, gen->x_q8_scale, layer->attn.o_proj_q8);
-    } else {
-        linear(gen->mlp_out, gen->attn_out, layer->attn.o_proj_weight, q_dim, hidden);
-    }
+    /* Output projection (always Q8) */
+    quantize_vector_q8(gen->attn_out, gen->x_q8_cache, &gen->x_q8_scale, q_dim);
+    linear_q8_preq(gen->mlp_out, gen->x_q8_cache, gen->x_q8_scale, layer->attn.o_proj_q8);
 }
 
 static void mlp_forward(qwen3_generator_t *gen, gen_layer_t *layer) {
     int hidden = QWEN3_HIDDEN_SIZE;
     int intermediate = QWEN3_INTERMEDIATE_SIZE;
 
-    /* Gate and Up projections */
-    if (gen->use_q8 && layer->mlp.gate_proj_q8) {
-        /* Quantize norm_buf once, reuse for gate/up projections (saves 1 quantization) */
-        quantize_vector_q8(gen->norm_buf, gen->x_q8_cache, &gen->x_q8_scale, hidden);
-        linear_q8_preq(gen->mlp_gate, gen->x_q8_cache, gen->x_q8_scale, layer->mlp.gate_proj_q8);
-        linear_q8_preq(gen->mlp_up, gen->x_q8_cache, gen->x_q8_scale, layer->mlp.up_proj_q8);
-    } else {
-        linear(gen->mlp_gate, gen->norm_buf, layer->mlp.gate_proj_weight, hidden, intermediate);
-        linear(gen->mlp_up, gen->norm_buf, layer->mlp.up_proj_weight, hidden, intermediate);
-    }
+    /* Gate and Up projections (always Q8) */
+    quantize_vector_q8(gen->norm_buf, gen->x_q8_cache, &gen->x_q8_scale, hidden);
+    linear_q8_preq(gen->mlp_gate, gen->x_q8_cache, gen->x_q8_scale, layer->mlp.gate_proj_q8);
+    linear_q8_preq(gen->mlp_up, gen->x_q8_cache, gen->x_q8_scale, layer->mlp.up_proj_q8);
 
     /* SwiGLU: silu(gate) * up */
     for (int i = 0; i < intermediate; i++) {
         gen->mlp_gate[i] = silu(gen->mlp_gate[i]) * gen->mlp_up[i];
     }
 
-    /* Down projection */
-    if (gen->use_q8 && layer->mlp.down_proj_q8) {
-        /* Quantize mlp_gate using pre-allocated cache (avoids malloc) */
-        quantize_vector_q8(gen->mlp_gate, gen->x_q8_cache, &gen->x_q8_scale, intermediate);
-        linear_q8_preq(gen->mlp_out, gen->x_q8_cache, gen->x_q8_scale, layer->mlp.down_proj_q8);
-    } else {
-        linear(gen->mlp_out, gen->mlp_gate, layer->mlp.down_proj_weight, intermediate, hidden);
-    }
+    /* Down projection (always Q8) */
+    quantize_vector_q8(gen->mlp_gate, gen->x_q8_cache, &gen->x_q8_scale, intermediate);
+    linear_q8_preq(gen->mlp_out, gen->x_q8_cache, gen->x_q8_scale, layer->mlp.down_proj_q8);
 }
 
 static void forward_token(qwen3_generator_t *gen, int token_id, int pos) {
@@ -808,212 +824,14 @@ static void forward_token(qwen3_generator_t *gen, int token_id, int pos) {
     }
 }
 
-/* ========================================================================
- * Batched Prefill (Process multiple tokens at once)
- * ======================================================================== */
-
-/* Batched RMS norm: out[seq, hidden] = rms_norm(x[seq, hidden]) * weight[hidden] */
-static void rms_norm_batch(float *out, const float *x, const float *weight,
-                           int seq_len, int hidden, float eps) {
-    for (int s = 0; s < seq_len; s++) {
-        const float *x_row = x + s * hidden;
-        float *out_row = out + s * hidden;
-        float sum_sq = 0.0f;
-        for (int i = 0; i < hidden; i++) {
-            sum_sq += x_row[i] * x_row[i];
-        }
-        float rms = sqrtf(sum_sq / hidden + eps);
-        float inv_rms = 1.0f / rms;
-        for (int i = 0; i < hidden; i++) {
-            out_row[i] = x_row[i] * inv_rms * weight[i];
-        }
-    }
-}
-
-/* Batched head RMS norm */
-static void head_rms_norm_batch(float *x, const float *weight,
-                                 int seq_len, int num_heads, int head_dim, float eps) {
-    for (int s = 0; s < seq_len; s++) {
-        float *row = x + s * num_heads * head_dim;
-        head_rms_norm(row, weight, num_heads, head_dim, eps);
-    }
-}
-
-/* Batched RoPE application */
-static void apply_rope_batch(float *q, float *k,
-                             int seq_len, int num_q_heads, int num_kv_heads, int head_dim) {
-    for (int s = 0; s < seq_len; s++) {
-        float *q_row = q + s * num_q_heads * head_dim;
-        float *k_row = k + s * num_kv_heads * head_dim;
-        apply_rope_single(q_row, k_row, s, num_q_heads, num_kv_heads, head_dim);
-    }
-}
-
-/* Batched causal attention with KV cache population */
-static void causal_attention_batch(qwen3_generator_t *gen, gen_layer_t *layer,
-                                   int layer_idx, int seq_len) {
-    int num_heads = QWEN3_NUM_HEADS;
-    int num_kv_heads = QWEN3_NUM_KV_HEADS;
-    int head_dim = QWEN3_HEAD_DIM;
-    int hidden = QWEN3_HIDDEN_SIZE;
-    int kv_dim = num_kv_heads * head_dim;
-    int q_dim = num_heads * head_dim;
-    int heads_per_kv = num_heads / num_kv_heads;
-    float scale = 1.0f / sqrtf((float)head_dim);
-
-    kv_cache_layer_t *kv = &gen->cache.layers[layer_idx];
-
-    /* Q, K, V projections for all tokens - use BLAS with f32 weights */
-    flux_linear_nobias(gen->batch_q, gen->batch_norm, layer->attn.q_proj_weight,
-                       seq_len, hidden, q_dim);
-    flux_linear_nobias(gen->batch_k, gen->batch_norm, layer->attn.k_proj_weight,
-                       seq_len, hidden, kv_dim);
-    flux_linear_nobias(gen->batch_v, gen->batch_norm, layer->attn.v_proj_weight,
-                       seq_len, hidden, kv_dim);
-
-    /* Q/K RMS normalization */
-    head_rms_norm_batch(gen->batch_q, layer->attn.q_norm_weight, seq_len, num_heads, head_dim, QWEN3_RMS_NORM_EPS);
-    head_rms_norm_batch(gen->batch_k, layer->attn.k_norm_weight, seq_len, num_kv_heads, head_dim, QWEN3_RMS_NORM_EPS);
-
-    /* Apply RoPE */
-    apply_rope_batch(gen->batch_q, gen->batch_k, seq_len, num_heads, num_kv_heads, head_dim);
-
-    /* Store K, V in cache */
-    memcpy(kv->k, gen->batch_k, seq_len * kv_dim * sizeof(float));
-    memcpy(kv->v, gen->batch_v, seq_len * kv_dim * sizeof(float));
-
-    /* Causal attention: each query attends only to previous positions */
-    for (int q_pos = 0; q_pos < seq_len; q_pos++) {
-        int attend_len = q_pos + 1;
-
-        for (int h = 0; h < num_heads; h++) {
-            int kv_h = h / heads_per_kv;
-            float *q_head = gen->batch_q + q_pos * q_dim + h * head_dim;
-            float *out_head = gen->batch_attn_out + q_pos * q_dim + h * head_dim;
-            float *scores = gen->mlp_gate;  /* Reuse single-token buffer */
-
-            /* Compute attention scores */
-            float max_score = -1e30f;
-            for (int s = 0; s < attend_len; s++) {
-                float *k_s = kv->k + s * kv_dim + kv_h * head_dim;
-                float score = vec_dot(q_head, k_s, head_dim) * scale;
-                scores[s] = score;
-                if (score > max_score) max_score = score;
-            }
-
-            /* Softmax */
-            float sum_exp = 0.0f;
-            for (int s = 0; s < attend_len; s++) {
-                scores[s] = expf(scores[s] - max_score);
-                sum_exp += scores[s];
-            }
-            float inv_sum = 1.0f / sum_exp;
-            for (int s = 0; s < attend_len; s++) {
-                scores[s] *= inv_sum;
-            }
-
-            /* Weighted sum of V */
-            memset(out_head, 0, head_dim * sizeof(float));
-            for (int s = 0; s < attend_len; s++) {
-                float *v_s = kv->v + s * kv_dim + kv_h * head_dim;
-                vec_axpy(out_head, scores[s], v_s, head_dim);
-            }
-        }
-    }
-
-    /* Output projection */
-    flux_linear_nobias(gen->batch_mlp_out, gen->batch_attn_out, layer->attn.o_proj_weight,
-                       seq_len, q_dim, hidden);
-}
-
-/* Batched MLP forward */
-static void mlp_forward_batch(qwen3_generator_t *gen, gen_layer_t *layer, int seq_len) {
-    int hidden = QWEN3_HIDDEN_SIZE;
-    int intermediate = QWEN3_INTERMEDIATE_SIZE;
-
-    /* Gate and Up projections */
-    flux_linear_nobias(gen->batch_mlp_gate, gen->batch_norm, layer->mlp.gate_proj_weight,
-                       seq_len, hidden, intermediate);
-    flux_linear_nobias(gen->batch_mlp_up, gen->batch_norm, layer->mlp.up_proj_weight,
-                       seq_len, hidden, intermediate);
-
-    /* SwiGLU: silu(gate) * up */
-    int total = seq_len * intermediate;
-    for (int i = 0; i < total; i++) {
-        gen->batch_mlp_gate[i] = silu(gen->batch_mlp_gate[i]) * gen->batch_mlp_up[i];
-    }
-
-    /* Down projection */
-    flux_linear_nobias(gen->batch_mlp_out, gen->batch_mlp_gate, layer->mlp.down_proj_weight,
-                       seq_len, intermediate, hidden);
-}
-
 /* Forward pass for multiple tokens (prefill) */
 static void forward_tokens_batch(qwen3_generator_t *gen, const int *token_ids, int seq_len) {
-    int hidden = QWEN3_HIDDEN_SIZE;
-    gen_layer_t *layers = (gen_layer_t *)gen->layers;
-
-    /* Ensure batch buffers are allocated */
-    if (ensure_batch_buffers(gen, seq_len) != 0) {
-        /* Fallback to token-by-token if allocation fails */
-        for (int i = 0; i < seq_len; i++) {
-            forward_token(gen, token_ids[i], i);
-        }
-        return;
-    }
-
-    /* Token embeddings for all tokens */
+    /* We only have Q8 weights (no f32 for BLAS), so use token-by-token processing.
+     * This is slower for prefill but uses much less memory. */
     for (int i = 0; i < seq_len; i++) {
-        memcpy(gen->batch_hidden + i * hidden,
-               gen->embed_tokens + token_ids[i] * hidden,
-               hidden * sizeof(float));
+        forward_token(gen, token_ids[i], i);
     }
-
-    /* Process each layer */
-    for (int l = 0; l < gen->num_layers; l++) {
-        gen_layer_t *layer = &layers[l];
-
-        /* Save residual */
-        memcpy(gen->batch_residual, gen->batch_hidden, seq_len * hidden * sizeof(float));
-
-        /* Pre-attention norm */
-        rms_norm_batch(gen->batch_norm, gen->batch_hidden, layer->input_layernorm_weight,
-                       seq_len, hidden, QWEN3_RMS_NORM_EPS);
-
-        /* Causal attention */
-        causal_attention_batch(gen, layer, l, seq_len);
-
-        /* Residual connection */
-        for (int i = 0; i < seq_len * hidden; i++) {
-            gen->batch_hidden[i] = gen->batch_residual[i] + gen->batch_mlp_out[i];
-        }
-
-        /* Save residual */
-        memcpy(gen->batch_residual, gen->batch_hidden, seq_len * hidden * sizeof(float));
-
-        /* Post-attention norm */
-        rms_norm_batch(gen->batch_norm, gen->batch_hidden, layer->post_attention_layernorm_weight,
-                       seq_len, hidden, QWEN3_RMS_NORM_EPS);
-
-        /* MLP */
-        mlp_forward_batch(gen, layer, seq_len);
-
-        /* Residual connection */
-        for (int i = 0; i < seq_len * hidden; i++) {
-            gen->batch_hidden[i] = gen->batch_residual[i] + gen->batch_mlp_out[i];
-        }
-    }
-
-    /* Update cache position */
     gen->cache.cur_seq_len = seq_len;
-
-    /* Final norm and logits for last token only */
-    rms_norm(gen->norm_buf, gen->batch_hidden + (seq_len - 1) * hidden,
-             gen->norm_weight, hidden, QWEN3_RMS_NORM_EPS);
-    flux_linear_nobias(gen->logits, gen->norm_buf, gen->embed_tokens, 1, hidden, QWEN3_VOCAB_SIZE);
-
-    /* Copy last hidden state for continuation */
-    memcpy(gen->hidden_state, gen->batch_hidden + (seq_len - 1) * hidden, hidden * sizeof(float));
 }
 
 /* ========================================================================
@@ -1145,7 +963,8 @@ int qwen3_sample(const float *logits, int vocab_size,
  * Weight Loading
  * ======================================================================== */
 
-static float *load_tensor(safetensors_file_t **files, int num_files, const char *name) {
+/* Load tensor as f32 (allocates memory) */
+static float *load_tensor_f32(safetensors_file_t **files, int num_files, const char *name) {
     for (int i = 0; i < num_files; i++) {
         const safetensor_t *t = safetensors_find(files[i], name);
         if (t) {
@@ -1155,83 +974,86 @@ static float *load_tensor(safetensors_file_t **files, int num_files, const char 
     return NULL;
 }
 
+/* Get direct pointer to bf16 tensor data (mmap'd, no allocation) */
+static const uint16_t *load_tensor_bf16_direct(safetensors_file_t **files, int num_files, const char *name) {
+    for (int i = 0; i < num_files; i++) {
+        const safetensor_t *t = safetensors_find(files[i], name);
+        if (t) {
+            return safetensors_get_bf16_direct(files[i], t);
+        }
+    }
+    return NULL;
+}
+
+/* Load layer weights: small norms as f32, large projections directly to Q8 via mmap */
 static int load_layer_weights(gen_layer_t *layer, safetensors_file_t **files,
                               int num_files, int layer_idx) {
     char name[256];
-
-    /* Layer norms */
-    snprintf(name, sizeof(name), "model.layers.%d.input_layernorm.weight", layer_idx);
-    layer->input_layernorm_weight = load_tensor(files, num_files, name);
-
-    snprintf(name, sizeof(name), "model.layers.%d.post_attention_layernorm.weight", layer_idx);
-    layer->post_attention_layernorm_weight = load_tensor(files, num_files, name);
-
-    /* Attention weights */
-    snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.weight", layer_idx);
-    layer->attn.q_proj_weight = load_tensor(files, num_files, name);
-
-    snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.weight", layer_idx);
-    layer->attn.k_proj_weight = load_tensor(files, num_files, name);
-
-    snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.weight", layer_idx);
-    layer->attn.v_proj_weight = load_tensor(files, num_files, name);
-
-    snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", layer_idx);
-    layer->attn.o_proj_weight = load_tensor(files, num_files, name);
-
-    snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_norm.weight", layer_idx);
-    layer->attn.q_norm_weight = load_tensor(files, num_files, name);
-
-    snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_norm.weight", layer_idx);
-    layer->attn.k_norm_weight = load_tensor(files, num_files, name);
-
-    /* MLP weights */
-    snprintf(name, sizeof(name), "model.layers.%d.mlp.gate_proj.weight", layer_idx);
-    layer->mlp.gate_proj_weight = load_tensor(files, num_files, name);
-
-    snprintf(name, sizeof(name), "model.layers.%d.mlp.up_proj.weight", layer_idx);
-    layer->mlp.up_proj_weight = load_tensor(files, num_files, name);
-
-    snprintf(name, sizeof(name), "model.layers.%d.mlp.down_proj.weight", layer_idx);
-    layer->mlp.down_proj_weight = load_tensor(files, num_files, name);
-
-    /* Initialize Q8 pointers to NULL */
-    layer->attn.q_proj_q8 = NULL;
-    layer->attn.k_proj_q8 = NULL;
-    layer->attn.v_proj_q8 = NULL;
-    layer->attn.o_proj_q8 = NULL;
-    layer->mlp.gate_proj_q8 = NULL;
-    layer->mlp.up_proj_q8 = NULL;
-    layer->mlp.down_proj_q8 = NULL;
-
-    /* Check all weights loaded */
-    return (layer->input_layernorm_weight && layer->post_attention_layernorm_weight &&
-            layer->attn.q_proj_weight && layer->attn.k_proj_weight &&
-            layer->attn.v_proj_weight && layer->attn.o_proj_weight &&
-            layer->attn.q_norm_weight && layer->attn.k_norm_weight &&
-            layer->mlp.gate_proj_weight && layer->mlp.up_proj_weight &&
-            layer->mlp.down_proj_weight) ? 0 : -1;
-}
-
-/* Quantize a layer's weights to Q8 format */
-static void quantize_layer_weights(gen_layer_t *layer) {
     int hidden = QWEN3_HIDDEN_SIZE;
     int q_dim = QWEN3_NUM_HEADS * QWEN3_HEAD_DIM;
     int kv_dim = QWEN3_NUM_KV_HEADS * QWEN3_HEAD_DIM;
     int intermediate = QWEN3_INTERMEDIATE_SIZE;
 
-    /* Quantize attention weights */
-    layer->attn.q_proj_q8 = q8_quantize(layer->attn.q_proj_weight, q_dim, hidden);
-    layer->attn.k_proj_q8 = q8_quantize(layer->attn.k_proj_weight, kv_dim, hidden);
-    layer->attn.v_proj_q8 = q8_quantize(layer->attn.v_proj_weight, kv_dim, hidden);
-    layer->attn.o_proj_q8 = q8_quantize(layer->attn.o_proj_weight, hidden, q_dim);
+    /* Layer norms - small, load as f32 */
+    snprintf(name, sizeof(name), "model.layers.%d.input_layernorm.weight", layer_idx);
+    layer->input_layernorm_weight = load_tensor_f32(files, num_files, name);
 
-    /* Quantize MLP weights */
-    layer->mlp.gate_proj_q8 = q8_quantize(layer->mlp.gate_proj_weight, intermediate, hidden);
-    layer->mlp.up_proj_q8 = q8_quantize(layer->mlp.up_proj_weight, intermediate, hidden);
-    layer->mlp.down_proj_q8 = q8_quantize(layer->mlp.down_proj_weight, hidden, intermediate);
+    snprintf(name, sizeof(name), "model.layers.%d.post_attention_layernorm.weight", layer_idx);
+    layer->post_attention_layernorm_weight = load_tensor_f32(files, num_files, name);
 
-    /* Note: Keep f32 weights for batched prefill (BLAS is faster for batched ops) */
+    snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_norm.weight", layer_idx);
+    layer->attn.q_norm_weight = load_tensor_f32(files, num_files, name);
+
+    snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_norm.weight", layer_idx);
+    layer->attn.k_norm_weight = load_tensor_f32(files, num_files, name);
+
+    /* Large projection weights - mmap bf16 and quantize directly to Q8 */
+    const uint16_t *bf16_ptr;
+
+    snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.weight", layer_idx);
+    bf16_ptr = load_tensor_bf16_direct(files, num_files, name);
+    layer->attn.q_proj_q8 = bf16_ptr ? q8_quantize_bf16(bf16_ptr, q_dim, hidden) : NULL;
+
+    snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.weight", layer_idx);
+    bf16_ptr = load_tensor_bf16_direct(files, num_files, name);
+    layer->attn.k_proj_q8 = bf16_ptr ? q8_quantize_bf16(bf16_ptr, kv_dim, hidden) : NULL;
+
+    snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.weight", layer_idx);
+    bf16_ptr = load_tensor_bf16_direct(files, num_files, name);
+    layer->attn.v_proj_q8 = bf16_ptr ? q8_quantize_bf16(bf16_ptr, kv_dim, hidden) : NULL;
+
+    snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", layer_idx);
+    bf16_ptr = load_tensor_bf16_direct(files, num_files, name);
+    layer->attn.o_proj_q8 = bf16_ptr ? q8_quantize_bf16(bf16_ptr, hidden, q_dim) : NULL;
+
+    snprintf(name, sizeof(name), "model.layers.%d.mlp.gate_proj.weight", layer_idx);
+    bf16_ptr = load_tensor_bf16_direct(files, num_files, name);
+    layer->mlp.gate_proj_q8 = bf16_ptr ? q8_quantize_bf16(bf16_ptr, intermediate, hidden) : NULL;
+
+    snprintf(name, sizeof(name), "model.layers.%d.mlp.up_proj.weight", layer_idx);
+    bf16_ptr = load_tensor_bf16_direct(files, num_files, name);
+    layer->mlp.up_proj_q8 = bf16_ptr ? q8_quantize_bf16(bf16_ptr, intermediate, hidden) : NULL;
+
+    snprintf(name, sizeof(name), "model.layers.%d.mlp.down_proj.weight", layer_idx);
+    bf16_ptr = load_tensor_bf16_direct(files, num_files, name);
+    layer->mlp.down_proj_q8 = bf16_ptr ? q8_quantize_bf16(bf16_ptr, hidden, intermediate) : NULL;
+
+    /* f32 projection weights not used - set to NULL */
+    layer->attn.q_proj_weight = NULL;
+    layer->attn.k_proj_weight = NULL;
+    layer->attn.v_proj_weight = NULL;
+    layer->attn.o_proj_weight = NULL;
+    layer->mlp.gate_proj_weight = NULL;
+    layer->mlp.up_proj_weight = NULL;
+    layer->mlp.down_proj_weight = NULL;
+
+    /* Check all weights loaded */
+    return (layer->input_layernorm_weight && layer->post_attention_layernorm_weight &&
+            layer->attn.q_norm_weight && layer->attn.k_norm_weight &&
+            layer->attn.q_proj_q8 && layer->attn.k_proj_q8 &&
+            layer->attn.v_proj_q8 && layer->attn.o_proj_q8 &&
+            layer->mlp.gate_proj_q8 && layer->mlp.up_proj_q8 &&
+            layer->mlp.down_proj_q8) ? 0 : -1;
 }
 
 /* ========================================================================
@@ -1266,8 +1088,8 @@ qwen3_generator_t *qwen3_generator_create(const char *model_dir) {
     }
 
     /* Load embeddings and final norm */
-    gen->embed_tokens = load_tensor(gen->files, 2, "model.embed_tokens.weight");
-    gen->norm_weight = load_tensor(gen->files, 2, "model.norm.weight");
+    gen->embed_tokens = load_tensor_f32(gen->files, 2, "model.embed_tokens.weight");
+    gen->norm_weight = load_tensor_f32(gen->files, 2, "model.norm.weight");
 
     if (!gen->embed_tokens || !gen->norm_weight) {
         fprintf(stderr, "Failed to load embedding weights\n");
@@ -1402,16 +1224,12 @@ void qwen3_generator_reset(qwen3_generator_t *gen) {
 int qwen3_generator_quantize(qwen3_generator_t *gen) {
     if (!gen || gen->use_q8) return 0;  /* Already quantized */
 
-    fprintf(stderr, "Quantizing weights to Q8...");
+    fprintf(stderr, "Quantizing embedding matrix...");
     fflush(stderr);
 
-    gen_layer_t *layers = (gen_layer_t *)gen->layers;
-    for (int i = 0; i < gen->num_layers; i++) {
-        quantize_layer_weights(&layers[i]);
-    }
-
-    /* Quantize embedding matrix for LM head projection
-     * This is the largest matrix: [vocab_size, hidden] = ~388M params */
+    /* Layer weights are already Q8 from load time.
+     * We only need to quantize the embedding matrix for LM head projection.
+     * (Embeddings are kept as f32 for embedding lookup, Q8 for LM head) */
     gen->embed_tokens_q8 = q8_quantize(gen->embed_tokens,
                                         QWEN3_VOCAB_SIZE, QWEN3_HIDDEN_SIZE);
 
