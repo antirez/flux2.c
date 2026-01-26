@@ -13,6 +13,12 @@
 
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
+#elif defined(__AVX512F__) && defined(__AVX512BW__)
+#include <immintrin.h>
+#define USE_AVX512
+#elif defined(__AVX2__)
+#include <immintrin.h>
+#define USE_AVX2
 #endif
 
 #include "qwen3_generate.h"
@@ -169,6 +175,48 @@ static q8_weight_t *q8_quantize_bf16(const uint16_t *weights_bf16, int out_dim, 
             float abs_val = fabsf(val);
             if (abs_val > max_abs) max_abs = abs_val;
         }
+#elif defined(USE_AVX512)
+        __m512 max_v = _mm512_setzero_ps();
+        __m512 sign_mask = _mm512_castsi512_ps(_mm512_set1_epi32(0x7FFFFFFF));
+        int j = 0;
+        for (; j + 15 < in_dim; j += 16) {
+            /* Load 16 bf16, convert to f32 by shifting left 16 bits */
+            __m256i bf16_v = _mm256_loadu_si256((const __m256i*)(row_bf16 + j));
+            __m512i f32_bits = _mm512_slli_epi32(_mm512_cvtepu16_epi32(bf16_v), 16);
+            __m512 f32_v = _mm512_castsi512_ps(f32_bits);
+            __m512 abs_v = _mm512_and_ps(f32_v, sign_mask);
+            max_v = _mm512_max_ps(max_v, abs_v);
+        }
+        max_abs = _mm512_reduce_max_ps(max_v);
+        for (; j < in_dim; j++) {
+            float val = bf16_to_f32(row_bf16[j]);
+            float abs_val = fabsf(val);
+            if (abs_val > max_abs) max_abs = abs_val;
+        }
+#elif defined(USE_AVX2)
+        __m256 max_v = _mm256_setzero_ps();
+        __m256 sign_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+        int j = 0;
+        for (; j + 7 < in_dim; j += 8) {
+            /* Load 8 bf16, convert to f32 */
+            __m128i bf16_v = _mm_loadu_si128((const __m128i*)(row_bf16 + j));
+            __m256i f32_bits = _mm256_slli_epi32(_mm256_cvtepu16_epi32(bf16_v), 16);
+            __m256 f32_v = _mm256_castsi256_ps(f32_bits);
+            __m256 abs_v = _mm256_and_ps(f32_v, sign_mask);
+            max_v = _mm256_max_ps(max_v, abs_v);
+        }
+        /* Horizontal max */
+        __m128 lo = _mm256_castps256_ps128(max_v);
+        __m128 hi = _mm256_extractf128_ps(max_v, 1);
+        lo = _mm_max_ps(lo, hi);
+        lo = _mm_max_ps(lo, _mm_shuffle_ps(lo, lo, _MM_SHUFFLE(2, 3, 0, 1)));
+        lo = _mm_max_ps(lo, _mm_shuffle_ps(lo, lo, _MM_SHUFFLE(1, 0, 3, 2)));
+        max_abs = _mm_cvtss_f32(lo);
+        for (; j < in_dim; j++) {
+            float val = bf16_to_f32(row_bf16[j]);
+            float abs_val = fabsf(val);
+            if (abs_val > max_abs) max_abs = abs_val;
+        }
 #else
         for (int j = 0; j < in_dim; j++) {
             float val = bf16_to_f32(row_bf16[j]);
@@ -201,6 +249,51 @@ static q8_weight_t *q8_quantize_bf16(const uint16_t *weights_bf16, int out_dim, 
                 int16x4_t s1 = vqmovn_s32(i1);
                 int8x8_t b = vqmovn_s16(vcombine_s16(s0, s1));
                 vst1_s8(qrow + j, b);
+            }
+            for (; j < in_dim; j++) {
+                float val = bf16_to_f32(row_bf16[j]) * inv_scale;
+                if (val > 127.0f) val = 127.0f;
+                if (val < -127.0f) val = -127.0f;
+                qrow[j] = (int8_t)roundf(val);
+            }
+#elif defined(USE_AVX512)
+            __m512 inv_scale_v = _mm512_set1_ps(inv_scale);
+            j = 0;
+            for (; j + 15 < in_dim; j += 16) {
+                /* Load 16 bf16, convert to f32 */
+                __m256i bf16_v = _mm256_loadu_si256((const __m256i*)(row_bf16 + j));
+                __m512i f32_bits = _mm512_slli_epi32(_mm512_cvtepu16_epi32(bf16_v), 16);
+                __m512 f32_v = _mm512_castsi512_ps(f32_bits);
+                /* Scale and convert to int32 with rounding */
+                __m512 scaled = _mm512_mul_ps(f32_v, inv_scale_v);
+                __m512i i32 = _mm512_cvtps_epi32(scaled);
+                /* Pack to int16 then int8 with saturation */
+                __m256i i16 = _mm512_cvtsepi32_epi16(i32);
+                __m128i i8 = _mm256_cvtsepi16_epi8(i16);
+                _mm_storeu_si128((__m128i*)(qrow + j), i8);
+            }
+            for (; j < in_dim; j++) {
+                float val = bf16_to_f32(row_bf16[j]) * inv_scale;
+                if (val > 127.0f) val = 127.0f;
+                if (val < -127.0f) val = -127.0f;
+                qrow[j] = (int8_t)roundf(val);
+            }
+#elif defined(USE_AVX2)
+            __m256 inv_scale_v = _mm256_set1_ps(inv_scale);
+            j = 0;
+            for (; j + 7 < in_dim; j += 8) {
+                /* Load 8 bf16, convert to f32 */
+                __m128i bf16_v = _mm_loadu_si128((const __m128i*)(row_bf16 + j));
+                __m256i f32_bits = _mm256_slli_epi32(_mm256_cvtepu16_epi32(bf16_v), 16);
+                __m256 f32_v = _mm256_castsi256_ps(f32_bits);
+                /* Scale and convert to int32 with rounding */
+                __m256 scaled = _mm256_mul_ps(f32_v, inv_scale_v);
+                __m256i i32 = _mm256_cvtps_epi32(scaled);
+                /* Pack to int16 then int8 with saturation */
+                __m128i i16 = _mm_packs_epi32(_mm256_castsi256_si128(i32),
+                                              _mm256_extracti128_si256(i32, 1));
+                __m128i i8 = _mm_packs_epi16(i16, i16);
+                _mm_storel_epi64((__m128i*)(qrow + j), i8);
             }
             for (; j < in_dim; j++) {
                 float val = bf16_to_f32(row_bf16[j]) * inv_scale;
@@ -286,6 +379,101 @@ static void quantize_vector_q8(const float *x, int8_t *x_q8, float *x_scale, int
 
         /* Store 16 int8s */
         vst1q_s8(x_q8 + i, result);
+    }
+    /* Handle remainder */
+    for (; i < n; i++) {
+        float val = x[i] * inv_scale;
+        if (val > 127.0f) val = 127.0f;
+        if (val < -127.0f) val = -127.0f;
+        x_q8[i] = (int8_t)roundf(val);
+    }
+#elif defined(USE_AVX512)
+    /* Find max absolute value using AVX-512 */
+    __m512 max_v = _mm512_setzero_ps();
+    __m512 sign_mask = _mm512_castsi512_ps(_mm512_set1_epi32(0x7FFFFFFF));
+    int i = 0;
+    for (; i + 15 < n; i += 16) {
+        __m512 v = _mm512_loadu_ps(x + i);
+        __m512 abs_v = _mm512_and_ps(v, sign_mask);
+        max_v = _mm512_max_ps(max_v, abs_v);
+    }
+    float max_abs = _mm512_reduce_max_ps(max_v);
+    for (; i < n; i++) {
+        float abs_val = fabsf(x[i]);
+        if (abs_val > max_abs) max_abs = abs_val;
+    }
+
+    /* Compute scale */
+    *x_scale = max_abs / 127.0f;
+    if (*x_scale == 0.0f) {
+        memset(x_q8, 0, n);
+        return;
+    }
+
+    /* Quantize using AVX-512: float -> int32 -> int16 -> int8 */
+    float inv_scale = 127.0f / max_abs;
+    __m512 scale_v = _mm512_set1_ps(inv_scale);
+    i = 0;
+    for (; i + 15 < n; i += 16) {
+        /* Load 16 floats */
+        __m512 f = _mm512_loadu_ps(x + i);
+        /* Scale and convert to int32 with rounding */
+        __m512i i32 = _mm512_cvtps_epi32(_mm512_mul_ps(f, scale_v));
+        /* Pack to int16 then int8 with saturation */
+        __m256i i16 = _mm512_cvtsepi32_epi16(i32);
+        __m128i i8 = _mm256_cvtsepi16_epi8(i16);
+        _mm_storeu_si128((__m128i*)(x_q8 + i), i8);
+    }
+    /* Handle remainder */
+    for (; i < n; i++) {
+        float val = x[i] * inv_scale;
+        if (val > 127.0f) val = 127.0f;
+        if (val < -127.0f) val = -127.0f;
+        x_q8[i] = (int8_t)roundf(val);
+    }
+#elif defined(USE_AVX2)
+    /* Find max absolute value using AVX2 */
+    __m256 max_v = _mm256_setzero_ps();
+    __m256 sign_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+    int i = 0;
+    for (; i + 7 < n; i += 8) {
+        __m256 v = _mm256_loadu_ps(x + i);
+        __m256 abs_v = _mm256_and_ps(v, sign_mask);
+        max_v = _mm256_max_ps(max_v, abs_v);
+    }
+    /* Horizontal max */
+    __m128 lo = _mm256_castps256_ps128(max_v);
+    __m128 hi = _mm256_extractf128_ps(max_v, 1);
+    lo = _mm_max_ps(lo, hi);
+    lo = _mm_max_ps(lo, _mm_shuffle_ps(lo, lo, _MM_SHUFFLE(2, 3, 0, 1)));
+    lo = _mm_max_ps(lo, _mm_shuffle_ps(lo, lo, _MM_SHUFFLE(1, 0, 3, 2)));
+    float max_abs = _mm_cvtss_f32(lo);
+    for (; i < n; i++) {
+        float abs_val = fabsf(x[i]);
+        if (abs_val > max_abs) max_abs = abs_val;
+    }
+
+    /* Compute scale */
+    *x_scale = max_abs / 127.0f;
+    if (*x_scale == 0.0f) {
+        memset(x_q8, 0, n);
+        return;
+    }
+
+    /* Quantize using AVX2: float -> int32 -> int16 -> int8 */
+    float inv_scale = 127.0f / max_abs;
+    __m256 scale_v = _mm256_set1_ps(inv_scale);
+    i = 0;
+    for (; i + 7 < n; i += 8) {
+        /* Load 8 floats */
+        __m256 f = _mm256_loadu_ps(x + i);
+        /* Scale and convert to int32 with rounding */
+        __m256i i32 = _mm256_cvtps_epi32(_mm256_mul_ps(f, scale_v));
+        /* Pack to int16 then int8 with saturation */
+        __m128i i16 = _mm_packs_epi32(_mm256_castsi256_si128(i32),
+                                       _mm256_extracti128_si256(i32, 1));
+        __m128i i8 = _mm_packs_epi16(i16, i16);
+        _mm_storel_epi64((__m128i*)(x_q8 + i), i8);
     }
     /* Handle remainder */
     for (; i < n; i++) {
@@ -396,6 +584,108 @@ static void linear_q8_preq(float *y, const int8_t *x_q8, float x_scale,
         acc0 = vaddq_s32(acc0, acc1);
         int32_t sum = vaddvq_s32(acc0);
 
+        for (; j < in_dim; j++) {
+            sum += (int32_t)x_q8[j] * (int32_t)wrow[j];
+        }
+
+        y[i] = (float)sum * scale;
+    }
+#elif defined(USE_AVX512)
+    /* AVX-512: Process 64 int8 elements at a time using int16 intermediate.
+     * We sign-extend int8 to int16, multiply, then use madd to sum pairs into int32. */
+    for (int i = 0; i < out_dim; i++) {
+        const int8_t *wrow = W->data + i * in_dim;
+        float scale = W->scale[i] * x_scale;
+
+        __m512i acc0 = _mm512_setzero_si512();
+        __m512i acc1 = _mm512_setzero_si512();
+
+        int j = 0;
+        for (; j + 63 < in_dim; j += 64) {
+            /* Load 64 int8 from x and W (as two 256-bit loads each) */
+            __m256i x8_lo = _mm256_loadu_si256((const __m256i*)(x_q8 + j));
+            __m256i x8_hi = _mm256_loadu_si256((const __m256i*)(x_q8 + j + 32));
+            __m256i w8_lo = _mm256_loadu_si256((const __m256i*)(wrow + j));
+            __m256i w8_hi = _mm256_loadu_si256((const __m256i*)(wrow + j + 32));
+
+            /* Sign-extend int8 to int16: 32 int8 -> 32 int16 in 512-bit register */
+            __m512i x16_lo = _mm512_cvtepi8_epi16(x8_lo);
+            __m512i x16_hi = _mm512_cvtepi8_epi16(x8_hi);
+            __m512i w16_lo = _mm512_cvtepi8_epi16(w8_lo);
+            __m512i w16_hi = _mm512_cvtepi8_epi16(w8_hi);
+
+            /* Multiply and add pairs: (x[2i]*w[2i] + x[2i+1]*w[2i+1]) -> 16 int32 */
+            __m512i prod_lo = _mm512_madd_epi16(x16_lo, w16_lo);
+            __m512i prod_hi = _mm512_madd_epi16(x16_hi, w16_hi);
+
+            acc0 = _mm512_add_epi32(acc0, prod_lo);
+            acc1 = _mm512_add_epi32(acc1, prod_hi);
+        }
+
+        /* Handle 32-element chunk if remaining */
+        if (j + 31 < in_dim) {
+            __m256i x8 = _mm256_loadu_si256((const __m256i*)(x_q8 + j));
+            __m256i w8 = _mm256_loadu_si256((const __m256i*)(wrow + j));
+            __m512i x16 = _mm512_cvtepi8_epi16(x8);
+            __m512i w16 = _mm512_cvtepi8_epi16(w8);
+            __m512i prod = _mm512_madd_epi16(x16, w16);
+            acc0 = _mm512_add_epi32(acc0, prod);
+            j += 32;
+        }
+
+        /* Combine accumulators and reduce */
+        acc0 = _mm512_add_epi32(acc0, acc1);
+        int32_t sum = _mm512_reduce_add_epi32(acc0);
+
+        /* Handle remaining elements */
+        for (; j < in_dim; j++) {
+            sum += (int32_t)x_q8[j] * (int32_t)wrow[j];
+        }
+
+        y[i] = (float)sum * scale;
+    }
+#elif defined(USE_AVX2)
+    /* AVX2: Process 32 int8 elements at a time using int16 intermediate */
+    for (int i = 0; i < out_dim; i++) {
+        const int8_t *wrow = W->data + i * in_dim;
+        float scale = W->scale[i] * x_scale;
+
+        __m256i acc0 = _mm256_setzero_si256();
+        __m256i acc1 = _mm256_setzero_si256();
+
+        int j = 0;
+        for (; j + 31 < in_dim; j += 32) {
+            /* Load 32 int8 from x and W (as two 128-bit loads each) */
+            __m128i x8_lo = _mm_loadu_si128((const __m128i*)(x_q8 + j));
+            __m128i x8_hi = _mm_loadu_si128((const __m128i*)(x_q8 + j + 16));
+            __m128i w8_lo = _mm_loadu_si128((const __m128i*)(wrow + j));
+            __m128i w8_hi = _mm_loadu_si128((const __m128i*)(wrow + j + 16));
+
+            /* Sign-extend int8 to int16: 16 int8 -> 16 int16 in 256-bit register */
+            __m256i x16_lo = _mm256_cvtepi8_epi16(x8_lo);
+            __m256i x16_hi = _mm256_cvtepi8_epi16(x8_hi);
+            __m256i w16_lo = _mm256_cvtepi8_epi16(w8_lo);
+            __m256i w16_hi = _mm256_cvtepi8_epi16(w8_hi);
+
+            /* Multiply and add pairs: (x[2i]*w[2i] + x[2i+1]*w[2i+1]) -> 8 int32 */
+            __m256i prod_lo = _mm256_madd_epi16(x16_lo, w16_lo);
+            __m256i prod_hi = _mm256_madd_epi16(x16_hi, w16_hi);
+
+            acc0 = _mm256_add_epi32(acc0, prod_lo);
+            acc1 = _mm256_add_epi32(acc1, prod_hi);
+        }
+
+        /* Combine accumulators */
+        acc0 = _mm256_add_epi32(acc0, acc1);
+        /* Horizontal sum: 8 int32 -> 1 int32 */
+        __m128i lo = _mm256_castsi256_si128(acc0);
+        __m128i hi = _mm256_extracti128_si256(acc0, 1);
+        lo = _mm_add_epi32(lo, hi);
+        lo = _mm_add_epi32(lo, _mm_shuffle_epi32(lo, _MM_SHUFFLE(2, 3, 0, 1)));
+        lo = _mm_add_epi32(lo, _mm_shuffle_epi32(lo, _MM_SHUFFLE(1, 0, 3, 2)));
+        int32_t sum = _mm_cvtsi128_si32(lo);
+
+        /* Handle remaining elements */
         for (; j < in_dim; j++) {
             sum += (int32_t)x_q8[j] * (int32_t)wrow[j];
         }
