@@ -3,7 +3,7 @@
  *
  * Supports multiple terminal graphics protocols:
  *   - Kitty graphics protocol (Kitty, Ghostty)
- *   - iTerm2 inline image protocol
+ *   - iTerm2 inline image protocol (iTerm2, WezTerm)
  *
  * The unified API (terminal_display_*) auto-detects and uses the appropriate
  * protocol based on environment variables.
@@ -21,7 +21,7 @@
 
 /*
  * Detect terminal graphics capability from environment variables.
- * Checks for Kitty, Ghostty, and iTerm2.
+ * Checks for Kitty, Ghostty, iTerm2, and WezTerm.
  */
 term_graphics_proto detect_terminal_graphics(void) {
     /* Kitty: KITTY_WINDOW_ID is set */
@@ -36,6 +36,10 @@ term_graphics_proto detect_terminal_graphics(void) {
     const char *term_program = getenv("TERM_PROGRAM");
     if ((term_program && strcmp(term_program, "iTerm.app") == 0) ||
         getenv("ITERM_SESSION_ID"))
+        return TERM_PROTO_ITERM2;
+
+    /* WezTerm: WEZTERM_PANE is set (uses iTerm2 protocol) */
+    if (getenv("WEZTERM_PANE"))
         return TERM_PROTO_ITERM2;
 
     return TERM_PROTO_NONE;

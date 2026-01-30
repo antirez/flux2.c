@@ -219,7 +219,7 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "Output options:\n");
     fprintf(stderr, "  -q, --quiet           Silent mode, no output\n");
     fprintf(stderr, "  -v, --verbose         Detailed output\n");
-    fprintf(stderr, "      --show            Display image in terminal (auto-detects Kitty/Ghostty/iTerm2)\n");
+    fprintf(stderr, "      --show            Display image in terminal (auto-detects Kitty/Ghostty/iTerm2/WezTerm)\n");
     fprintf(stderr, "      --show-steps      Display each denoising step (slower)\n\n");
     fprintf(stderr, "Other options:\n");
     fprintf(stderr, "  -e, --embeddings PATH Load pre-computed text embeddings\n");
@@ -428,7 +428,7 @@ int main(int argc, char *argv[]) {
     /* Set up step image callback if requested */
     if (show_steps) {
         if (graphics_proto == TERM_PROTO_NONE) {
-            fprintf(stderr, "Warning: --show-steps requires a supported terminal (Kitty, Ghostty, or iTerm2)\n");
+            fprintf(stderr, "Warning: --show-steps requires a supported terminal (Kitty, Ghostty, iTerm2, or WezTerm)\n");
         } else {
             cli_graphics_proto = graphics_proto;
             flux_set_step_image_callback(ctx, cli_step_image_callback);

@@ -1,7 +1,7 @@
 /*
  * terminals.h - Terminal graphics protocol support
  *
- * Supports Kitty graphics protocol (Kitty, Ghostty) and iTerm2 inline images.
+ * Supports Kitty graphics protocol (Kitty, Ghostty) and iTerm2 inline images (iTerm2, WezTerm).
  */
 
 #ifndef TERMINALS_H
