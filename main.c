@@ -52,6 +52,8 @@ static output_level_t output_level = OUTPUT_NORMAL;
  * ======================================================================== */
 
 static int cli_current_step = 0;
+static int cli_current_substep = 0;  /* 0-9: tracks 10 phases (5d + 4s + 1F) per step */
+static int cli_total_steps = 4;
 static int cli_legend_printed = 0;
 static term_graphics_proto cli_graphics_proto = TERM_PROTO_NONE;
 
@@ -70,8 +72,14 @@ static void cli_step_callback(int step, int total) {
         fprintf(stderr, "\n");
     }
     cli_current_step = step;
+    cli_total_steps = total;
+    cli_current_substep = 0;
     fprintf(stderr, "  Step %d/%d ", step, total);
     fflush(stderr);
+
+    /* OSC 9.4 progress: calculate percentage based on completed steps */
+    int percent = ((step - 1) * 100) / total;  /* Start at beginning of step */
+    terminal_progress_set(percent);
 }
 
 /* Called for each substep within transformer forward */
@@ -79,19 +87,33 @@ static void cli_substep_callback(flux_substep_type_t type, int index, int total)
     if (output_level == OUTPUT_QUIET) return;
     (void)total;
 
+    int substep_prog = 0;
     switch (type) {
         case FLUX_SUBSTEP_DOUBLE_BLOCK:
             fputc('d', stderr);
+            substep_prog = 1;
             break;
         case FLUX_SUBSTEP_SINGLE_BLOCK:
             /* Print 's' every 5 single blocks to avoid too much output */
             if ((index + 1) % 5 == 0) {
                 fputc('s', stderr);
+                substep_prog = 1;
             }
             break;
         case FLUX_SUBSTEP_FINAL_LAYER:
             fputc('F', stderr);
+            substep_prog = 1;
             break;
+    }
+
+    /* Update OSC 9.4 progress for each substep (10 phases per step) */
+    if (substep_prog && cli_current_step > 0) {
+        cli_current_substep++;
+        int base = ((cli_current_step - 1) * 100) / cli_total_steps;
+        int contrib = (cli_current_substep * 100) / (cli_total_steps * 10);
+        int percent = base + contrib;
+        if (percent > 100) percent = 100;
+        terminal_progress_set(percent);
     }
     fflush(stderr);
 }
@@ -125,6 +147,9 @@ static void cli_phase_callback(const char *phase, int done) {
 
         fprintf(stderr, "%s...", display);
         fflush(stderr);
+
+        /* OSC 9.4 progress: show indeterminate during phases */
+        terminal_progress_indeterminate();
     } else {
         /* Phase finished */
         struct timeval now;
@@ -162,6 +187,9 @@ static void cli_finish_progress(void) {
     flux_step_callback = NULL;
     flux_substep_callback = NULL;
     flux_phase_callback = NULL;
+
+    /* OSC 9.4 progress: remove progress indicator when done */
+    terminal_progress_remove();
 }
 
 /* ========================================================================
