@@ -62,6 +62,8 @@ Display generated images directly in your terminal with `--show`, or watch the d
 
 Requires a terminal supporting the [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/) (such as [Kitty](https://sw.kovidgoyal.net/kitty/) or [Ghostty](https://ghostty.org/)), or [iTerm2](https://iterm2.com/). Terminal type is auto-detected from environment variables.
 
+Use `--zoom N` to adjust the display size (default: 2 for Retina displays, use 1 for non-HiDPI screens).
+
 ## Usage
 
 ### Text-to-Image
@@ -174,6 +176,7 @@ Done -> /tmp/flux-.../image-0003.png (ref $2)
 -v, --verbose         Show detailed config and timing info
     --show            Display image in terminal (auto-detects Kitty/Ghostty/iTerm2)
     --show-steps      Display each denoising step (slower)
+    --zoom N          Terminal image zoom factor (default: 2 for Retina)
 ```
 
 **Other options:**

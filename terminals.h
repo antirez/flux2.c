@@ -64,6 +64,16 @@ int iterm2_display_png(const char *path);
 int iterm2_display_image(const flux_image *img);
 
 /* ======================================================================
+ * Zoom Setting
+ * ====================================================================== */
+
+/*
+ * Set the zoom factor for terminal image display (default: 2 for Retina).
+ * Values: 1 = native pixels, 2 = 2x (Retina), 3 = 3x, etc.
+ */
+void terminal_set_zoom(int zoom);
+
+/* ======================================================================
  * Unified Terminal API
  * ====================================================================== */
 

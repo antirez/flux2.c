@@ -16,6 +16,16 @@
 #include <unistd.h>
 
 /* ======================================================================
+ * Zoom Setting
+ * ====================================================================== */
+
+static int terminal_zoom = 2;  /* Default: 2x for Retina displays */
+
+void terminal_set_zoom(int zoom) {
+    if (zoom >= 1) terminal_zoom = zoom;
+}
+
+/* ======================================================================
  * Terminal Detection
  * ====================================================================== */
 
@@ -88,8 +98,28 @@ static char *base64_encode(const unsigned char *data, size_t len, size_t *out_le
  * ====================================================================== */
 
 /*
+ * Get PNG dimensions from header (bytes 16-23 contain width and height).
+ * Returns 0 on success, -1 on failure.
+ */
+static int png_get_dimensions(const unsigned char *data, size_t size,
+                              int *width, int *height) {
+    /* PNG signature (8 bytes) + IHDR chunk (length:4 + type:4 + data:13+) */
+    if (size < 24) return -1;
+
+    /* Check PNG signature */
+    static const unsigned char png_sig[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+    if (memcmp(data, png_sig, 8) != 0) return -1;
+
+    /* IHDR chunk starts at byte 8, width at 16, height at 20 (big-endian) */
+    *width = (data[16] << 24) | (data[17] << 16) | (data[18] << 8) | data[19];
+    *height = (data[20] << 24) | (data[21] << 16) | (data[22] << 8) | data[23];
+    return 0;
+}
+
+/*
  * Send data using Kitty graphics protocol in chunks.
  * format: 24=RGB, 32=RGBA, 100=PNG
+ * width/height: image dimensions in pixels
  */
 static int kitty_send_data(const unsigned char *data, size_t size,
                            int format, int width, int height) {
@@ -108,14 +138,19 @@ static int kitty_send_data(const unsigned char *data, size_t size,
         int more = (offset + this_chunk) < b64_len;
 
         if (first) {
-            /* First chunk: a=T (transmit+display), f=format, t=d (direct) */
+            /* First chunk: a=T (transmit+display), f=format, t=d (direct)
+             * Apply zoom factor for HiDPI/Retina display. */
+            int display_w = width * terminal_zoom;
+            int display_h = height * terminal_zoom;
+
             if (format == 100) {
-                /* PNG: no dimensions needed */
-                printf("\033_Ga=T,f=100,t=d,m=%d;", more ? 1 : 0);
+                /* PNG format */
+                printf("\033_Ga=T,f=100,t=d,w=%d,h=%d,m=%d;",
+                       display_w, display_h, more ? 1 : 0);
             } else {
-                /* Raw: include dimensions */
-                printf("\033_Ga=T,f=%d,s=%d,v=%d,m=%d;",
-                       format, width, height, more ? 1 : 0);
+                /* Raw RGB/RGBA: s,v = source dimensions */
+                printf("\033_Ga=T,f=%d,s=%d,v=%d,w=%d,h=%d,m=%d;",
+                       format, width, height, display_w, display_h, more ? 1 : 0);
             }
             first = 0;
         } else {
@@ -162,7 +197,11 @@ int kitty_display_png(const char *path) {
     }
     fclose(f);
 
-    int result = kitty_send_data(png_data, size, 100, 0, 0);
+    /* Get PNG dimensions for correct HiDPI display */
+    int width = 0, height = 0;
+    png_get_dimensions(png_data, size, &width, &height);
+
+    int result = kitty_send_data(png_data, size, 100, width, height);
     free(png_data);
     printf("\n");
     return result;

@@ -437,6 +437,7 @@ static void cmd_help(void) {
     printf("  !steps <n>            Set sampling steps\n");
     printf("  !explore <n> <prompt> Generate n thumbnail variations\n");
     printf("  !show                 Toggle terminal display\n");
+    printf("  !zoom <n>             Set display zoom (default: 2 for Retina)\n");
     printf("  !open                 Toggle auto-open (macOS)\n");
     printf("  !quit                 Exit\n");
     printf("\n");
@@ -675,6 +676,21 @@ static void cmd_show(void) {
     printf("Display: %s\n", state.show_enabled ? "ON" : "OFF");
 }
 
+static void cmd_zoom(char *arg) {
+    arg = skip_spaces(arg);
+    if (*arg) {
+        int zoom = atoi(arg);
+        if (zoom >= 1) {
+            terminal_set_zoom(zoom);
+            printf("Zoom: %dx\n", zoom);
+        } else {
+            fprintf(stderr, "Invalid zoom (must be >= 1)\n");
+        }
+    } else {
+        fprintf(stderr, "Usage: !zoom <factor>  (e.g., !zoom 2)\n");
+    }
+}
+
 static void cmd_open(void) {
     state.open_enabled = !state.open_enabled;
     printf("Auto-open: %s\n", state.open_enabled ? "ON" : "OFF");
@@ -705,6 +721,8 @@ static int process_command(char *line) {
         cmd_explore(cmd + 7);
     } else if (starts_with_ci(cmd, "show")) {
         cmd_show();
+    } else if (starts_with_ci(cmd, "zoom")) {
+        cmd_zoom(cmd + 4);
     } else if (starts_with_ci(cmd, "open")) {
         cmd_open();
     } else if (starts_with_ci(cmd, "quit") || starts_with_ci(cmd, "exit")) {

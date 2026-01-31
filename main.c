@@ -220,7 +220,8 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  -q, --quiet           Silent mode, no output\n");
     fprintf(stderr, "  -v, --verbose         Detailed output\n");
     fprintf(stderr, "      --show            Display image in terminal (auto-detects Kitty/Ghostty/iTerm2)\n");
-    fprintf(stderr, "      --show-steps      Display each denoising step (slower)\n\n");
+    fprintf(stderr, "      --show-steps      Display each denoising step (slower)\n");
+    fprintf(stderr, "      --zoom N          Terminal image zoom factor (default: 2 for Retina)\n\n");
     fprintf(stderr, "Other options:\n");
     fprintf(stderr, "  -e, --embeddings PATH Load pre-computed text embeddings\n");
     fprintf(stderr, "  -m, --mmap            Use memory-mapped weights (default, fastest on MPS)\n");
@@ -265,6 +266,7 @@ int main(int argc, char *argv[]) {
         {"no-mmap",    no_argument,       0, 'M'},
         {"show",       no_argument,       0, 'k'},
         {"show-steps", no_argument,       0, 'K'},
+        {"zoom",       required_argument, 0, 'z'},
         {"debug-py",   no_argument,       0, 'D'},
         {0, 0, 0, 0}
     };
@@ -322,6 +324,7 @@ int main(int argc, char *argv[]) {
             case 'M': use_mmap = 0; break;
             case 'k': show_image = 1; break;
             case 'K': show_steps = 1; break;
+            case 'z': terminal_set_zoom(atoi(optarg)); break;
             case 'D': debug_py = 1; break;
             default:
                 print_usage(argv[0]);
