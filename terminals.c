@@ -31,7 +31,7 @@ void terminal_set_zoom(int zoom) {
 
 /*
  * Detect terminal graphics capability from environment variables.
- * Checks for Kitty, Ghostty, and iTerm2.
+ * Checks for Kitty, Ghostty, iTerm2, and Konsole.
  */
 term_graphics_proto detect_terminal_graphics(void) {
     /* Kitty: KITTY_WINDOW_ID is set */
@@ -46,6 +46,10 @@ term_graphics_proto detect_terminal_graphics(void) {
     const char *term_program = getenv("TERM_PROGRAM");
     if ((term_program && strcmp(term_program, "iTerm.app") == 0) ||
         getenv("ITERM_SESSION_ID"))
+        return TERM_PROTO_ITERM2;
+
+    /* Konsole: supports iTerm2 inline image protocol */
+    if (getenv("KONSOLE_VERSION"))
         return TERM_PROTO_ITERM2;
 
     return TERM_PROTO_NONE;

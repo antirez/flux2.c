@@ -44,7 +44,7 @@ That's it. No Python runtime or CUDA toolkit required at inference time.
 - **Memory efficient**: Automatic encoder release after encoding (~8GB freed)
 - **Memory-mapped weights**: Enabled by default. Reduces peak memory from ~16GB to ~4-5GB. Fastest mode on MPS; BLAS users with plenty of RAM may prefer `--no-mmap` for faster inference
 - **Size-independent seeds**: Same seed produces similar compositions at different resolutions. Explore at 256×256, then render at 512×512 with the same seed
-- **Terminal image display**: watch the resulting image without leaving your terminal (Ghostty, Kitty, or iTerm2).
+- **Terminal image display**: watch the resulting image without leaving your terminal (Ghostty, Kitty, iTerm2, or Konsole).
 
 ### Terminal Image Display
 
@@ -53,14 +53,14 @@ That's it. No Python runtime or CUDA toolkit required at inference time.
 Display generated images directly in your terminal with `--show`, or watch the denoising process step-by-step with `--show-steps`:
 
 ```bash
-# Display final image in terminal (auto-detects Kitty/Ghostty/iTerm2)
+# Display final image in terminal (auto-detects Kitty/Ghostty/iTerm2/Konsole)
 ./flux -d flux-klein-model -p "a cute robot" -o robot.png --show
 
 # Display each denoising step (slower, but interesting to watch)
 ./flux -d flux-klein-model -p "a cute robot" -o robot.png --show-steps
 ```
 
-Requires a terminal supporting the [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/) (such as [Kitty](https://sw.kovidgoyal.net/kitty/) or [Ghostty](https://ghostty.org/)), or [iTerm2](https://iterm2.com/). Terminal type is auto-detected from environment variables.
+Requires a terminal supporting the [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/) (such as [Kitty](https://sw.kovidgoyal.net/kitty/) or [Ghostty](https://ghostty.org/)), [iTerm2](https://iterm2.com/), or [Konsole](https://konsole.kde.org/). Terminal type is auto-detected from environment variables.
 
 Use `--zoom N` to adjust the display size (default: 2 for Retina displays, use 1 for non-HiDPI screens).
 
@@ -174,7 +174,7 @@ Done -> /tmp/flux-.../image-0003.png (ref $2)
 ```
 -q, --quiet           Silent mode, no output
 -v, --verbose         Show detailed config and timing info
-    --show            Display image in terminal (auto-detects Kitty/Ghostty/iTerm2)
+    --show            Display image in terminal (auto-detects Kitty/Ghostty/iTerm2/Konsole)
     --show-steps      Display each denoising step (slower)
     --zoom N          Terminal image zoom factor (default: 2 for Retina)
 ```
