@@ -81,6 +81,15 @@ static linear_graph_cache_t g_linear_graph_cache[MAX_LINEAR_GRAPH_CACHE];
 static int g_linear_graph_count = 0;
 static pthread_mutex_t g_linear_graph_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* Cache for MPSGraph bf16 matmul graphs (no fp32 casts).
+ * If unsupported on the current OS/driver, we transparently fall back to the
+ * fp32-cast graphs above. */
+static linear_graph_cache_t g_linear_graph_cache_bf16[MAX_LINEAR_GRAPH_CACHE];
+static int g_linear_graph_bf16_count = 0;
+static pthread_mutex_t g_linear_graph_bf16_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int g_linear_graph_bf16_disabled = 0;
+static int g_linear_graph_bf16_seen_success = 0;
+
 /* ========================================================================
  * MPSGraph Conv2D Cache
  * ======================================================================== */
@@ -4355,6 +4364,63 @@ static linear_graph_cache_t *get_linear_graph_cache(int seq_len, int in_dim, int
     return entry;
 }
 
+static linear_graph_cache_t *get_linear_graph_cache_bf16(int seq_len, int in_dim, int out_dim) {
+    if (!NSClassFromString(@"MPSGraph")) {
+        return NULL;
+    }
+
+    pthread_mutex_lock(&g_linear_graph_bf16_mutex);
+    for (int i = 0; i < g_linear_graph_bf16_count; i++) {
+        linear_graph_cache_t *entry = &g_linear_graph_cache_bf16[i];
+        if (entry->seq == seq_len && entry->in_dim == in_dim && entry->out_dim == out_dim) {
+            pthread_mutex_unlock(&g_linear_graph_bf16_mutex);
+            return entry;
+        }
+    }
+
+    int slot = 0;
+    if (g_linear_graph_bf16_count < MAX_LINEAR_GRAPH_CACHE) {
+        slot = g_linear_graph_bf16_count++;
+    }
+
+    linear_graph_cache_t *entry = &g_linear_graph_cache_bf16[slot];
+    entry->seq = seq_len;
+    entry->in_dim = in_dim;
+    entry->out_dim = out_dim;
+
+    @autoreleasepool {
+        MPSGraph *graph = [[MPSGraph alloc] init];
+        if (!graph) {
+            pthread_mutex_unlock(&g_linear_graph_bf16_mutex);
+            return NULL;
+        }
+
+        NSArray<NSNumber *> *xShape = @[@1, @(seq_len), @(in_dim)];
+        NSArray<NSNumber *> *wShape = @[@1, @(out_dim), @(in_dim)];
+        NSArray<NSNumber *> *outShape = @[@1, @(seq_len), @(out_dim)];
+
+        MPSGraphTensor *xIn = [graph placeholderWithShape:xShape dataType:MPSDataTypeBFloat16 name:nil];
+        MPSGraphTensor *wIn = [graph placeholderWithShape:wShape dataType:MPSDataTypeBFloat16 name:nil];
+        MPSGraphTensor *wT = [graph transposeTensor:wIn dimension:1 withDimension:2 name:nil];
+
+        /* Try bf16 matmul directly (avoids fp32 casts). If unsupported, encode will
+         * throw and we will permanently disable this fast path at runtime. */
+        MPSGraphTensor *out = [graph matrixMultiplicationWithPrimaryTensor:xIn secondaryTensor:wT name:nil];
+        MPSGraphTensor *outCast = [graph castTensor:out toType:MPSDataTypeBFloat16 name:nil];
+
+        entry->graph = graph;
+        entry->xTensor = xIn;
+        entry->wTensor = wIn;
+        entry->outTensor = outCast;
+        entry->xShape = xShape;
+        entry->wShape = wShape;
+        entry->outShape = outShape;
+    }
+
+    pthread_mutex_unlock(&g_linear_graph_bf16_mutex);
+    return entry;
+}
+
 static int flux_gpu_attention_mpsgraph_bf16(flux_gpu_tensor_t out,
                                             flux_gpu_tensor_t Q, flux_gpu_tensor_t K, flux_gpu_tensor_t V,
                                             int seq_q, int seq_k, int num_heads, int head_dim, float scale) {
@@ -5170,12 +5236,91 @@ static int flux_gpu_linear_bf16_mpsgraph_into(flux_gpu_tensor_t out,
     if (!out->is_f16 || !x->is_f16) return 0;
     if (out->num_elements != (size_t)seq_len * (size_t)out_dim) return 0;
 
-    linear_graph_cache_t *cache = get_linear_graph_cache(seq_len, in_dim, out_dim);
-    if (!cache || !cache->graph) return 0;
-
     size_t numW = (size_t)out_dim * (size_t)in_dim;
     id<MTLBuffer> bufW = get_cached_bf16_buffer(W_bf16, numW);
     if (!bufW) return 0;
+
+    /* Fast path: try bf16 matmul directly (no fp32 casts). If unsupported, MPSGraph
+     * will throw; disable this path for the remainder of the run and fall back to
+     * the fp32-cast graph (still MPSGraph, much faster than our custom kernel). */
+    /* Heuristic: bf16 matmul helps a lot for very wide outputs (single-block fused
+     * projections, MLP up/gate). For narrower linears (hidden->hidden), it tends
+     * to help only at large seq_len (bigger images). */
+    if (!g_linear_graph_bf16_disabled && (out_dim >= 8192 || seq_len >= 8192)) {
+        linear_graph_cache_t *cache_bf16 = get_linear_graph_cache_bf16(seq_len, in_dim, out_dim);
+        if (cache_bf16 && cache_bf16->graph) {
+            @autoreleasepool {
+                id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+                if (!cmdBuffer) return 0;
+
+                MPSCommandBuffer *mpsCmd = nil;
+                if (g_tensor_batch_mode) {
+                    mpsCmd = [MPSCommandBuffer commandBufferWithCommandBuffer:cmdBuffer];
+                } else {
+                    mpsCmd = [MPSCommandBuffer commandBufferFromCommandQueue:g_queue];
+                }
+                if (!mpsCmd) return 0;
+
+                MPSGraphTensorData *xData =
+                    [[MPSGraphTensorData alloc] initWithMTLBuffer:x->buffer
+                                                           shape:cache_bf16->xShape
+                                                        dataType:MPSDataTypeBFloat16];
+                MPSGraphTensorData *wData =
+                    [[MPSGraphTensorData alloc] initWithMTLBuffer:bufW
+                                                           shape:cache_bf16->wShape
+                                                        dataType:MPSDataTypeBFloat16];
+                MPSGraphTensorData *outData =
+                    [[MPSGraphTensorData alloc] initWithMTLBuffer:out->buffer
+                                                           shape:cache_bf16->outShape
+                                                        dataType:MPSDataTypeBFloat16];
+
+                NSDictionary *feeds = @{
+                    cache_bf16->xTensor : xData,
+                    cache_bf16->wTensor : wData
+                };
+                NSDictionary *results = @{ cache_bf16->outTensor : outData };
+
+                int bf16_ok = 0;
+                @try {
+                    [cache_bf16->graph encodeToCommandBuffer:mpsCmd
+                                                      feeds:feeds
+                                           targetOperations:nil
+                                          resultsDictionary:results
+                                        executionDescriptor:nil];
+                    bf16_ok = 1;
+                } @catch (NSException *exception) {
+                    /* If bf16 matmul isn't supported at all, the first attempt will
+                     * throw consistently; disable the fast path to avoid repeated
+                     * exceptions. If we've already seen successes, treat failures
+                     * as shape-specific and just fall back for this call. */
+                    if (!g_linear_graph_bf16_seen_success) {
+                        g_linear_graph_bf16_disabled = 1;
+                    }
+                }
+
+                if (bf16_ok) {
+                    g_linear_graph_bf16_seen_success = 1;
+                    out->has_pending_work = 1;
+                    x->has_pending_work = 1;
+
+                    if (!g_tensor_batch_mode) {
+                        [mpsCmd commit];
+                        [mpsCmd waitUntilCompleted];
+                        out->has_pending_work = 0;
+                        x->has_pending_work = 0;
+                    } else {
+                        /* MPSGraph may commit-and-continue; update the live buffer. */
+                        g_tensor_cmd = [mpsCmd rootCommandBuffer];
+                    }
+
+                    return 1;
+                }
+            }
+        }
+    }
+
+    linear_graph_cache_t *cache = get_linear_graph_cache(seq_len, in_dim, out_dim);
+    if (!cache || !cache->graph) return 0;
 
     @autoreleasepool {
         id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
