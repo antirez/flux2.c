@@ -576,12 +576,17 @@ flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
     if (p.width <= 0) p.width = input->width;
     if (p.height <= 0) p.height = input->height;
 
-    /* Clamp to VAE max dimensions, preserving aspect ratio */
-    if (p.width > FLUX_VAE_MAX_DIM || p.height > FLUX_VAE_MAX_DIM) {
-        float scale = (float)FLUX_VAE_MAX_DIM /
+    /* Clamp to img2img max dimensions (MPS 4GB attention limit).
+     * For img2img with references, the combined sequence length can exceed
+     * Metal's MPSTemporaryNDArray 4GB limit at higher resolutions. */
+    if (p.width > FLUX_IMG2IMG_MAX_DIM || p.height > FLUX_IMG2IMG_MAX_DIM) {
+        float scale = (float)FLUX_IMG2IMG_MAX_DIM /
                       (p.width > p.height ? p.width : p.height);
         p.width = (int)(p.width * scale);
         p.height = (int)(p.height * scale);
+        fprintf(stderr, "Note: img2img limited to %dx%d max (GPU memory constraint). "
+                "Resizing to %dx%d.\n", FLUX_IMG2IMG_MAX_DIM, FLUX_IMG2IMG_MAX_DIM,
+                p.width, p.height);
     }
 
     /* Ensure divisible by 16 */
@@ -736,12 +741,15 @@ flux_image *flux_multiref(flux_ctx *ctx, const char *prompt,
     if (p.width <= 0) p.width = refs[0]->width;
     if (p.height <= 0) p.height = refs[0]->height;
 
-    /* Clamp to VAE max dimensions */
-    if (p.width > FLUX_VAE_MAX_DIM || p.height > FLUX_VAE_MAX_DIM) {
-        float scale = (float)FLUX_VAE_MAX_DIM /
+    /* Clamp to img2img max dimensions (MPS 4GB attention limit) */
+    if (p.width > FLUX_IMG2IMG_MAX_DIM || p.height > FLUX_IMG2IMG_MAX_DIM) {
+        float scale = (float)FLUX_IMG2IMG_MAX_DIM /
                       (p.width > p.height ? p.width : p.height);
         p.width = (int)(p.width * scale);
         p.height = (int)(p.height * scale);
+        fprintf(stderr, "Note: img2img limited to %dx%d max (GPU memory constraint). "
+                "Resizing to %dx%d.\n", FLUX_IMG2IMG_MAX_DIM, FLUX_IMG2IMG_MAX_DIM,
+                p.width, p.height);
     }
 
     p.width = (p.width / 16) * 16;
@@ -775,9 +783,9 @@ flux_image *flux_multiref(flux_ctx *ctx, const char *prompt,
         int ref_w = (ref->width / 16) * 16;
         int ref_h = (ref->height / 16) * 16;
 
-        /* Clamp to VAE max */
-        if (ref_w > FLUX_VAE_MAX_DIM) ref_w = FLUX_VAE_MAX_DIM;
-        if (ref_h > FLUX_VAE_MAX_DIM) ref_h = FLUX_VAE_MAX_DIM;
+        /* Clamp to img2img max (MPS attention limit) */
+        if (ref_w > FLUX_IMG2IMG_MAX_DIM) ref_w = FLUX_IMG2IMG_MAX_DIM;
+        if (ref_h > FLUX_IMG2IMG_MAX_DIM) ref_h = FLUX_IMG2IMG_MAX_DIM;
 
         /* Resize only if dimensions changed after rounding/clamping */
         if (ref->width != ref_w || ref->height != ref_h) {

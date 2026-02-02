@@ -22,3 +22,6 @@ documents/
 *.a
 *.so
 *.dylib
+
+# Auto-generated files
+flux_shaders_source.h

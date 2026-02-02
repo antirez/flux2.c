@@ -50,6 +50,7 @@ extern "C" {
 #define FLUX_VAE_NUM_RES        2
 #define FLUX_VAE_GROUPS         32
 #define FLUX_VAE_MAX_DIM        1792  /* Max image dimension for VAE */
+#define FLUX_IMG2IMG_MAX_DIM    1024  /* Max dimension for img2img (MPS 4GB attention limit) */
 
 /* Tokenizer */
 #define FLUX_MAX_SEQ_LEN        512
