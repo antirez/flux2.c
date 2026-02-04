@@ -13,7 +13,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
+
+#ifdef _WIN32
+  #include <windows.h>
+  #include <io.h>
+  #define unlink _unlink
+#else
+  #include <unistd.h>
+#endif
 
 /* ======================================================================
  * Zoom Setting
@@ -299,6 +306,23 @@ int iterm2_display_image(const flux_image *img) {
     if (!img || !img->data) return -1;
 
     /* Create temp file for PNG */
+#ifdef _WIN32
+    char temp_path[MAX_PATH];
+    char tmppath[MAX_PATH];
+    DWORD ret = GetTempPathA(sizeof(temp_path), temp_path);
+    if (ret == 0 || ret > sizeof(temp_path)) {
+        fprintf(stderr, "iterm2: cannot get temp path\n");
+        return -1;
+    }
+
+    /* GetTempFileName creates file automatically */
+    if (GetTempFileNameA(temp_path, "flux", 0, tmppath) == 0) {
+        fprintf(stderr, "iterm2: cannot create temp file\n");
+        return -1;
+    }
+    /* Append .png extension */
+    strncat(tmppath, ".png", sizeof(tmppath) - strlen(tmppath) - 1);
+#else
     char tmppath[] = "/tmp/flux_iterm_XXXXXX.png";
     int fd = mkstemps(tmppath, 4);
     if (fd < 0) {
@@ -306,6 +330,7 @@ int iterm2_display_image(const flux_image *img) {
         return -1;
     }
     close(fd);
+#endif
 
     /* Save image as PNG */
     if (flux_image_save(img, tmppath) != 0) {

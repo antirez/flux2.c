@@ -16,6 +16,11 @@
 #include "flux_metal.h"
 #endif
 
+/* Use CUDA for GPU acceleration on NVIDIA GPUs */
+#ifdef USE_CUDA
+#include "flux_cuda.h"
+#endif
+
 /* Use BLAS for matrix operations when enabled via Makefile */
 #ifdef USE_BLAS
 #ifdef __APPLE__
@@ -151,6 +156,20 @@ void flux_matmul(float *C, const float *A, const float *B,
     }
 #endif
 
+#ifdef USE_CUDA
+    size_t matrix_elements = (size_t)M * N;
+    if (flux_cuda_available() && matrix_elements >= MIN_GPU_ELEMENTS) {
+        flux_cuda_sgemm(0, 0,  /* no transpose */
+                        M, N, K,
+                        1.0f,
+                        A, K,
+                        B, N,
+                        0.0f,
+                        C, N);
+        return;
+    }
+#endif
+
 #ifdef USE_BLAS
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                 M, N, K,
@@ -184,6 +203,20 @@ void flux_matmul_t(float *C, const float *A, const float *B,
                          B, K,
                          0.0f,
                          C, N);
+        return;
+    }
+#endif
+
+#ifdef USE_CUDA
+    size_t matrix_elements = (size_t)M * N;
+    if (flux_cuda_available() && matrix_elements >= MIN_GPU_ELEMENTS) {
+        flux_cuda_sgemm(0, 1,  /* no transpose A, transpose B */
+                        M, N, K,
+                        1.0f,
+                        A, K,
+                        B, K,
+                        0.0f,
+                        C, N);
         return;
     }
 #endif
@@ -227,6 +260,30 @@ void flux_linear(float *y, const float *x, const float *W, const float *b,
                          W, in_dim,
                          0.0f,
                          y, out_dim);
+
+        /* Add bias if present */
+        if (b != NULL) {
+            for (int s = 0; s < seq_len; s++) {
+                for (int o = 0; o < out_dim; o++) {
+                    y[s * out_dim + o] += b[o];
+                }
+            }
+        }
+        return;
+    }
+#endif
+
+#ifdef USE_CUDA
+    /* Use CUDA GPU for large matrices */
+    size_t matrix_elements = (size_t)seq_len * out_dim;
+    if (flux_cuda_available() && matrix_elements >= MIN_GPU_ELEMENTS) {
+        flux_cuda_sgemm(0, 1,  /* no transpose A, transpose B */
+                        seq_len, out_dim, in_dim,
+                        1.0f,
+                        x, in_dim,
+                        W, in_dim,
+                        0.0f,
+                        y, out_dim);
 
         /* Add bias if present */
         if (b != NULL) {
@@ -305,6 +362,21 @@ void flux_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
     }
 #endif
 
+#ifdef USE_CUDA
+    /* Use CUDA GPU for bf16 matmul - provides 2x memory bandwidth */
+    size_t matrix_elements = (size_t)seq_len * out_dim;
+    if (flux_cuda_available() && matrix_elements >= MIN_GPU_ELEMENTS) {
+        flux_cuda_sgemm_bf16(0, 1,  /* no transpose A, transpose B */
+                             seq_len, out_dim, in_dim,
+                             1.0f,
+                             x, in_dim,
+                             W_bf16, in_dim,
+                             0.0f,
+                             y, out_dim);
+        return;
+    }
+#endif
+
     /* Fallback: convert bf16 to f32 and use regular linear */
     float *W_f32 = (float *)malloc((size_t)out_dim * in_dim * sizeof(float));
     if (!W_f32) return;
@@ -327,13 +399,30 @@ void flux_gpu_begin_batch(void) {
 #ifdef USE_METAL
     flux_metal_begin_batch();
 #endif
+#ifdef USE_CUDA
+    flux_cuda_begin_batch();
+#endif
 }
 
 void flux_gpu_end_batch(void) {
 #ifdef USE_METAL
     flux_metal_end_batch();
 #endif
+#ifdef USE_CUDA
+    flux_cuda_end_batch();
+#endif
 }
+
+int flux_gpu_in_batch(void) {
+#ifdef USE_METAL
+    return flux_metal_in_batch();
+#endif
+#ifdef USE_CUDA
+    return flux_cuda_in_batch();
+#endif
+    return 0;
+}
+
 
 /* ========================================================================
  * Convolution Operations

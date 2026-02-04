@@ -35,6 +35,10 @@
 #include "flux_metal.h"
 #endif
 
+#ifdef USE_CUDA
+#include "flux_cuda.h"
+#endif
+
 /* ========================================================================
  * Verbosity Levels
  * ======================================================================== */
@@ -246,6 +250,8 @@ static void print_usage(const char *prog) {
 int main(int argc, char *argv[]) {
 #ifdef USE_METAL
     flux_metal_init();
+#elif defined(USE_CUDA)
+    flux_cuda_init();
 #elif defined(USE_BLAS)
     fprintf(stderr, "BLAS: CPU acceleration enabled (Accelerate/OpenBLAS)\n");
 #else

@@ -13,6 +13,9 @@
 
 #include "flux.h"
 #include "flux_kernels.h"
+#ifdef USE_CUDA
+#include "flux_cuda.h"
+#endif
 #include "flux_safetensors.h"
 #ifdef USE_METAL
 #include "flux_metal.h"
@@ -128,6 +131,19 @@ static void vae_conv2d(float *out, const float *in,
                        const float *weight, const float *bias,
                        int batch, int in_ch, int out_ch, int H, int W,
                        int kH, int kW, int stride, int padding) {
+#ifdef USE_CUDA
+    if (flux_cuda_available() &&
+        flux_cuda_conv2d(out, in, weight, bias,
+                         batch, in_ch, out_ch, H, W,
+                         kH, kW, stride, padding)) {
+        static int logged = 0;
+        if (!logged) {
+            fprintf(stderr, "[VAE: using CUDA conv2d path]\n");
+            logged = 1;
+        }
+        return;
+    }
+#endif
 #ifdef USE_METAL
     if (!flux_metal_available()) {
         flux_metal_init();

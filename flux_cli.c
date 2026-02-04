@@ -12,9 +12,17 @@
 #include <string.h>
 #include <ctype.h>
 #include <time.h>
-#include <unistd.h>
-#include <sys/stat.h>
 #include <errno.h>
+
+#ifdef _WIN32
+  #include <windows.h>
+  #include <io.h>
+  #include <direct.h>
+  #define mkdir(path, mode) _mkdir(path)
+#else
+  #include <sys/stat.h>
+  #include <unistd.h>
+#endif
 
 #include "flux.h"
 #include "flux_kernels.h"
@@ -29,7 +37,7 @@
 
 #define CLI_HISTORY_FILE ".flux_history"
 #define CLI_MAX_PATH 4096
-#define CLI_MAX_TMPDIR 256
+#define CLI_TMPDIR_SIZE 32    /* /tmp/flux-XXXXXX + margin */
 #define CLI_DEFAULT_WIDTH 256
 #define CLI_DEFAULT_HEIGHT 256
 #define CLI_DEFAULT_STEPS 4
@@ -51,7 +59,7 @@ typedef struct {
 typedef struct {
     flux_ctx *ctx;
     char model_dir[CLI_MAX_PATH];
-    char tmpdir[CLI_MAX_TMPDIR];
+    char tmpdir[CLI_TMPDIR_SIZE];
     char last_image[CLI_MAX_PATH];
     int width;
     int height;
@@ -208,12 +216,32 @@ static char *extract_size_from_prompt(const char *prompt, int *w, int *h) {
  * ====================================================================== */
 
 static int create_tmpdir(void) {
+#ifdef _WIN32
+    char temp_path[MAX_PATH];
+    DWORD ret = GetTempPathA(sizeof(temp_path), temp_path);
+    if (ret == 0 || ret > sizeof(temp_path)) {
+        fprintf(stderr, "Error: Cannot get temp directory path\n");
+        return -1;
+    }
+
+    /* Generate unique directory name using process ID and timestamp */
+    snprintf(state.tmpdir, sizeof(state.tmpdir), "%sflux-%lu-%lu",
+             temp_path, (unsigned long)GetCurrentProcessId(),
+             (unsigned long)GetTickCount64());
+
+    if (_mkdir(state.tmpdir) != 0) {
+        fprintf(stderr, "Error: Cannot create temp directory: %s\n",
+                strerror(errno));
+        return -1;
+    }
+#else
     snprintf(state.tmpdir, sizeof(state.tmpdir), "/tmp/flux-XXXXXX");
     if (mkdtemp(state.tmpdir) == NULL) {
         fprintf(stderr, "Error: Cannot create temp directory: %s\n",
                 strerror(errno));
         return -1;
     }
+#endif
     return 0;
 }
 
@@ -420,7 +448,7 @@ static int generate_image(const char *prompt, const char *ref_image,
     snprintf(state.last_image, sizeof(state.last_image), "%s", path);
     int ref_id = ref_add(path);
 
-    printf("Done -> %s (ref $%d) [%.2fs]\n", path, ref_id, elapsed);
+    printf("Done -> %s (ref $%d)\n", path, ref_id);
     display_image(path);
 
     return 0;
@@ -445,10 +473,6 @@ static int generate_multiref(const char *prompt, const char **ref_paths, int num
     params.seed = actual_seed;
     printf("Seed: %lld\n", (long long)actual_seed);
 
-    /* Start timing */
-    struct timespec start_time, end_time;
-    clock_gettime(CLOCK_MONOTONIC, &start_time);
-
     /* Load reference images */
     flux_image **refs = (flux_image **)malloc(num_refs * sizeof(flux_image *));
     for (int i = 0; i < num_refs; i++) {
@@ -472,6 +496,10 @@ static int generate_multiref(const char *prompt, const char **ref_paths, int num
 
     printf("Generating %dx%d (multi-ref, %d images)...\n",
            params.width, params.height, num_refs);
+
+    /* Start timing */
+    struct timespec start_time, end_time;
+    clock_gettime(CLOCK_MONOTONIC, &start_time);
 
     cli_progress_start();
 
@@ -506,7 +534,7 @@ static int generate_multiref(const char *prompt, const char **ref_paths, int num
     snprintf(state.last_image, sizeof(state.last_image), "%s", path);
     int ref_id = ref_add(path);
 
-    printf("Done -> %s (ref $%d) [%.2fs]\n", path, ref_id, elapsed);
+    printf("Done -> %s (ref $%d)\n", path, ref_id);
     display_image(path);
 
     return 0;
@@ -530,7 +558,6 @@ static void cmd_help(void) {
     printf("  !power [alpha]        Toggle power schedule (default alpha: 2.0)\n");
     printf("  !explore <n> <prompt> Generate n thumbnail variations\n");
     printf("  !show                 Toggle terminal display\n");
-    printf("  !zoom <n>             Set display zoom (default: 2 for Retina)\n");
     printf("  !open                 Toggle auto-open (macOS)\n");
     printf("  !quit                 Exit\n");
     printf("\n");
@@ -819,21 +846,6 @@ static void cmd_show(void) {
     printf("Display: %s\n", state.show_enabled ? "ON" : "OFF");
 }
 
-static void cmd_zoom(char *arg) {
-    arg = skip_spaces(arg);
-    if (*arg) {
-        int zoom = atoi(arg);
-        if (zoom >= 1) {
-            terminal_set_zoom(zoom);
-            printf("Zoom: %dx\n", zoom);
-        } else {
-            fprintf(stderr, "Invalid zoom (must be >= 1)\n");
-        }
-    } else {
-        fprintf(stderr, "Usage: !zoom <factor>  (e.g., !zoom 2)\n");
-    }
-}
-
 static void cmd_open(void) {
     state.open_enabled = !state.open_enabled;
     printf("Auto-open: %s\n", state.open_enabled ? "ON" : "OFF");
@@ -882,8 +894,6 @@ static int process_command(char *line) {
         cmd_explore(cmd + 7);
     } else if (starts_with_ci(cmd, "show")) {
         cmd_show();
-    } else if (starts_with_ci(cmd, "zoom")) {
-        cmd_zoom(cmd + 4);
     } else if (starts_with_ci(cmd, "open")) {
         cmd_open();
     } else if (starts_with_ci(cmd, "quit") || starts_with_ci(cmd, "exit")) {
@@ -1010,9 +1020,6 @@ int flux_cli_run(flux_ctx *ctx, const char *model_dir) {
     state.seed = -1;
     state.power_alpha = 2.0f;
 
-    /* Initialize embedding cache */
-    emb_cache_init();
-
     /* Detect terminal graphics support */
     cli_term_proto = detect_terminal_graphics();
     state.show_enabled = (cli_term_proto != TERM_PROTO_NONE);
@@ -1060,9 +1067,6 @@ int flux_cli_run(flux_ctx *ctx, const char *model_dir) {
     if (home) {
         linenoiseHistorySave(history_path);
     }
-
-    /* Cleanup embedding cache */
-    emb_cache_free();
 
     printf("Goodbye.\n");
     return 0;

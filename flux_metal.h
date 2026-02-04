@@ -622,7 +622,7 @@ void flux_metal_rope_2d(float *x, const float *cos_freq, const float *sin_freq,
 int flux_metal_shaders_available(void);
 
 /*
- * Pre-warm the bf16→f16 conversion cache for a weight tensor.
+ * Pre-warm the bf16->f16 conversion cache for a weight tensor.
  * Call this during model loading to avoid conversion overhead during inference.
  * This converts bf16 weights to f16 and caches the result.
  */

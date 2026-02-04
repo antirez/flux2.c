@@ -31,12 +31,23 @@
 #include "flux_metal.h"
 #endif
 
+/* Use CUDA for GPU acceleration */
+#ifdef USE_CUDA
+#include "flux_cuda.h"
+#endif
+
 /* Minimum matrix size for GPU acceleration.
- * Using 10M threshold keeps text encoder on CPU (Accelerate BLAS), which is
- * faster and avoids GPU memory pressure on 16GB systems. Text encoder weights
- * are only used once per generation, so GPU caching provides no benefit.
+ * Metal: Using 10M threshold keeps text encoder on CPU (Accelerate BLAS), which is
+ * faster and avoids GPU memory pressure on 16GB systems.
+ * CUDA: Linear ops stay on CPU (BLAS) - GPU transfers per-op are too costly.
+ * Attention uses dedicated CUDA kernel (flux_cuda_causal_attention) which is faster.
+ * Text encoder weights are only used once per generation, so GPU caching provides no benefit.
  * Fixes issue #9: SIGKILL on 16GB Metal systems during text encoding. */
-#define QWEN3_MIN_GPU_ELEMENTS (10 * 1024 * 1024)
+#ifdef USE_CUDA
+#define QWEN3_MIN_GPU_ELEMENTS (1000 * 1024 * 1024)  /* Disabled for CUDA linears */
+#else
+#define QWEN3_MIN_GPU_ELEMENTS (10 * 1024 * 1024)  /* 10M for Metal */
+#endif
 
 /* ========================================================================
  * Data Structures
@@ -141,6 +152,20 @@ static void free_layer_weights(qwen3_layer_t *layer);
 static void qwen3_linear(float *y, const float *x, const float *W,
                          int seq_len, int in_dim, int out_dim) {
     /* y[seq, out] = x[seq, in] @ W[out, in]^T */
+#ifdef USE_CUDA
+    /* Use GPU for large matrices */
+    size_t matrix_elements = (size_t)seq_len * out_dim;
+    if (flux_cuda_available() && matrix_elements >= QWEN3_MIN_GPU_ELEMENTS) {
+        flux_cuda_sgemm(0, 1,  /* no transpose A, transpose B */
+                        seq_len, out_dim, in_dim,
+                        1.0f,
+                        x, in_dim,
+                        W, in_dim,
+                        0.0f,
+                        y, out_dim);
+        return;
+    }
+#endif
 #ifdef USE_METAL
     /* Use GPU for large matrices */
     size_t matrix_elements = (size_t)seq_len * out_dim;
@@ -354,6 +379,20 @@ static void qwen3_attention_forward(qwen3_model_t *model, qwen3_layer_t *layer,
     }
 #endif
 
+#ifdef USE_CUDA
+    /* Try CUDA-accelerated causal attention */
+    if (flux_cuda_available()) {
+        if (flux_cuda_causal_attention(model->attn_out,
+                                        model->q_buf, model->k_buf, model->v_buf,
+                                        attention_mask,
+                                        seq_len, num_heads, num_kv_heads,
+                                        head_dim, scale)) {
+            /* GPU attention succeeded - skip to output projection */
+            goto output_proj;
+        }
+    }
+#endif
+
     /* CPU fallback: compute attention for each head with GQA
      * Use BLAS for Q@K^T and scores@V matrix multiplications */
     {
@@ -443,7 +482,7 @@ static void qwen3_attention_forward(qwen3_model_t *model, qwen3_layer_t *layer,
 
     /* Work buffers are pre-allocated in model, no free needed */
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
 output_proj:
 #endif
     /* Output projection */

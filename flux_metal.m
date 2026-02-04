@@ -999,7 +999,7 @@ static id<MTLBuffer> get_cached_bf16_as_f16_buffer(const uint16_t *weights, size
 }
 
 /*
- * Pre-warm the bf16→f16 cache for a weight tensor.
+ * Pre-warm the bf16->f16 cache for a weight tensor.
  * This triggers the conversion and caching so it doesn't happen during inference.
  */
 void flux_metal_warmup_bf16(const uint16_t *bf16_weights, size_t num_elements) {
