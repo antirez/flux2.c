@@ -50,6 +50,11 @@ static double tf_get_time_ms(void) {
 #include "flux_metal.h"
 #endif
 
+/* Use ROCm for GPU acceleration on AMD GPUs */
+#ifdef USE_ROCM
+#include "rocm/flux_rocm.h"
+#endif
+
 /* Enable BF16 pipeline debug logging when FLUX_BF16_DEBUG is set. */
 #ifdef USE_METAL
 static int bf16_debug_enabled(void) {
@@ -2944,6 +2949,506 @@ cleanup:
 }
 #endif /* USE_METAL */
 
+#ifdef USE_ROCM
+/* ROCm single block forward - keeps data on GPU throughout the block.
+ * Returns 1 if GPU path was used, 0 to fall back to CPU path.
+ */
+static int single_block_forward_rocm(float *hidden, const single_block_t *block,
+                                     const float *t_emb, const float *adaln_weight,
+                                     const float *img_rope_cos, const float *img_rope_sin,
+                                     const float *txt_rope_cos, const float *txt_rope_sin,
+                                     int seq, int img_offset, flux_transformer_t *tf) {
+    /* GPU path enabled - RoPE bug fixed (was using axis_dim instead of head_dim) */
+    
+    if (!flux_rocm_available()) return 0;
+    
+    /* Need f32 weights for ROCm path (bf16 not implemented yet) */
+    if (block->qkv_mlp_weight == NULL || block->proj_mlp_weight == NULL) return 0;
+    
+    int h_size = tf->hidden_size;
+    int heads = tf->num_heads;
+    int head_dim = tf->head_dim;
+    int mlp_hidden = tf->mlp_hidden;
+    int fused_dim = h_size * 3 + mlp_hidden * 2;
+    float eps = 1e-6f;
+    int axis_dim = 32;
+    
+    /* === Phase 1: Compute AdaLN modulation on CPU (small, not worth GPU) === */
+    int mod_size = h_size * 3;
+    float *t_emb_silu = tf->t_emb_silu;
+    for (int i = 0; i < h_size; i++) {
+        float x = t_emb[i];
+        t_emb_silu[i] = x / (1.0f + expf(-x));
+    }
+    float *mod_params = tf->work2 + seq * fused_dim;
+    flux_linear_nobias(mod_params, t_emb_silu, adaln_weight, 1, h_size, mod_size);
+    
+    float *shift = mod_params;
+    float *scale = mod_params + h_size;
+    float *gate = mod_params + h_size * 2;
+    
+    /* === Phase 2: Create GPU tensors === */
+    flux_rocm_batch_begin();
+    
+    flux_rocm_tensor_t hidden_gpu = flux_rocm_tensor_create(hidden, seq * h_size);
+    if (!hidden_gpu) {
+        flux_rocm_batch_end();
+        return 0;
+    }
+    
+    /* Allocate intermediate tensors */
+    flux_rocm_tensor_t norm_gpu = flux_rocm_tensor_alloc(seq * h_size);
+    flux_rocm_tensor_t q_gpu = flux_rocm_tensor_alloc(seq * h_size);
+    flux_rocm_tensor_t k_gpu = flux_rocm_tensor_alloc(seq * h_size);
+    flux_rocm_tensor_t v_gpu = flux_rocm_tensor_alloc(seq * h_size);
+    flux_rocm_tensor_t gate_mlp = flux_rocm_tensor_alloc(seq * mlp_hidden);
+    flux_rocm_tensor_t up_gpu = flux_rocm_tensor_alloc(seq * mlp_hidden);
+    flux_rocm_tensor_t attn_out_gpu = flux_rocm_tensor_alloc(seq * h_size);
+    flux_rocm_tensor_t concat_gpu = flux_rocm_tensor_alloc(seq * (h_size + mlp_hidden));
+    
+    if (!norm_gpu || !q_gpu || !k_gpu || !v_gpu || !gate_mlp || !up_gpu || 
+        !attn_out_gpu || !concat_gpu) {
+        if (hidden_gpu) flux_rocm_tensor_free(hidden_gpu);
+        if (norm_gpu) flux_rocm_tensor_free(norm_gpu);
+        if (q_gpu) flux_rocm_tensor_free(q_gpu);
+        if (k_gpu) flux_rocm_tensor_free(k_gpu);
+        if (v_gpu) flux_rocm_tensor_free(v_gpu);
+        if (gate_mlp) flux_rocm_tensor_free(gate_mlp);
+        if (up_gpu) flux_rocm_tensor_free(up_gpu);
+        if (attn_out_gpu) flux_rocm_tensor_free(attn_out_gpu);
+        if (concat_gpu) flux_rocm_tensor_free(concat_gpu);
+        flux_rocm_batch_end();
+        return 0;
+    }
+    
+    /* === Phase 3: AdaLN normalization on GPU === */
+    flux_rocm_gpu_adaln_norm(norm_gpu, hidden_gpu, shift, scale, seq, h_size, eps);
+    
+    /* === Phase 4: Fused QKV + MLP projection on GPU === */
+    flux_rocm_tensor_t fused_gpu = flux_rocm_gpu_linear(norm_gpu, block->qkv_mlp_weight,
+                                                        seq, h_size, fused_dim);
+    if (!fused_gpu) {
+        flux_rocm_tensor_free(hidden_gpu);
+        flux_rocm_tensor_free(norm_gpu);
+        flux_rocm_tensor_free(q_gpu);
+        flux_rocm_tensor_free(k_gpu);
+        flux_rocm_tensor_free(v_gpu);
+        flux_rocm_tensor_free(gate_mlp);
+        flux_rocm_tensor_free(up_gpu);
+        flux_rocm_tensor_free(attn_out_gpu);
+        flux_rocm_tensor_free(concat_gpu);
+        flux_rocm_batch_end();
+        return 0;
+    }
+    
+    /* === Phase 5: Split fused output on GPU === */
+    flux_rocm_gpu_split_qkv_mlp(fused_gpu, q_gpu, k_gpu, v_gpu, gate_mlp, up_gpu,
+                                seq, h_size, mlp_hidden);
+    
+    /* === Phase 6: QK RMSNorm on GPU === */
+    flux_rocm_gpu_qk_rms_norm(q_gpu, k_gpu, block->norm_q_weight, block->norm_k_weight,
+                              seq, heads, head_dim, eps);
+    
+    /* === Phase 7: Apply unified RoPE on GPU === */
+    flux_rocm_gpu_rope_unified(q_gpu, k_gpu,
+                               txt_rope_cos, txt_rope_sin,
+                               img_rope_cos, img_rope_sin,
+                               seq, img_offset, heads, head_dim, axis_dim);
+    
+    /* === Phase 8: Self-attention on GPU === */
+    float attn_scale = 1.0f / sqrtf((float)head_dim);
+    if (!flux_rocm_gpu_attention_fused(attn_out_gpu, q_gpu, k_gpu, v_gpu,
+                                       seq, seq, heads, head_dim, attn_scale)) {
+        flux_rocm_tensor_free(hidden_gpu);
+        flux_rocm_tensor_free(norm_gpu);
+        flux_rocm_tensor_free(fused_gpu);
+        flux_rocm_tensor_free(q_gpu);
+        flux_rocm_tensor_free(k_gpu);
+        flux_rocm_tensor_free(v_gpu);
+        flux_rocm_tensor_free(gate_mlp);
+        flux_rocm_tensor_free(up_gpu);
+        flux_rocm_tensor_free(attn_out_gpu);
+        flux_rocm_tensor_free(concat_gpu);
+        flux_rocm_batch_end();
+        return 0;
+    }
+    
+    /* === Phase 9: SwiGLU on GPU === */
+    flux_rocm_gpu_silu_mul(gate_mlp, up_gpu, seq * mlp_hidden);
+    
+    /* === Phase 10: Concat attention + MLP outputs on GPU === */
+    flux_rocm_gpu_concat_attn_mlp(attn_out_gpu, gate_mlp, concat_gpu, seq, h_size, mlp_hidden);
+    
+    /* === Phase 11: Final projection on GPU === */
+    flux_rocm_tensor_t proj_out_gpu = flux_rocm_gpu_linear(concat_gpu, block->proj_mlp_weight,
+                                                           seq, h_size + mlp_hidden, h_size);
+    if (!proj_out_gpu) {
+        flux_rocm_tensor_free(hidden_gpu);
+        flux_rocm_tensor_free(norm_gpu);
+        flux_rocm_tensor_free(fused_gpu);
+        flux_rocm_tensor_free(q_gpu);
+        flux_rocm_tensor_free(k_gpu);
+        flux_rocm_tensor_free(v_gpu);
+        flux_rocm_tensor_free(gate_mlp);
+        flux_rocm_tensor_free(up_gpu);
+        flux_rocm_tensor_free(attn_out_gpu);
+        flux_rocm_tensor_free(concat_gpu);
+        flux_rocm_batch_end();
+        return 0;
+    }
+    
+    /* === Phase 12: Gated add residual on GPU === */
+    flux_rocm_gpu_gated_add(hidden_gpu, gate, proj_out_gpu, seq, h_size);
+    
+    /* === Phase 13: Sync and copy result back === */
+    flux_rocm_batch_end();
+    flux_rocm_tensor_read(hidden_gpu, hidden, seq * h_size);
+    
+    /* === Cleanup === */
+    flux_rocm_tensor_free(hidden_gpu);
+    flux_rocm_tensor_free(norm_gpu);
+    flux_rocm_tensor_free(fused_gpu);
+    flux_rocm_tensor_free(q_gpu);
+    flux_rocm_tensor_free(k_gpu);
+    flux_rocm_tensor_free(v_gpu);
+    flux_rocm_tensor_free(gate_mlp);
+    flux_rocm_tensor_free(up_gpu);
+    flux_rocm_tensor_free(attn_out_gpu);
+    flux_rocm_tensor_free(concat_gpu);
+    flux_rocm_tensor_free(proj_out_gpu);
+    
+    return 1;  /* GPU path succeeded */
+}
+
+/* ROCm double block forward - keeps data on GPU throughout the block.
+ * Returns 1 if GPU path was used, 0 to fall back to CPU path.
+ */
+static int double_block_forward_rocm(float *img_hidden, float *txt_hidden,
+                                     const double_block_t *block,
+                                     const float *img_mod, const float *txt_mod,
+                                     const float *img_rope_cos, const float *img_rope_sin,
+                                     const float *txt_rope_cos, const float *txt_rope_sin,
+                                     int img_seq, int txt_seq,
+                                     flux_transformer_t *tf) {
+    if (!flux_rocm_available()) return 0;
+    
+    /* Need f32 weights for ROCm path (bf16 not implemented yet) */
+    if (block->img_q_weight == NULL || block->txt_q_weight == NULL) return 0;
+    
+    int hidden = tf->hidden_size;
+    int heads = tf->num_heads;
+    int head_dim = tf->head_dim;
+    int mlp_hidden = tf->mlp_hidden;
+    int total_seq = img_seq + txt_seq;
+    float eps = 1e-6f;
+    
+    /* Extract pre-computed modulation parameters (computed on CPU, small) */
+    const float *img_shift1 = img_mod;
+    const float *img_scale1 = img_mod + hidden;
+    const float *img_gate1 = img_mod + hidden * 2;
+    const float *img_shift2 = img_mod + hidden * 3;
+    const float *img_scale2 = img_mod + hidden * 4;
+    const float *img_gate2 = img_mod + hidden * 5;
+    
+    const float *txt_shift1 = txt_mod;
+    const float *txt_scale1 = txt_mod + hidden;
+    const float *txt_gate1 = txt_mod + hidden * 2;
+    const float *txt_shift2 = txt_mod + hidden * 3;
+    const float *txt_scale2 = txt_mod + hidden * 4;
+    const float *txt_gate2 = txt_mod + hidden * 5;
+    
+    /* === Create GPU tensors === */
+    flux_rocm_batch_begin();
+    
+    flux_rocm_tensor_t img_hidden_gpu = flux_rocm_tensor_create(img_hidden, img_seq * hidden);
+    flux_rocm_tensor_t txt_hidden_gpu = flux_rocm_tensor_create(txt_hidden, txt_seq * hidden);
+    
+    if (!img_hidden_gpu || !txt_hidden_gpu) {
+        if (img_hidden_gpu) flux_rocm_tensor_free(img_hidden_gpu);
+        if (txt_hidden_gpu) flux_rocm_tensor_free(txt_hidden_gpu);
+        flux_rocm_batch_end();
+        return 0;
+    }
+    
+    /* Allocate intermediate tensors */
+    flux_rocm_tensor_t img_norm_gpu = flux_rocm_tensor_alloc(img_seq * hidden);
+    flux_rocm_tensor_t txt_norm_gpu = flux_rocm_tensor_alloc(txt_seq * hidden);
+    flux_rocm_tensor_t cat_k_gpu = flux_rocm_tensor_alloc(total_seq * hidden);
+    flux_rocm_tensor_t cat_v_gpu = flux_rocm_tensor_alloc(total_seq * hidden);
+    flux_rocm_tensor_t img_attn_out_gpu = flux_rocm_tensor_alloc(img_seq * hidden);
+    flux_rocm_tensor_t txt_attn_out_gpu = flux_rocm_tensor_alloc(txt_seq * hidden);
+    
+    if (!img_norm_gpu || !txt_norm_gpu || !cat_k_gpu || !cat_v_gpu ||
+        !img_attn_out_gpu || !txt_attn_out_gpu) {
+        /* Cleanup on failure */
+        if (img_hidden_gpu) flux_rocm_tensor_free(img_hidden_gpu);
+        if (txt_hidden_gpu) flux_rocm_tensor_free(txt_hidden_gpu);
+        if (img_norm_gpu) flux_rocm_tensor_free(img_norm_gpu);
+        if (txt_norm_gpu) flux_rocm_tensor_free(txt_norm_gpu);
+        if (cat_k_gpu) flux_rocm_tensor_free(cat_k_gpu);
+        if (cat_v_gpu) flux_rocm_tensor_free(cat_v_gpu);
+        if (img_attn_out_gpu) flux_rocm_tensor_free(img_attn_out_gpu);
+        if (txt_attn_out_gpu) flux_rocm_tensor_free(txt_attn_out_gpu);
+        flux_rocm_batch_end();
+        return 0;
+    }
+    
+    /* === Image stream: AdaLN -> QKV -> QK-norm -> RoPE === */
+    flux_rocm_gpu_adaln_norm(img_norm_gpu, img_hidden_gpu, img_shift1, img_scale1,
+                             img_seq, hidden, eps);
+    
+    /* Separate Q, K, V projections for image */
+    flux_rocm_tensor_t img_q_proj = flux_rocm_gpu_linear(img_norm_gpu, block->img_q_weight,
+                                                         img_seq, hidden, hidden);
+    flux_rocm_tensor_t img_k_proj = flux_rocm_gpu_linear(img_norm_gpu, block->img_k_weight,
+                                                         img_seq, hidden, hidden);
+    flux_rocm_tensor_t img_v_proj = flux_rocm_gpu_linear(img_norm_gpu, block->img_v_weight,
+                                                         img_seq, hidden, hidden);
+    
+    if (!img_q_proj || !img_k_proj || !img_v_proj) {
+        /* Cleanup and fallback */
+        flux_rocm_tensor_free(img_hidden_gpu);
+        flux_rocm_tensor_free(txt_hidden_gpu);
+        flux_rocm_tensor_free(img_norm_gpu);
+        flux_rocm_tensor_free(txt_norm_gpu);
+        if (img_q_proj) flux_rocm_tensor_free(img_q_proj);
+        if (img_k_proj) flux_rocm_tensor_free(img_k_proj);
+        if (img_v_proj) flux_rocm_tensor_free(img_v_proj);
+        flux_rocm_tensor_free(cat_k_gpu);
+        flux_rocm_tensor_free(cat_v_gpu);
+        flux_rocm_tensor_free(img_attn_out_gpu);
+        flux_rocm_tensor_free(txt_attn_out_gpu);
+        flux_rocm_batch_end();
+        return 0;
+    }
+    
+    /* QK normalization for image */
+    flux_rocm_gpu_qk_rms_norm(img_q_proj, img_k_proj,
+                              block->img_norm_q_weight, block->img_norm_k_weight,
+                              img_seq, heads, head_dim, eps);
+    
+    /* RoPE for image (2D positional encoding) */
+    flux_rocm_gpu_rope_2d(img_q_proj, img_rope_cos, img_rope_sin, img_seq, heads, head_dim);
+    flux_rocm_gpu_rope_2d(img_k_proj, img_rope_cos, img_rope_sin, img_seq, heads, head_dim);
+    
+    /* === Text stream: AdaLN -> QKV -> QK-norm -> RoPE === */
+    flux_rocm_gpu_adaln_norm(txt_norm_gpu, txt_hidden_gpu, txt_shift1, txt_scale1,
+                             txt_seq, hidden, eps);
+    
+    /* Separate Q, K, V projections for text */
+    flux_rocm_tensor_t txt_q_proj = flux_rocm_gpu_linear(txt_norm_gpu, block->txt_q_weight,
+                                                         txt_seq, hidden, hidden);
+    flux_rocm_tensor_t txt_k_proj = flux_rocm_gpu_linear(txt_norm_gpu, block->txt_k_weight,
+                                                         txt_seq, hidden, hidden);
+    flux_rocm_tensor_t txt_v_proj = flux_rocm_gpu_linear(txt_norm_gpu, block->txt_v_weight,
+                                                         txt_seq, hidden, hidden);
+    
+    if (!txt_q_proj || !txt_k_proj || !txt_v_proj) {
+        /* Cleanup - this is getting tedious, but safety first */
+        flux_rocm_tensor_free(img_hidden_gpu);
+        flux_rocm_tensor_free(txt_hidden_gpu);
+        flux_rocm_tensor_free(img_norm_gpu);
+        flux_rocm_tensor_free(txt_norm_gpu);
+        flux_rocm_tensor_free(img_q_proj);
+        flux_rocm_tensor_free(img_k_proj);
+        flux_rocm_tensor_free(img_v_proj);
+        if (txt_q_proj) flux_rocm_tensor_free(txt_q_proj);
+        if (txt_k_proj) flux_rocm_tensor_free(txt_k_proj);
+        if (txt_v_proj) flux_rocm_tensor_free(txt_v_proj);
+        flux_rocm_tensor_free(cat_k_gpu);
+        flux_rocm_tensor_free(cat_v_gpu);
+        flux_rocm_tensor_free(img_attn_out_gpu);
+        flux_rocm_tensor_free(txt_attn_out_gpu);
+        flux_rocm_batch_end();
+        return 0;
+    }
+    
+    /* QK normalization for text */
+    flux_rocm_gpu_qk_rms_norm(txt_q_proj, txt_k_proj,
+                              block->txt_norm_q_weight, block->txt_norm_k_weight,
+                              txt_seq, heads, head_dim, eps);
+    
+    /* RoPE for text (1D, axis 3 only) */
+    flux_rocm_gpu_rope_2d(txt_q_proj, txt_rope_cos, txt_rope_sin, txt_seq, heads, head_dim);
+    flux_rocm_gpu_rope_2d(txt_k_proj, txt_rope_cos, txt_rope_sin, txt_seq, heads, head_dim);
+    
+    /* === Joint attention: concatenate K,V then attend === */
+    /* Order: [txt, img] to match Python Flux2 */
+    flux_rocm_gpu_concat_tensors(txt_k_proj, img_k_proj, cat_k_gpu, txt_seq, img_seq, hidden);
+    flux_rocm_gpu_concat_tensors(txt_v_proj, img_v_proj, cat_v_gpu, txt_seq, img_seq, hidden);
+    
+    /* Image attention: img_Q @ cat_K^T -> softmax -> @ cat_V */
+    float attn_scale = 1.0f / sqrtf((float)head_dim);
+    if (!flux_rocm_gpu_attention_fused(img_attn_out_gpu, img_q_proj, cat_k_gpu, cat_v_gpu,
+                                       img_seq, total_seq, heads, head_dim, attn_scale)) {
+        /* Attention failed, cleanup and fallback */
+        flux_rocm_tensor_free(img_hidden_gpu);
+        flux_rocm_tensor_free(txt_hidden_gpu);
+        flux_rocm_tensor_free(img_norm_gpu);
+        flux_rocm_tensor_free(txt_norm_gpu);
+        flux_rocm_tensor_free(img_q_proj);
+        flux_rocm_tensor_free(img_k_proj);
+        flux_rocm_tensor_free(img_v_proj);
+        flux_rocm_tensor_free(txt_q_proj);
+        flux_rocm_tensor_free(txt_k_proj);
+        flux_rocm_tensor_free(txt_v_proj);
+        flux_rocm_tensor_free(cat_k_gpu);
+        flux_rocm_tensor_free(cat_v_gpu);
+        flux_rocm_tensor_free(img_attn_out_gpu);
+        flux_rocm_tensor_free(txt_attn_out_gpu);
+        flux_rocm_batch_end();
+        return 0;
+    }
+    
+    /* Text attention: txt_Q @ cat_K^T -> softmax -> @ cat_V */
+    if (!flux_rocm_gpu_attention_fused(txt_attn_out_gpu, txt_q_proj, cat_k_gpu, cat_v_gpu,
+                                       txt_seq, total_seq, heads, head_dim, attn_scale)) {
+        flux_rocm_tensor_free(img_hidden_gpu);
+        flux_rocm_tensor_free(txt_hidden_gpu);
+        flux_rocm_tensor_free(img_norm_gpu);
+        flux_rocm_tensor_free(txt_norm_gpu);
+        flux_rocm_tensor_free(img_q_proj);
+        flux_rocm_tensor_free(img_k_proj);
+        flux_rocm_tensor_free(img_v_proj);
+        flux_rocm_tensor_free(txt_q_proj);
+        flux_rocm_tensor_free(txt_k_proj);
+        flux_rocm_tensor_free(txt_v_proj);
+        flux_rocm_tensor_free(cat_k_gpu);
+        flux_rocm_tensor_free(cat_v_gpu);
+        flux_rocm_tensor_free(img_attn_out_gpu);
+        flux_rocm_tensor_free(txt_attn_out_gpu);
+        flux_rocm_batch_end();
+        return 0;
+    }
+    
+    /* === Project attention outputs and apply gated residual === */
+    flux_rocm_tensor_t img_proj_gpu = flux_rocm_gpu_linear(img_attn_out_gpu, block->img_proj_weight,
+                                                           img_seq, hidden, hidden);
+    flux_rocm_tensor_t txt_proj_gpu = flux_rocm_gpu_linear(txt_attn_out_gpu, block->txt_proj_weight,
+                                                           txt_seq, hidden, hidden);
+    
+    if (!img_proj_gpu || !txt_proj_gpu) {
+        flux_rocm_tensor_free(img_hidden_gpu);
+        flux_rocm_tensor_free(txt_hidden_gpu);
+        flux_rocm_tensor_free(img_norm_gpu);
+        flux_rocm_tensor_free(txt_norm_gpu);
+        flux_rocm_tensor_free(img_q_proj);
+        flux_rocm_tensor_free(img_k_proj);
+        flux_rocm_tensor_free(img_v_proj);
+        flux_rocm_tensor_free(txt_q_proj);
+        flux_rocm_tensor_free(txt_k_proj);
+        flux_rocm_tensor_free(txt_v_proj);
+        flux_rocm_tensor_free(cat_k_gpu);
+        flux_rocm_tensor_free(cat_v_gpu);
+        flux_rocm_tensor_free(img_attn_out_gpu);
+        flux_rocm_tensor_free(txt_attn_out_gpu);
+        if (img_proj_gpu) flux_rocm_tensor_free(img_proj_gpu);
+        if (txt_proj_gpu) flux_rocm_tensor_free(txt_proj_gpu);
+        flux_rocm_batch_end();
+        return 0;
+    }
+    
+    /* Gated residual: hidden += gate * proj */
+    flux_rocm_gpu_gated_add(img_hidden_gpu, img_gate1, img_proj_gpu, img_seq, hidden);
+    flux_rocm_gpu_gated_add(txt_hidden_gpu, txt_gate1, txt_proj_gpu, txt_seq, hidden);
+    
+    /* === FFN for image === */
+    flux_rocm_gpu_adaln_norm(img_norm_gpu, img_hidden_gpu, img_shift2, img_scale2,
+                             img_seq, hidden, eps);
+    
+    flux_rocm_tensor_t img_ffn_out = flux_rocm_gpu_swiglu_ffn(img_norm_gpu,
+                                                              block->img_mlp_gate_weight,
+                                                              block->img_mlp_up_weight,
+                                                              block->img_mlp_down_weight,
+                                                              img_seq, hidden, mlp_hidden);
+    
+    if (!img_ffn_out) {
+        /* FFN failed - cleanup all and fallback */
+        flux_rocm_tensor_free(img_hidden_gpu);
+        flux_rocm_tensor_free(txt_hidden_gpu);
+        flux_rocm_tensor_free(img_norm_gpu);
+        flux_rocm_tensor_free(txt_norm_gpu);
+        flux_rocm_tensor_free(img_q_proj);
+        flux_rocm_tensor_free(img_k_proj);
+        flux_rocm_tensor_free(img_v_proj);
+        flux_rocm_tensor_free(txt_q_proj);
+        flux_rocm_tensor_free(txt_k_proj);
+        flux_rocm_tensor_free(txt_v_proj);
+        flux_rocm_tensor_free(cat_k_gpu);
+        flux_rocm_tensor_free(cat_v_gpu);
+        flux_rocm_tensor_free(img_attn_out_gpu);
+        flux_rocm_tensor_free(txt_attn_out_gpu);
+        flux_rocm_tensor_free(img_proj_gpu);
+        flux_rocm_tensor_free(txt_proj_gpu);
+        flux_rocm_batch_end();
+        return 0;
+    }
+    
+    flux_rocm_gpu_gated_add(img_hidden_gpu, img_gate2, img_ffn_out, img_seq, hidden);
+    
+    /* === FFN for text === */
+    flux_rocm_gpu_adaln_norm(txt_norm_gpu, txt_hidden_gpu, txt_shift2, txt_scale2,
+                             txt_seq, hidden, eps);
+    
+    flux_rocm_tensor_t txt_ffn_out = flux_rocm_gpu_swiglu_ffn(txt_norm_gpu,
+                                                              block->txt_mlp_gate_weight,
+                                                              block->txt_mlp_up_weight,
+                                                              block->txt_mlp_down_weight,
+                                                              txt_seq, hidden, mlp_hidden);
+    
+    if (!txt_ffn_out) {
+        flux_rocm_tensor_free(img_hidden_gpu);
+        flux_rocm_tensor_free(txt_hidden_gpu);
+        flux_rocm_tensor_free(img_norm_gpu);
+        flux_rocm_tensor_free(txt_norm_gpu);
+        flux_rocm_tensor_free(img_q_proj);
+        flux_rocm_tensor_free(img_k_proj);
+        flux_rocm_tensor_free(img_v_proj);
+        flux_rocm_tensor_free(txt_q_proj);
+        flux_rocm_tensor_free(txt_k_proj);
+        flux_rocm_tensor_free(txt_v_proj);
+        flux_rocm_tensor_free(cat_k_gpu);
+        flux_rocm_tensor_free(cat_v_gpu);
+        flux_rocm_tensor_free(img_attn_out_gpu);
+        flux_rocm_tensor_free(txt_attn_out_gpu);
+        flux_rocm_tensor_free(img_proj_gpu);
+        flux_rocm_tensor_free(txt_proj_gpu);
+        flux_rocm_tensor_free(img_ffn_out);
+        flux_rocm_batch_end();
+        return 0;
+    }
+    
+    flux_rocm_gpu_gated_add(txt_hidden_gpu, txt_gate2, txt_ffn_out, txt_seq, hidden);
+    
+    /* === Sync and copy results back === */
+    flux_rocm_batch_end();
+    flux_rocm_tensor_read(img_hidden_gpu, img_hidden, img_seq * hidden);
+    flux_rocm_tensor_read(txt_hidden_gpu, txt_hidden, txt_seq * hidden);
+    
+    /* === Cleanup all tensors === */
+    flux_rocm_tensor_free(img_hidden_gpu);
+    flux_rocm_tensor_free(txt_hidden_gpu);
+    flux_rocm_tensor_free(img_norm_gpu);
+    flux_rocm_tensor_free(txt_norm_gpu);
+    flux_rocm_tensor_free(img_q_proj);
+    flux_rocm_tensor_free(img_k_proj);
+    flux_rocm_tensor_free(img_v_proj);
+    flux_rocm_tensor_free(txt_q_proj);
+    flux_rocm_tensor_free(txt_k_proj);
+    flux_rocm_tensor_free(txt_v_proj);
+    flux_rocm_tensor_free(cat_k_gpu);
+    flux_rocm_tensor_free(cat_v_gpu);
+    flux_rocm_tensor_free(img_attn_out_gpu);
+    flux_rocm_tensor_free(txt_attn_out_gpu);
+    flux_rocm_tensor_free(img_proj_gpu);
+    flux_rocm_tensor_free(txt_proj_gpu);
+    flux_rocm_tensor_free(img_ffn_out);
+    flux_rocm_tensor_free(txt_ffn_out);
+    
+    return 1;  /* GPU path succeeded */
+}
+#endif /* USE_ROCM */
+
 static void single_block_forward(float *hidden, const single_block_t *block,
                                  const float *t_emb, const float *adaln_weight,
                                  const float *img_rope_cos, const float *img_rope_sin,
@@ -3194,12 +3699,24 @@ float *flux_transformer_forward(flux_transformer_t *tf,
             load_double_block_weights(&tf->double_blocks[i], tf->sf, i,
                                       tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
         }
-        double_block_forward(img_hidden, txt_hidden,
-                             &tf->double_blocks[i],
-                             tf->double_mod_img, tf->double_mod_txt,
-                             img_rope_cos, img_rope_sin,
-                             txt_rope_cos, txt_rope_sin,
-                             img_seq, txt_seq, tf);
+#ifdef USE_ROCM
+        /* Try GPU path first */
+        int gpu_done = double_block_forward_rocm(img_hidden, txt_hidden,
+                                                  &tf->double_blocks[i],
+                                                  tf->double_mod_img, tf->double_mod_txt,
+                                                  img_rope_cos, img_rope_sin,
+                                                  txt_rope_cos, txt_rope_sin,
+                                                  img_seq, txt_seq, tf);
+        if (!gpu_done)
+#endif
+        {
+            double_block_forward(img_hidden, txt_hidden,
+                                 &tf->double_blocks[i],
+                                 tf->double_mod_img, tf->double_mod_txt,
+                                 img_rope_cos, img_rope_sin,
+                                 txt_rope_cos, txt_rope_sin,
+                                 img_seq, txt_seq, tf);
+        }
         /* In mmap mode, free block weights after use */
         if (tf->use_mmap) {
             free_double_block_weights(&tf->double_blocks[i]);
@@ -3419,15 +3936,24 @@ float *flux_transformer_forward(flux_transformer_t *tf,
                 load_single_block_weights(&tf->single_blocks[i], tf->sf, i,
                                           tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
             }
+{
+            int gpu_done = 0;
 #ifdef USE_METAL
             /* Try GPU-optimized path first */
-            if (!single_block_forward_gpu(concat_hidden, &tf->single_blocks[i],
+            gpu_done = single_block_forward_gpu(concat_hidden, &tf->single_blocks[i],
                                           t_emb, tf->adaln_single_weight,
                                           img_rope_cos, img_rope_sin,
                                           txt_rope_cos, txt_rope_sin,
-                                          total_seq, txt_seq, tf))
+                                          total_seq, txt_seq, tf);
+#elif defined(USE_ROCM)
+            /* Try ROCm GPU path */
+            gpu_done = single_block_forward_rocm(concat_hidden, &tf->single_blocks[i],
+                                           t_emb, tf->adaln_single_weight,
+                                           img_rope_cos, img_rope_sin,
+                                           txt_rope_cos, txt_rope_sin,
+                                           total_seq, txt_seq, tf);
 #endif
-            {
+            if (!gpu_done) {
                 /* Fall back to CPU path */
                 single_block_forward(concat_hidden, &tf->single_blocks[i],
                                      t_emb, tf->adaln_single_weight,
@@ -3440,6 +3966,7 @@ float *flux_transformer_forward(flux_transformer_t *tf,
                 free_single_block_weights(&tf->single_blocks[i]);
                 /* With direct mmap pointers for bf16, no need to clear caches. */
             }
+}
             if (flux_substep_callback)
                 flux_substep_callback(FLUX_SUBSTEP_SINGLE_BLOCK, i, tf->num_single_layers);
 
@@ -3667,12 +4194,23 @@ float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
             load_double_block_weights(&tf->double_blocks[i], tf->sf, i,
                                       tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
         }
-        double_block_forward(combined_hidden, txt_hidden,
-                             &tf->double_blocks[i],
-                             tf->double_mod_img, tf->double_mod_txt,
-                             combined_rope_cos, combined_rope_sin,
-                             txt_rope_cos, txt_rope_sin,
-                             combined_img_seq, txt_seq, tf);
+#ifdef USE_ROCM
+        int gpu_done = double_block_forward_rocm(combined_hidden, txt_hidden,
+                                                  &tf->double_blocks[i],
+                                                  tf->double_mod_img, tf->double_mod_txt,
+                                                  combined_rope_cos, combined_rope_sin,
+                                                  txt_rope_cos, txt_rope_sin,
+                                                  combined_img_seq, txt_seq, tf);
+        if (!gpu_done)
+#endif
+        {
+            double_block_forward(combined_hidden, txt_hidden,
+                                 &tf->double_blocks[i],
+                                 tf->double_mod_img, tf->double_mod_txt,
+                                 combined_rope_cos, combined_rope_sin,
+                                 txt_rope_cos, txt_rope_sin,
+                                 combined_img_seq, txt_seq, tf);
+        }
         if (tf->use_mmap) {
             free_double_block_weights(&tf->double_blocks[i]);
             /* With direct mmap pointers for bf16, no need to clear caches. */
@@ -3911,12 +4449,23 @@ float *flux_transformer_forward_with_multi_refs(flux_transformer_t *tf,
             load_double_block_weights(&tf->double_blocks[i], tf->sf, i,
                                       tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
         }
-        double_block_forward(combined_hidden, txt_hidden,
-                             &tf->double_blocks[i],
-                             tf->double_mod_img, tf->double_mod_txt,
-                             combined_rope_cos, combined_rope_sin,
-                             txt_rope_cos, txt_rope_sin,
-                             combined_img_seq, txt_seq, tf);
+#ifdef USE_ROCM
+        int gpu_done = double_block_forward_rocm(combined_hidden, txt_hidden,
+                                                  &tf->double_blocks[i],
+                                                  tf->double_mod_img, tf->double_mod_txt,
+                                                  combined_rope_cos, combined_rope_sin,
+                                                  txt_rope_cos, txt_rope_sin,
+                                                  combined_img_seq, txt_seq, tf);
+        if (!gpu_done)
+#endif
+        {
+            double_block_forward(combined_hidden, txt_hidden,
+                                 &tf->double_blocks[i],
+                                 tf->double_mod_img, tf->double_mod_txt,
+                                 combined_rope_cos, combined_rope_sin,
+                                 txt_rope_cos, txt_rope_sin,
+                                 combined_img_seq, txt_seq, tf);
+        }
         if (tf->use_mmap) {
             free_double_block_weights(&tf->double_blocks[i]);
         }
