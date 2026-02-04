@@ -8,7 +8,12 @@
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <sys/mman.h>
+#ifdef _WIN32
+  #include <windows.h>
+  #include <io.h>
+#else
+  #include <sys/mman.h>
+#endif
 #include <sys/stat.h>
 
 /* Minimal JSON parser for safetensors header */
@@ -221,13 +226,38 @@ safetensors_file_t *safetensors_open(const char *path) {
         return NULL;
     }
 
-    void *data = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    void *data;
+#ifdef _WIN32
+    HANDLE hFile = (HANDLE)_get_osfhandle(fd);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        perror("safetensors_open: _get_osfhandle failed");
+        close(fd);
+        return NULL;
+    }
+
+    HANDLE hMapping = CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!hMapping) {
+        perror("safetensors_open: CreateFileMapping failed");
+        close(fd);
+        return NULL;
+    }
+
+    data = MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
+    CloseHandle(hMapping);
+    if (!data) {
+        perror("safetensors_open: MapViewOfFile failed");
+        close(fd);
+        return NULL;
+    }
+#else
+    data = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
 
     if (data == MAP_FAILED) {
         perror("safetensors_open: mmap failed");
         return NULL;
     }
+#endif
 
     /* Read header size (8-byte little-endian) */
     uint64_t header_size = 0;
@@ -235,13 +265,21 @@ safetensors_file_t *safetensors_open(const char *path) {
 
     if (header_size > file_size - 8) {
         fprintf(stderr, "safetensors_open: invalid header size\n");
+#ifdef _WIN32
+        UnmapViewOfFile(data);
+#else
         munmap(data, file_size);
+#endif
         return NULL;
     }
 
     safetensors_file_t *sf = calloc(1, sizeof(safetensors_file_t));
     if (!sf) {
+#ifdef _WIN32
+        UnmapViewOfFile(data);
+#else
         munmap(data, file_size);
+#endif
         return NULL;
     }
 
@@ -271,7 +309,13 @@ safetensors_file_t *safetensors_open(const char *path) {
 
 void safetensors_close(safetensors_file_t *sf) {
     if (!sf) return;
-    if (sf->data) munmap(sf->data, sf->file_size);
+    if (sf->data) {
+#ifdef _WIN32
+        UnmapViewOfFile(sf->data);
+#else
+        munmap(sf->data, sf->file_size);
+#endif
+    }
     free(sf->path);
     free(sf->header_json);
     free(sf);
