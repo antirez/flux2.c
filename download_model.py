@@ -22,8 +22,12 @@ def main():
     )
     parser.add_argument(
         '--output-dir', '-o',
-        default='./flux-klein-model',
-        help='Output directory (default: ./flux-klein-model)'
+        default=None,
+        help='Output directory (default: auto based on model type)'
+    )
+    parser.add_argument(
+        '--base', action='store_true',
+        help='Download the undistilled base model instead of the distilled model'
     )
     args = parser.parse_args()
 
@@ -34,18 +38,25 @@ def main():
         print("Install with: pip install huggingface_hub")
         return 1
 
-    output_dir = Path(args.output_dir)
+    if args.base:
+        repo_id = "black-forest-labs/FLUX.2-klein-base-4B"
+        default_dir = "./flux-klein-base-model"
+    else:
+        repo_id = "black-forest-labs/FLUX.2-klein-4B"
+        default_dir = "./flux-klein-model"
 
-    print("FLUX.2-klein-4B Model Downloader")
+    output_dir = Path(args.output_dir if args.output_dir else default_dir)
+
+    print(f"FLUX.2 Model Downloader")
     print("================================")
     print()
-    print(f"Repository: black-forest-labs/FLUX.2-klein-4B")
+    print(f"Repository: {repo_id}")
     print(f"Output dir: {output_dir}")
     print()
 
-    # Files to download - VAE, transformer, and Qwen3 text encoder
-    # Note: text_encoder_2 and tokenizer_2 are not used by the C implementation
+    # Files to download - VAE, transformer, Qwen3 text encoder, and model_index.json
     patterns = [
+        "model_index.json",
         "vae/*.safetensors",
         "vae/*.json",
         "transformer/*.safetensors",
@@ -60,7 +71,7 @@ def main():
 
     try:
         model_dir = snapshot_download(
-            "black-forest-labs/FLUX.2-klein-4B",
+            repo_id,
             local_dir=str(output_dir),
             allow_patterns=patterns,
             ignore_patterns=["*.bin", "*.pt", "*.pth"],  # Skip pytorch format

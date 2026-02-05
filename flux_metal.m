@@ -14,6 +14,7 @@
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 #import <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
 #include "flux_metal.h"
+#include "flux_kernels.h"
 #include "flux_shaders_source.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -80,6 +81,15 @@ typedef struct {
 static linear_graph_cache_t g_linear_graph_cache[MAX_LINEAR_GRAPH_CACHE];
 static int g_linear_graph_count = 0;
 static pthread_mutex_t g_linear_graph_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Cache for MPSGraph bf16 matmul graphs (no fp32 casts).
+ * If unsupported on the current OS/driver, we transparently fall back to the
+ * fp32-cast graphs above. */
+static linear_graph_cache_t g_linear_graph_cache_bf16[MAX_LINEAR_GRAPH_CACHE];
+static int g_linear_graph_bf16_count = 0;
+static pthread_mutex_t g_linear_graph_bf16_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int g_linear_graph_bf16_disabled = 0;
+static int g_linear_graph_bf16_seen_success = 0;
 
 /* ========================================================================
  * MPSGraph Conv2D Cache
@@ -447,8 +457,9 @@ int flux_metal_init(void) {
         memset(g_weight_cache, 0, sizeof(g_weight_cache));
 
         g_initialized = 1;
-        fprintf(stderr, "Metal: GPU acceleration enabled (%s)\n",
-                [[g_device name] UTF8String]);
+        if (flux_verbose)
+            fprintf(stderr, "Metal: GPU acceleration enabled (%s)\n",
+                    [[g_device name] UTF8String]);
 
         /* Load compute shaders (high thresholds keep them dormant for small ops) */
         flux_metal_init_shaders();
@@ -2595,6 +2606,76 @@ flux_gpu_tensor_t flux_gpu_linear_bf16(flux_gpu_tensor_t x,
     }
 }
 
+/* GPU linear with bf16 weights - writes to pre-allocated output tensor.
+ * Same as flux_gpu_linear_bf16 but avoids allocation overhead by reusing buffers. */
+int flux_gpu_linear_bf16_into(flux_gpu_tensor_t out,
+                              flux_gpu_tensor_t x,
+                              const uint16_t *W_bf16,
+                              int seq_len, int in_dim, int out_dim) {
+    if (!g_initialized || !out || !x || !W_bf16) return 0;
+
+    @autoreleasepool {
+        /* Verify output buffer is large enough */
+        size_t out_elements = (size_t)seq_len * out_dim;
+        if (out->num_elements < out_elements) return 0;
+
+        /* Get cached f16 weight buffer (bf16 converted to f16) */
+        size_t numW = (size_t)out_dim * in_dim;
+        id<MTLBuffer> bufW = get_cached_bf16_as_f16_buffer(W_bf16, numW);
+        if (!bufW) return 0;
+
+        /* Create matrix descriptors */
+        MPSMatrixDescriptor *descX = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:seq_len columns:in_dim
+                            rowBytes:in_dim * sizeof(float)
+                            dataType:MPSDataTypeFloat32];
+        MPSMatrixDescriptor *descW = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:out_dim columns:in_dim
+                            rowBytes:in_dim * sizeof(uint16_t)
+                            dataType:MPSDataTypeFloat16];
+        MPSMatrixDescriptor *descOut = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:seq_len columns:out_dim
+                            rowBytes:out_dim * sizeof(float)
+                            dataType:MPSDataTypeFloat32];
+
+        MPSMatrix *matX = [[MPSMatrix alloc] initWithBuffer:x->buffer descriptor:descX];
+        MPSMatrix *matW = [[MPSMatrix alloc] initWithBuffer:bufW descriptor:descW];
+        MPSMatrix *matOut = [[MPSMatrix alloc] initWithBuffer:out->buffer descriptor:descOut];
+
+        /* Create matmul: out = x @ W^T */
+        MPSMatrixMultiplication *matmul = [[MPSMatrixMultiplication alloc]
+            initWithDevice:g_device
+               transposeLeft:NO
+              transposeRight:YES
+                  resultRows:seq_len
+               resultColumns:out_dim
+             interiorColumns:in_dim
+                       alpha:1.0f
+                        beta:0.0f];
+
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        [matmul encodeToCommandBuffer:cmdBuffer
+                           leftMatrix:matX
+                          rightMatrix:matW
+                         resultMatrix:matOut];
+
+        /* Mark tensors as having pending work */
+        out->has_pending_work = 1;
+
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            out->has_pending_work = 0;
+        }
+
+        if (g_tensor_batch_mode) {
+            x->has_pending_work = 1;
+        }
+
+        return 1;
+    }
+}
+
 /* GPU linear with bf16 weights - outputs bf16 tensor for full bf16 pipeline
  * Uses native bf16 (MPSDataTypeBFloat16). */
 flux_gpu_tensor_t flux_gpu_linear_bf16_bf16out(flux_gpu_tensor_t x,
@@ -3268,7 +3349,8 @@ int flux_metal_init_shaders(void) {
         }
 
         g_shaders_initialized = 1;
-        fprintf(stderr, "Metal shaders: compute kernels loaded\n");
+        if (flux_verbose)
+            fprintf(stderr, "Metal shaders: compute kernels loaded\n");
         return 1;
     }
 }
@@ -4198,6 +4280,15 @@ static sdpa_graph_cache_t *get_sdpa_graph_cache(int seq_q, int seq_k, int num_he
         return NULL;
     }
 
+    /* Prefer native SDPA (flash attention) when available for long sequences.
+     * Can be disabled for debugging/regression comparisons by setting:
+     *   FLUX_USE_MANUAL_SDPA=1
+     */
+    static int s_force_manual_sdpa = -1;
+    if (s_force_manual_sdpa < 0) {
+        s_force_manual_sdpa = getenv("FLUX_USE_MANUAL_SDPA") ? 1 : 0;
+    }
+
     pthread_mutex_lock(&g_sdpa_graph_mutex);
     for (int i = 0; i < g_sdpa_graph_count; i++) {
         sdpa_graph_cache_t *entry = &g_sdpa_graph_cache[i];
@@ -4245,27 +4336,35 @@ static sdpa_graph_cache_t *get_sdpa_graph_cache(int seq_q, int seq_k, int num_he
 
         MPSGraphTensor *outTensor = nil;
 
-        /* Build attention graph: scaled dot product attention with f32 softmax.
-         *
-         * NOTE: The native scaledDotProductAttention API (macOS 14+) was tested but
-         * showed numerical differences in the output. Until this is resolved, we use
-         * manual attention which passes all regression tests.
-         *
-         * Manual attention: Q @ K^T * scale -> softmax -> @ V
-         * Uses f32 for softmax to maintain precision.
-         */
-        MPSGraphTensor *kTT = [graph transposeTensor:kT dimension:2 withDimension:3 name:nil];
+        if (!s_force_manual_sdpa &&
+            [graph respondsToSelector:@selector(scaledDotProductAttentionWithQueryTensor:keyTensor:valueTensor:scale:name:)]) {
+            /* Native SDPA is significantly more memory-efficient than materializing
+             * the full [heads, seq_q, seq_k] score matrix for long sequences. */
+            MPSGraphTensor *out = [graph scaledDotProductAttentionWithQueryTensor:qT
+                                                                         keyTensor:kT
+                                                                       valueTensor:vT
+                                                                            scale:scale
+                                                                              name:nil];
+            MPSGraphTensor *outCast = [graph castTensor:out toType:MPSDataTypeBFloat16 name:nil];
+            outTensor = [graph transposeTensor:outCast dimension:1 withDimension:2 name:nil];
+        } else {
+            /* Manual attention: Q @ K^T * scale -> softmax -> @ V
+             * Uses f32 for softmax to maintain precision.
+             * Note: this materializes the score matrix and can be very memory-hungry
+             * for large seq lengths. */
+            MPSGraphTensor *kTT = [graph transposeTensor:kT dimension:2 withDimension:3 name:nil];
 
-        MPSGraphTensor *qk = [graph matrixMultiplicationWithPrimaryTensor:qT secondaryTensor:kTT name:nil];
-        MPSGraphTensor *qkF32 = [graph castTensor:qk toType:MPSDataTypeFloat32 name:nil];
-        MPSGraphTensor *scaleTensor = [graph constantWithScalar:scale
-                                                          shape:@[@1]
-                                                       dataType:MPSDataTypeFloat32];
-        MPSGraphTensor *scaled = [graph multiplicationWithPrimaryTensor:qkF32 secondaryTensor:scaleTensor name:nil];
-        MPSGraphTensor *sm = [graph softMaxWithTensor:scaled axis:3 name:nil];
-        MPSGraphTensor *out = [graph matrixMultiplicationWithPrimaryTensor:sm secondaryTensor:vT name:nil];
-        MPSGraphTensor *outCast = [graph castTensor:out toType:MPSDataTypeBFloat16 name:nil];
-        outTensor = [graph transposeTensor:outCast dimension:1 withDimension:2 name:nil];
+            MPSGraphTensor *qk = [graph matrixMultiplicationWithPrimaryTensor:qT secondaryTensor:kTT name:nil];
+            MPSGraphTensor *qkF32 = [graph castTensor:qk toType:MPSDataTypeFloat32 name:nil];
+            MPSGraphTensor *scaleTensor = [graph constantWithScalar:scale
+                                                              shape:@[@1]
+                                                           dataType:MPSDataTypeFloat32];
+            MPSGraphTensor *scaled = [graph multiplicationWithPrimaryTensor:qkF32 secondaryTensor:scaleTensor name:nil];
+            MPSGraphTensor *sm = [graph softMaxWithTensor:scaled axis:3 name:nil];
+            MPSGraphTensor *out = [graph matrixMultiplicationWithPrimaryTensor:sm secondaryTensor:vT name:nil];
+            MPSGraphTensor *outCast = [graph castTensor:out toType:MPSDataTypeBFloat16 name:nil];
+            outTensor = [graph transposeTensor:outCast dimension:1 withDimension:2 name:nil];
+        }
 
         entry->graph = graph;
         entry->qTensor = qIn;
@@ -4335,6 +4434,63 @@ static linear_graph_cache_t *get_linear_graph_cache(int seq_len, int in_dim, int
     }
 
     pthread_mutex_unlock(&g_linear_graph_mutex);
+    return entry;
+}
+
+static linear_graph_cache_t *get_linear_graph_cache_bf16(int seq_len, int in_dim, int out_dim) {
+    if (!NSClassFromString(@"MPSGraph")) {
+        return NULL;
+    }
+
+    pthread_mutex_lock(&g_linear_graph_bf16_mutex);
+    for (int i = 0; i < g_linear_graph_bf16_count; i++) {
+        linear_graph_cache_t *entry = &g_linear_graph_cache_bf16[i];
+        if (entry->seq == seq_len && entry->in_dim == in_dim && entry->out_dim == out_dim) {
+            pthread_mutex_unlock(&g_linear_graph_bf16_mutex);
+            return entry;
+        }
+    }
+
+    int slot = 0;
+    if (g_linear_graph_bf16_count < MAX_LINEAR_GRAPH_CACHE) {
+        slot = g_linear_graph_bf16_count++;
+    }
+
+    linear_graph_cache_t *entry = &g_linear_graph_cache_bf16[slot];
+    entry->seq = seq_len;
+    entry->in_dim = in_dim;
+    entry->out_dim = out_dim;
+
+    @autoreleasepool {
+        MPSGraph *graph = [[MPSGraph alloc] init];
+        if (!graph) {
+            pthread_mutex_unlock(&g_linear_graph_bf16_mutex);
+            return NULL;
+        }
+
+        NSArray<NSNumber *> *xShape = @[@1, @(seq_len), @(in_dim)];
+        NSArray<NSNumber *> *wShape = @[@1, @(out_dim), @(in_dim)];
+        NSArray<NSNumber *> *outShape = @[@1, @(seq_len), @(out_dim)];
+
+        MPSGraphTensor *xIn = [graph placeholderWithShape:xShape dataType:MPSDataTypeBFloat16 name:nil];
+        MPSGraphTensor *wIn = [graph placeholderWithShape:wShape dataType:MPSDataTypeBFloat16 name:nil];
+        MPSGraphTensor *wT = [graph transposeTensor:wIn dimension:1 withDimension:2 name:nil];
+
+        /* Try bf16 matmul directly (avoids fp32 casts). If unsupported, encode will
+         * throw and we will permanently disable this fast path at runtime. */
+        MPSGraphTensor *out = [graph matrixMultiplicationWithPrimaryTensor:xIn secondaryTensor:wT name:nil];
+        MPSGraphTensor *outCast = [graph castTensor:out toType:MPSDataTypeBFloat16 name:nil];
+
+        entry->graph = graph;
+        entry->xTensor = xIn;
+        entry->wTensor = wIn;
+        entry->outTensor = outCast;
+        entry->xShape = xShape;
+        entry->wShape = wShape;
+        entry->outShape = outShape;
+    }
+
+    pthread_mutex_unlock(&g_linear_graph_bf16_mutex);
     return entry;
 }
 
@@ -5128,45 +5284,128 @@ flux_gpu_tensor_t flux_gpu_tensor_bf16_to_f32(flux_gpu_tensor_t bf16_tensor) {
     return f32_tensor;
 }
 
-/* BF16 linear layer: out = x @ W^T (all bf16)
- * x: [seq, in_dim] bf16
- * W: [out_dim, in_dim] bf16 (from model weights)
- * out: [seq, out_dim] bf16
- */
-static flux_gpu_tensor_t flux_gpu_linear_bf16_mpsgraph(flux_gpu_tensor_t x,
-                                                       const uint16_t *W_bf16,
-                                                       int seq_len, int in_dim, int out_dim) {
-    if (!g_initialized || !x || !W_bf16 || !x->is_f16) return NULL;
-
-    linear_graph_cache_t *cache = get_linear_graph_cache(seq_len, in_dim, out_dim);
-    if (!cache || !cache->graph) return NULL;
+flux_gpu_tensor_t flux_gpu_linear_bf16_native(flux_gpu_tensor_t x,
+                                               const uint16_t *W_bf16,
+                                               int seq_len, int in_dim, int out_dim) {
+    if (!g_shaders_initialized || !x || !x->is_f16 || !W_bf16) return NULL;
 
     flux_gpu_tensor_t out = flux_gpu_tensor_alloc_f16((size_t)seq_len * out_dim);
     if (!out) return NULL;
 
-    size_t numW = (size_t)out_dim * in_dim;
-    id<MTLBuffer> bufW = get_cached_bf16_buffer(W_bf16, numW);
-    if (!bufW) {
+    if (!flux_gpu_linear_bf16_native_into(out, x, W_bf16, seq_len, in_dim, out_dim)) {
         flux_gpu_tensor_free(out);
         return NULL;
     }
 
+    return out;
+}
+
+/* MPSGraph bf16 linear writing into a pre-allocated bf16 output tensor. */
+static int flux_gpu_linear_bf16_mpsgraph_into(flux_gpu_tensor_t out,
+                                              flux_gpu_tensor_t x,
+                                              const uint16_t *W_bf16,
+                                              int seq_len, int in_dim, int out_dim) {
+    if (!g_initialized || !out || !x || !W_bf16) return 0;
+    if (!out->is_f16 || !x->is_f16) return 0;
+    if (out->num_elements != (size_t)seq_len * (size_t)out_dim) return 0;
+
+    size_t numW = (size_t)out_dim * (size_t)in_dim;
+    id<MTLBuffer> bufW = get_cached_bf16_buffer(W_bf16, numW);
+    if (!bufW) return 0;
+
+    /* Fast path: try bf16 matmul directly (no fp32 casts). If unsupported, MPSGraph
+     * will throw; disable this path for the remainder of the run and fall back to
+     * the fp32-cast graph (still MPSGraph, much faster than our custom kernel). */
+    /* Heuristic: bf16 matmul helps a lot for very wide outputs (single-block fused
+     * projections, MLP up/gate). For narrower linears (hidden->hidden), it tends
+     * to help only at large seq_len (bigger images). */
+    if (!g_linear_graph_bf16_disabled && (out_dim >= 8192 || seq_len >= 8192)) {
+        linear_graph_cache_t *cache_bf16 = get_linear_graph_cache_bf16(seq_len, in_dim, out_dim);
+        if (cache_bf16 && cache_bf16->graph) {
+            @autoreleasepool {
+                id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+                if (!cmdBuffer) return 0;
+
+                MPSCommandBuffer *mpsCmd = nil;
+                if (g_tensor_batch_mode) {
+                    mpsCmd = [MPSCommandBuffer commandBufferWithCommandBuffer:cmdBuffer];
+                } else {
+                    mpsCmd = [MPSCommandBuffer commandBufferFromCommandQueue:g_queue];
+                }
+                if (!mpsCmd) return 0;
+
+                MPSGraphTensorData *xData =
+                    [[MPSGraphTensorData alloc] initWithMTLBuffer:x->buffer
+                                                           shape:cache_bf16->xShape
+                                                        dataType:MPSDataTypeBFloat16];
+                MPSGraphTensorData *wData =
+                    [[MPSGraphTensorData alloc] initWithMTLBuffer:bufW
+                                                           shape:cache_bf16->wShape
+                                                        dataType:MPSDataTypeBFloat16];
+                MPSGraphTensorData *outData =
+                    [[MPSGraphTensorData alloc] initWithMTLBuffer:out->buffer
+                                                           shape:cache_bf16->outShape
+                                                        dataType:MPSDataTypeBFloat16];
+
+                NSDictionary *feeds = @{
+                    cache_bf16->xTensor : xData,
+                    cache_bf16->wTensor : wData
+                };
+                NSDictionary *results = @{ cache_bf16->outTensor : outData };
+
+                int bf16_ok = 0;
+                @try {
+                    [cache_bf16->graph encodeToCommandBuffer:mpsCmd
+                                                      feeds:feeds
+                                           targetOperations:nil
+                                          resultsDictionary:results
+                                        executionDescriptor:nil];
+                    bf16_ok = 1;
+                } @catch (NSException *exception) {
+                    /* If bf16 matmul isn't supported at all, the first attempt will
+                     * throw consistently; disable the fast path to avoid repeated
+                     * exceptions. If we've already seen successes, treat failures
+                     * as shape-specific and just fall back for this call. */
+                    if (!g_linear_graph_bf16_seen_success) {
+                        g_linear_graph_bf16_disabled = 1;
+                    }
+                }
+
+                if (bf16_ok) {
+                    g_linear_graph_bf16_seen_success = 1;
+                    out->has_pending_work = 1;
+                    x->has_pending_work = 1;
+
+                    if (!g_tensor_batch_mode) {
+                        [mpsCmd commit];
+                        [mpsCmd waitUntilCompleted];
+                        out->has_pending_work = 0;
+                        x->has_pending_work = 0;
+                    } else {
+                        /* MPSGraph may commit-and-continue; update the live buffer. */
+                        g_tensor_cmd = [mpsCmd rootCommandBuffer];
+                    }
+
+                    return 1;
+                }
+            }
+        }
+    }
+
+    linear_graph_cache_t *cache = get_linear_graph_cache(seq_len, in_dim, out_dim);
+    if (!cache || !cache->graph) return 0;
+
     @autoreleasepool {
         id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
-        if (!cmdBuffer) {
-            flux_gpu_tensor_free(out);
-            return NULL;
-        }
+        if (!cmdBuffer) return 0;
+
         MPSCommandBuffer *mpsCmd = nil;
         if (g_tensor_batch_mode) {
             mpsCmd = [MPSCommandBuffer commandBufferWithCommandBuffer:cmdBuffer];
         } else {
             mpsCmd = [MPSCommandBuffer commandBufferFromCommandQueue:g_queue];
         }
-        if (!mpsCmd) {
-            flux_gpu_tensor_free(out);
-            return NULL;
-        }
+        if (!mpsCmd) return 0;
 
         MPSGraphTensorData *xData =
             [[MPSGraphTensorData alloc] initWithMTLBuffer:x->buffer
@@ -5194,8 +5433,7 @@ static flux_gpu_tensor_t flux_gpu_linear_bf16_mpsgraph(flux_gpu_tensor_t x,
                               resultsDictionary:results
                             executionDescriptor:nil];
         } @catch (NSException *exception) {
-            flux_gpu_tensor_free(out);
-            return NULL;
+            return 0;
         }
 
         out->has_pending_work = 1;
@@ -5207,41 +5445,35 @@ static flux_gpu_tensor_t flux_gpu_linear_bf16_mpsgraph(flux_gpu_tensor_t x,
             out->has_pending_work = 0;
             x->has_pending_work = 0;
         } else {
+            /* MPSGraph may commit-and-continue; update the live buffer. */
             g_tensor_cmd = [mpsCmd rootCommandBuffer];
         }
     }
 
-    return out;
+    return 1;
 }
 
-flux_gpu_tensor_t flux_gpu_linear_bf16_native(flux_gpu_tensor_t x,
-                                               const uint16_t *W_bf16,
-                                               int seq_len, int in_dim, int out_dim) {
-    if (!g_shaders_initialized || !x || !x->is_f16 || !W_bf16) return NULL;
+int flux_gpu_linear_bf16_native_into(flux_gpu_tensor_t out,
+                                     flux_gpu_tensor_t x,
+                                     const uint16_t *W_bf16,
+                                     int seq_len, int in_dim, int out_dim) {
+    if (!g_shaders_initialized || !out || !x || !W_bf16) return 0;
+    if (!out->is_f16 || !x->is_f16) return 0;
+    if (out->num_elements != (size_t)seq_len * (size_t)out_dim) return 0;
 
-    /* MPSGraph linear is faster than our custom kernel. It supports batch mode
-     * by wrapping our command buffer with MPSCommandBuffer. */
+    /* MPSGraph linear is faster than our custom kernel. */
     if (bf16_linear_use_graph(seq_len, in_dim, out_dim)) {
-        flux_gpu_tensor_t graph_out = flux_gpu_linear_bf16_mpsgraph(x, W_bf16,
-                                                                    seq_len, in_dim, out_dim);
-        if (graph_out) {
-            return graph_out;
+        if (flux_gpu_linear_bf16_mpsgraph_into(out, x, W_bf16, seq_len, in_dim, out_dim)) {
+            return 1;
         }
     }
 
-    if (!g_linear_bf16_pipeline) return NULL;
-
-    flux_gpu_tensor_t out = flux_gpu_tensor_alloc_f16((size_t)seq_len * out_dim);
-    if (!out) return NULL;
+    if (!g_linear_bf16_pipeline) return 0;
 
     @autoreleasepool {
-        /* Get cached bf16 weight buffer */
-        size_t numW = (size_t)out_dim * in_dim;
+        size_t numW = (size_t)out_dim * (size_t)in_dim;
         id<MTLBuffer> bufW = get_cached_bf16_buffer(W_bf16, numW);
-        if (!bufW) {
-            flux_gpu_tensor_free(out);
-            return NULL;
-        }
+        if (!bufW) return 0;
 
         id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
         id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
@@ -5273,7 +5505,7 @@ flux_gpu_tensor_t flux_gpu_linear_bf16_native(flux_gpu_tensor_t x,
         }
     }
 
-    return out;
+    return 1;
 }
 
 /* BF16 Split QKV+MLP: split fused output into separate tensors */

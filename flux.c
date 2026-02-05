@@ -78,9 +78,45 @@ extern float *flux_sample_euler_with_multi_refs(void *transformer, void *text_en
                                                 const float *schedule, int num_steps,
                                                 void (*progress_callback)(int step, int total));
 
+/* CFG sampling (for base model) */
+extern float *flux_sample_euler_cfg(void *transformer, void *text_encoder,
+                                     float *z, int batch, int channels, int h, int w,
+                                     const float *text_emb_cond, int text_seq_cond,
+                                     const float *text_emb_uncond, int text_seq_uncond,
+                                     float guidance_scale,
+                                     const float *schedule, int num_steps,
+                                     void (*progress_callback)(int step, int total));
+extern float *flux_sample_euler_cfg_with_refs(void *transformer, void *text_encoder,
+                                               float *z, int batch, int channels, int h, int w,
+                                               const float *ref_latent, int ref_h, int ref_w,
+                                               int t_offset,
+                                               const float *text_emb_cond, int text_seq_cond,
+                                               const float *text_emb_uncond, int text_seq_uncond,
+                                               float guidance_scale,
+                                               const float *schedule, int num_steps,
+                                               void (*progress_callback)(int step, int total));
+extern float *flux_sample_euler_cfg_with_multi_refs(void *transformer, void *text_encoder,
+                                                     float *z, int batch, int channels, int h, int w,
+                                                     const flux_ref_t *refs, int num_refs,
+                                                     const float *text_emb_cond, int text_seq_cond,
+                                                     const float *text_emb_uncond, int text_seq_uncond,
+                                                     float guidance_scale,
+                                                     const float *schedule, int num_steps,
+                                                     void (*progress_callback)(int step, int total));
+
 extern float *flux_linear_schedule(int num_steps);
+extern float *flux_power_schedule(int num_steps, float alpha);
 extern float *flux_official_schedule(int num_steps, int image_seq_len);
 extern float *flux_init_noise(int batch, int channels, int h, int w, int64_t seed);
+
+/* Return schedule based on params: linear, power, or official shifted sigmoid. */
+static float *flux_selected_schedule(const flux_params *p, int image_seq_len) {
+    if (p->power_schedule)
+        return flux_power_schedule(p->num_steps, p->power_alpha);
+    if (p->linear_schedule)
+        return flux_linear_schedule(p->num_steps);
+    return flux_official_schedule(p->num_steps, image_seq_len);
+}
 
 /* ========================================================================
  * Text Encoder (Qwen3)
@@ -103,6 +139,8 @@ struct flux_ctx {
     int max_width;
     int max_height;
     int default_steps;
+    float default_guidance;
+    int is_distilled;  /* 1 = distilled (4-step), 0 = base (50-step CFG) */
 
     /* Model info */
     char model_name[64];
@@ -151,10 +189,38 @@ flux_ctx *flux_load_dir(const char *model_dir) {
     /* Set defaults - max 1792x1792 (requires ~18GB VAE work buffers) */
     ctx->max_width = FLUX_VAE_MAX_DIM;
     ctx->max_height = FLUX_VAE_MAX_DIM;
-    ctx->default_steps = 4;
-    strncpy(ctx->model_name, "FLUX.2-klein-4B", sizeof(ctx->model_name) - 1);
     strncpy(ctx->model_version, "1.0", sizeof(ctx->model_version) - 1);
     strncpy(ctx->model_dir, model_dir, sizeof(ctx->model_dir) - 1);
+
+    /* Autodetect model type from model_index.json.
+     * Distilled model has "is_distilled": true, base model does not. */
+    ctx->is_distilled = 1;  /* Default to distilled */
+    snprintf(path, sizeof(path), "%s/model_index.json", model_dir);
+    if (file_exists(path)) {
+        FILE *f = fopen(path, "r");
+        if (f) {
+            char buf[4096];
+            size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+            buf[n] = '\0';
+            fclose(f);
+            /* If "is_distilled" is present and true, it's distilled.
+             * If absent, it's the base model. */
+            if (!strstr(buf, "\"is_distilled\": true") &&
+                !strstr(buf, "\"is_distilled\":true")) {
+                ctx->is_distilled = 0;
+            }
+        }
+    }
+
+    if (ctx->is_distilled) {
+        ctx->default_steps = 4;
+        ctx->default_guidance = 1.0f;
+        strncpy(ctx->model_name, "FLUX.2-klein-4B", sizeof(ctx->model_name) - 1);
+    } else {
+        ctx->default_steps = 50;
+        ctx->default_guidance = 4.0f;
+        strncpy(ctx->model_name, "FLUX.2-klein-base-4B", sizeof(ctx->model_name) - 1);
+    }
 
     /* Load VAE only at startup (~300MB).
      * Transformer and text encoder are loaded on-demand during generation
@@ -203,6 +269,18 @@ void flux_free(flux_ctx *ctx) {
 
 void flux_set_mmap(flux_ctx *ctx, int enable) {
     if (ctx) ctx->use_mmap = enable;
+}
+
+int flux_is_distilled(flux_ctx *ctx) {
+    return ctx ? ctx->is_distilled : 1;
+}
+
+void flux_set_base_mode(flux_ctx *ctx) {
+    if (!ctx) return;
+    ctx->is_distilled = 0;
+    ctx->default_steps = 50;
+    ctx->default_guidance = 4.0f;
+    strncpy(ctx->model_name, "FLUX.2-klein-base-4B", sizeof(ctx->model_name) - 1);
 }
 
 void flux_release_text_encoder(flux_ctx *ctx) {
@@ -309,7 +387,8 @@ flux_image *flux_generate(flux_ctx *ctx, const char *prompt,
     /* Validate dimensions */
     if (p.width <= 0) p.width = FLUX_DEFAULT_WIDTH;
     if (p.height <= 0) p.height = FLUX_DEFAULT_HEIGHT;
-    if (p.num_steps <= 0) p.num_steps = 4;  /* Klein default */
+    if (p.num_steps <= 0) p.num_steps = ctx->default_steps;
+    float guidance = (p.guidance > 0) ? p.guidance : ctx->default_guidance;
 
     /* Ensure dimensions are divisible by 16 */
     p.width = (p.width / 16) * 16;
@@ -321,12 +400,23 @@ flux_image *flux_generate(flux_ctx *ctx, const char *prompt,
         return NULL;
     }
 
-    /* Encode text */
+    /* Encode text (and unconditioned text for CFG in base model) */
     int text_seq;
     float *text_emb = flux_encode_text(ctx, prompt, &text_seq);
     if (!text_emb) {
         set_error("Failed to encode prompt");
         return NULL;
+    }
+
+    float *text_emb_uncond = NULL;
+    int text_seq_uncond = 0;
+    if (!ctx->is_distilled) {
+        text_emb_uncond = flux_encode_text(ctx, "", &text_seq_uncond);
+        if (!text_emb_uncond) {
+            free(text_emb);
+            set_error("Failed to encode empty prompt for CFG");
+            return NULL;
+        }
     }
 
     /* Release text encoder to free ~8GB before loading transformer */
@@ -335,6 +425,7 @@ flux_image *flux_generate(flux_ctx *ctx, const char *prompt,
     /* Load transformer now (after text encoder is freed to reduce peak memory) */
     if (!flux_load_transformer_if_needed(ctx)) {
         free(text_emb);
+        free(text_emb_uncond);
         return NULL;
     }
 
@@ -347,21 +438,35 @@ flux_image *flux_generate(flux_ctx *ctx, const char *prompt,
     int64_t seed = (p.seed < 0) ? (int64_t)time(NULL) : p.seed;
     float *z = flux_init_noise(1, FLUX_LATENT_CHANNELS, latent_h, latent_w, seed);
 
-    /* Get official FLUX.2 schedule (matches Python) */
-    float *schedule = flux_official_schedule(p.num_steps, image_seq_len);
+    /* Get schedule */
+    float *schedule = flux_selected_schedule(&p, image_seq_len);
 
     /* Sample */
-    float *latent = flux_sample_euler(
-        ctx->transformer, ctx->qwen3_encoder,
-        z, 1, FLUX_LATENT_CHANNELS, latent_h, latent_w,
-        text_emb, text_seq,
-        schedule, p.num_steps,
-        NULL
-    );
+    float *latent;
+    if (ctx->is_distilled) {
+        latent = flux_sample_euler(
+            ctx->transformer, ctx->qwen3_encoder,
+            z, 1, FLUX_LATENT_CHANNELS, latent_h, latent_w,
+            text_emb, text_seq,
+            schedule, p.num_steps,
+            NULL
+        );
+    } else {
+        latent = flux_sample_euler_cfg(
+            ctx->transformer, ctx->qwen3_encoder,
+            z, 1, FLUX_LATENT_CHANNELS, latent_h, latent_w,
+            text_emb, text_seq,
+            text_emb_uncond, text_seq_uncond,
+            guidance,
+            schedule, p.num_steps,
+            NULL
+        );
+    }
 
     free(z);
     free(schedule);
     free(text_emb);
+    free(text_emb_uncond);
 
     if (!latent) {
         set_error("Sampling failed");
@@ -393,6 +498,14 @@ flux_image *flux_generate_with_embeddings(flux_ctx *ctx,
         return NULL;
     }
 
+    /* This API only supports the distilled (non-CFG) sampler since the
+     * caller provides a single embedding.  Warn if used with a base model
+     * because results will be incorrect without CFG. */
+    if (!ctx->is_distilled) {
+        fprintf(stderr, "Warning: flux_generate_with_embeddings() does not "
+                        "support CFG. Use flux_generate() for base models.\n");
+    }
+
     /* Load transformer if not already loaded */
     if (!flux_load_transformer_if_needed(ctx)) {
         return NULL;
@@ -408,7 +521,7 @@ flux_image *flux_generate_with_embeddings(flux_ctx *ctx,
     /* Validate dimensions */
     if (p.width <= 0) p.width = FLUX_DEFAULT_WIDTH;
     if (p.height <= 0) p.height = FLUX_DEFAULT_HEIGHT;
-    if (p.num_steps <= 0) p.num_steps = 4;
+    if (p.num_steps <= 0) p.num_steps = ctx->default_steps;
 
     p.width = (p.width / 16) * 16;
     p.height = (p.height / 16) * 16;
@@ -428,10 +541,11 @@ flux_image *flux_generate_with_embeddings(flux_ctx *ctx,
     int64_t seed = (p.seed < 0) ? (int64_t)time(NULL) : p.seed;
     float *z = flux_init_noise(1, FLUX_LATENT_CHANNELS, latent_h, latent_w, seed);
 
-    /* Get official FLUX.2 schedule (matches Python) */
-    float *schedule = flux_official_schedule(p.num_steps, image_seq_len);
+    /* Get schedule */
+    float *schedule = flux_selected_schedule(&p, image_seq_len);
 
-    /* Sample */
+    /* Sample - note: pre-computed embeddings only support distilled path.
+     * CFG requires two embeddings which the caller doesn't provide. */
     float *latent = flux_sample_euler(
         ctx->transformer, ctx->qwen3_encoder,
         z, 1, FLUX_LATENT_CHANNELS, latent_h, latent_w,
@@ -489,7 +603,7 @@ flux_image *flux_generate_with_embeddings_and_noise(flux_ctx *ctx,
     /* Validate dimensions */
     if (p.width <= 0) p.width = FLUX_DEFAULT_WIDTH;
     if (p.height <= 0) p.height = FLUX_DEFAULT_HEIGHT;
-    if (p.num_steps <= 0) p.num_steps = 4;
+    if (p.num_steps <= 0) p.num_steps = ctx->default_steps;
 
     p.width = (p.width / 16) * 16;
     p.height = (p.height / 16) * 16;
@@ -518,8 +632,8 @@ flux_image *flux_generate_with_embeddings_and_noise(flux_ctx *ctx,
     float *z = (float *)malloc(expected_noise_size * sizeof(float));
     memcpy(z, noise, expected_noise_size * sizeof(float));
 
-    /* Get official FLUX.2 schedule (matches Python) */
-    float *schedule = flux_official_schedule(p.num_steps, image_seq_len);
+    /* Get schedule */
+    float *schedule = flux_selected_schedule(&p, image_seq_len);
 
     /* Sample */
     float *latent = flux_sample_euler(
@@ -600,6 +714,10 @@ flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
         img_to_use = resized;
     }
 
+    /* Resolve steps and guidance */
+    if (p.num_steps <= 0) p.num_steps = ctx->default_steps;
+    float guidance = (p.guidance > 0) ? p.guidance : ctx->default_guidance;
+
     /* Encode text */
     int text_seq;
     float *text_emb = flux_encode_text(ctx, prompt, &text_seq);
@@ -609,6 +727,17 @@ flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
         return NULL;
     }
 
+    float *text_emb_uncond = NULL;
+    int text_seq_uncond = 0;
+    if (!ctx->is_distilled) {
+        text_emb_uncond = flux_encode_text(ctx, "", &text_seq_uncond);
+        if (!text_emb_uncond) {
+            free(text_emb);
+            if (resized) flux_image_free(resized);
+            set_error("Failed to encode empty prompt for CFG");
+            return NULL;
+        }
+    }
 
     /* Release text encoder to free ~8GB before loading transformer */
     flux_release_text_encoder(ctx);
@@ -616,10 +745,13 @@ flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
     /* Load transformer now (after text encoder is freed to reduce peak memory) */
     if (!flux_load_transformer_if_needed(ctx)) {
         free(text_emb);
+        free(text_emb_uncond);
+        if (resized) flux_image_free(resized);
         return NULL;
     }
 
     /* Encode image to latent */
+    if (flux_phase_callback) flux_phase_callback("encoding reference image", 0);
     float *img_tensor = flux_image_to_tensor(img_to_use);
     if (resized) flux_image_free(resized);
 
@@ -637,9 +769,11 @@ flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
     }
 
     free(img_tensor);
+    if (flux_phase_callback) flux_phase_callback("encoding reference image", 1);
 
     if (!img_latent) {
         free(text_emb);
+        free(text_emb_uncond);
         set_error("Failed to encode image");
         return NULL;
     }
@@ -658,8 +792,8 @@ flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
     int num_steps = p.num_steps;
     int image_seq_len = latent_h * latent_w;  /* For schedule calculation */
 
-    /* Use official FLUX.2 schedule */
-    float *schedule = flux_official_schedule(num_steps, image_seq_len);
+    /* Get schedule */
+    float *schedule = flux_selected_schedule(&p, image_seq_len);
 
     /* Initialize target latent with pure noise */
     int64_t seed = (p.seed < 0) ? (int64_t)time(NULL) : p.seed;
@@ -669,20 +803,36 @@ flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
     int t_offset = 10;
 
     /* Sample using in-context conditioning */
-    float *latent = flux_sample_euler_with_refs(
-        ctx->transformer, ctx->qwen3_encoder,
-        z, 1, FLUX_LATENT_CHANNELS, latent_h, latent_w,
-        img_latent, latent_h, latent_w,  /* Reference latent */
-        t_offset,
-        text_emb, text_seq,
-        schedule, num_steps,
-        NULL  /* progress_callback */
-    );
+    float *latent;
+    if (ctx->is_distilled) {
+        latent = flux_sample_euler_with_refs(
+            ctx->transformer, ctx->qwen3_encoder,
+            z, 1, FLUX_LATENT_CHANNELS, latent_h, latent_w,
+            img_latent, latent_h, latent_w,
+            t_offset,
+            text_emb, text_seq,
+            schedule, num_steps,
+            NULL
+        );
+    } else {
+        latent = flux_sample_euler_cfg_with_refs(
+            ctx->transformer, ctx->qwen3_encoder,
+            z, 1, FLUX_LATENT_CHANNELS, latent_h, latent_w,
+            img_latent, latent_h, latent_w,
+            t_offset,
+            text_emb, text_seq,
+            text_emb_uncond, text_seq_uncond,
+            guidance,
+            schedule, num_steps,
+            NULL
+        );
+    }
 
     free(z);
     free(img_latent);
     free(schedule);
     free(text_emb);
+    free(text_emb_uncond);
 
     if (!latent) {
         set_error("Sampling failed");
@@ -745,6 +895,10 @@ flux_image *flux_multiref(flux_ctx *ctx, const char *prompt,
     p.width = (p.width / 16) * 16;
     p.height = (p.height / 16) * 16;
 
+    /* Resolve steps and guidance */
+    if (p.num_steps <= 0) p.num_steps = ctx->default_steps;
+    float guidance = (p.guidance > 0) ? p.guidance : ctx->default_guidance;
+
     /* Encode text */
     int text_seq;
     float *text_emb = flux_encode_text(ctx, prompt, &text_seq);
@@ -753,10 +907,22 @@ flux_image *flux_multiref(flux_ctx *ctx, const char *prompt,
         return NULL;
     }
 
+    float *text_emb_uncond = NULL;
+    int text_seq_uncond = 0;
+    if (!ctx->is_distilled) {
+        text_emb_uncond = flux_encode_text(ctx, "", &text_seq_uncond);
+        if (!text_emb_uncond) {
+            free(text_emb);
+            set_error("Failed to encode empty prompt for CFG");
+            return NULL;
+        }
+    }
+
     flux_release_text_encoder(ctx);
 
     if (!flux_load_transformer_if_needed(ctx)) {
         free(text_emb);
+        free(text_emb_uncond);
         return NULL;
     }
 
@@ -789,6 +955,7 @@ flux_image *flux_multiref(flux_ctx *ctx, const char *prompt,
                 free(ref_data);
                 free(resized_imgs);
                 free(text_emb);
+                free(text_emb_uncond);
                 set_error("Failed to resize reference image");
                 return NULL;
             }
@@ -813,6 +980,7 @@ flux_image *flux_multiref(flux_ctx *ctx, const char *prompt,
             free(ref_data);
             free(resized_imgs);
             free(text_emb);
+            free(text_emb_uncond);
             set_error("Failed to encode reference image");
             return NULL;
         }
@@ -833,19 +1001,33 @@ flux_image *flux_multiref(flux_ctx *ctx, const char *prompt,
     int latent_w = p.width / 16;
     int image_seq_len = latent_h * latent_w;
 
-    float *schedule = flux_official_schedule(p.num_steps, image_seq_len);
+    float *schedule = flux_selected_schedule(&p, image_seq_len);
     int64_t seed = (p.seed < 0) ? (int64_t)time(NULL) : p.seed;
     float *z = flux_init_noise(1, FLUX_LATENT_CHANNELS, latent_h, latent_w, seed);
 
     /* Sample with multi-reference conditioning */
-    float *latent = flux_sample_euler_with_multi_refs(
-        ctx->transformer, ctx->qwen3_encoder,
-        z, 1, FLUX_LATENT_CHANNELS, latent_h, latent_w,
-        ref_latents, num_refs,
-        text_emb, text_seq,
-        schedule, p.num_steps,
-        NULL
-    );
+    float *latent;
+    if (ctx->is_distilled) {
+        latent = flux_sample_euler_with_multi_refs(
+            ctx->transformer, ctx->qwen3_encoder,
+            z, 1, FLUX_LATENT_CHANNELS, latent_h, latent_w,
+            ref_latents, num_refs,
+            text_emb, text_seq,
+            schedule, p.num_steps,
+            NULL
+        );
+    } else {
+        latent = flux_sample_euler_cfg_with_multi_refs(
+            ctx->transformer, ctx->qwen3_encoder,
+            z, 1, FLUX_LATENT_CHANNELS, latent_h, latent_w,
+            ref_latents, num_refs,
+            text_emb, text_seq,
+            text_emb_uncond, text_seq_uncond,
+            guidance,
+            schedule, p.num_steps,
+            NULL
+        );
+    }
 
     /* Cleanup */
     free(z);
@@ -856,6 +1038,7 @@ flux_image *flux_multiref(flux_ctx *ctx, const char *prompt,
     free(ref_latents);
     free(schedule);
     free(text_emb);
+    free(text_emb_uncond);
 
     if (!latent) {
         set_error("Sampling failed");
@@ -887,9 +1070,10 @@ const char *flux_model_info(flux_ctx *ctx) {
     if (!ctx) {
         return "No model loaded";
     }
-    snprintf(info, sizeof(info), "%s v%s (max %dx%d, %d steps)",
+    snprintf(info, sizeof(info), "%s v%s (%s, %d steps, guidance %.1f)",
              ctx->model_name, ctx->model_version,
-             ctx->max_width, ctx->max_height, ctx->default_steps);
+             ctx->is_distilled ? "distilled" : "base",
+             ctx->default_steps, ctx->default_guidance);
     return info;
 }
 
@@ -1012,7 +1196,7 @@ flux_image *flux_img2img_debug_py(flux_ctx *ctx, const flux_params *params) {
     int image_seq_len = latent_h * latent_w;
 
     /* Get schedule */
-    float *schedule = flux_official_schedule(p.num_steps, image_seq_len);
+    float *schedule = flux_selected_schedule(&p, image_seq_len);
 
     /* Sample with refs */
     float *latent = flux_sample_euler_with_refs(

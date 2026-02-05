@@ -136,16 +136,38 @@ static void vae_conv2d(float *out, const float *in,
         flux_metal_conv2d(out, in, weight, bias,
                           batch, in_ch, out_ch, H, W,
                           kH, kW, stride, padding)) {
-        static int logged = 0;
-        if (!logged) {
-            fprintf(stderr, "[VAE: using MPS conv2d path] ");
-            logged = 1;
-        }
         return;
     }
 #endif
     flux_conv2d(out, in, weight, bias, batch, in_ch, out_ch,
                 H, W, kH, kW, stride, padding);
+}
+
+/* FLUX.2 VAE uses asymmetric padding for stride-2 downsampling convolutions:
+ * pad right and bottom by 1, then do a VALID 3x3/stride-2 conv.
+ *
+ * This matches the reference implementation (e.g. diffusers' Downsample2D)
+ * and avoids a ~7px top/left shift that shows up as a border in img2img. */
+static void vae_pad_right_bottom(float *out, const float *in,
+                                 int batch, int channels, int H, int W) {
+    int Hp = H + 1;
+    int Wp = W + 1;
+    size_t in_plane = (size_t)H * (size_t)W;
+    size_t out_plane = (size_t)Hp * (size_t)Wp;
+
+    memset(out, 0, (size_t)batch * (size_t)channels * out_plane * sizeof(float));
+
+    for (int b = 0; b < batch; b++) {
+        for (int c = 0; c < channels; c++) {
+            const float *src = in + ((size_t)b * (size_t)channels + (size_t)c) * in_plane;
+            float *dst = out + ((size_t)b * (size_t)channels + (size_t)c) * out_plane;
+            for (int y = 0; y < H; y++) {
+                memcpy(dst + (size_t)y * (size_t)Wp,
+                       src + (size_t)y * (size_t)W,
+                       (size_t)W * sizeof(float));
+            }
+        }
+    }
 }
 
 /* Swish activation in-place */
@@ -318,6 +340,8 @@ float *flux_vae_encode(flux_vae_t *vae, const float *img,
 
     int block_idx = 0;
     int down_idx = 0;
+    int progress = 0;
+    int total_blocks = 4 * vae->num_res_blocks + 3;  /* down resblocks + mid */
 
     /* Down blocks */
     for (int level = 0; level < 4; level++) {
@@ -328,16 +352,23 @@ float *flux_vae_encode(flux_vae_t *vae, const float *img,
             resblock_forward(work, x, block, vae->work3,
                              batch, cur_h, cur_w, vae->num_groups, vae->eps);
             flux_copy(x, work, batch * ch_out * cur_h * cur_w);
+            if (flux_vae_progress_callback)
+                flux_vae_progress_callback(progress++, total_blocks);
         }
 
         /* Downsample (except last level) */
         if (level < 3) {
             vae_downsample_t *ds = &vae->enc_downsample[down_idx++];
-            int new_h = cur_h / 2;
-            int new_w = cur_w / 2;
-            /* Asymmetric padding: pad right and bottom by 1 */
-            vae_conv2d(work, x, ds->conv_weight, ds->conv_bias,
-                        batch, ch_out, ch_out, cur_h, cur_w, 3, 3, 2, 1);
+            /* Asymmetric padding: pad right and bottom by 1.
+             * Implemented explicitly to match training/reference impl. */
+            float *padded = vae->work3;
+            int padded_h = cur_h + 1;
+            int padded_w = cur_w + 1;
+            int new_h = (padded_h - 3) / 2 + 1;
+            int new_w = (padded_w - 3) / 2 + 1;
+            vae_pad_right_bottom(padded, x, batch, ch_out, cur_h, cur_w);
+            vae_conv2d(work, padded, ds->conv_weight, ds->conv_bias,
+                       batch, ch_out, ch_out, padded_h, padded_w, 3, 3, 2, 0);
             cur_h = new_h;
             cur_w = new_w;
             flux_copy(x, work, batch * ch_out * cur_h * cur_w);
@@ -349,13 +380,19 @@ float *flux_vae_encode(flux_vae_t *vae, const float *img,
     /* Mid block: resblock -> attn -> resblock */
     resblock_forward(work, x, &vae->enc_mid_block1, vae->work3,
                      batch, cur_h, cur_w, vae->num_groups, vae->eps);
+    if (flux_vae_progress_callback)
+        flux_vae_progress_callback(progress++, total_blocks);
     if (attnblock_forward(x, work, &vae->enc_mid_attn, vae->work3,
                           batch, cur_h, cur_w, vae->num_groups, vae->eps) < 0) {
         return NULL;  /* OOM in attention */
     }
+    if (flux_vae_progress_callback)
+        flux_vae_progress_callback(progress++, total_blocks);
     resblock_forward(work, x, &vae->enc_mid_block2, vae->work3,
                      batch, cur_h, cur_w, vae->num_groups, vae->eps);
     flux_copy(x, work, batch * mid_ch * cur_h * cur_w);
+    if (flux_vae_progress_callback)
+        flux_vae_progress_callback(progress++, total_blocks);
 
     /* Output: norm -> swish -> conv */
     flux_group_norm(work, x, vae->enc_norm_out_weight, vae->enc_norm_out_bias,
@@ -457,15 +494,24 @@ flux_image *flux_vae_decode(flux_vae_t *vae, const float *latent,
     flux_copy(x, work, batch * mid_ch * cur_h * cur_w);
 
     /* Mid block: resblock -> attn -> resblock */
+    int progress = 0;
+    int total_blocks = 3 + 4 * (vae->num_res_blocks + 1);  /* mid + up resblocks */
+
     resblock_forward(work, x, &vae->dec_mid_block1, vae->work3,
                      batch, cur_h, cur_w, vae->num_groups, vae->eps);
+    if (flux_vae_progress_callback)
+        flux_vae_progress_callback(progress++, total_blocks);
     if (attnblock_forward(x, work, &vae->dec_mid_attn, vae->work3,
                           batch, cur_h, cur_w, vae->num_groups, vae->eps) < 0) {
         return NULL;  /* OOM in attention */
     }
+    if (flux_vae_progress_callback)
+        flux_vae_progress_callback(progress++, total_blocks);
     resblock_forward(work, x, &vae->dec_mid_block2, vae->work3,
                      batch, cur_h, cur_w, vae->num_groups, vae->eps);
     flux_copy(x, work, batch * mid_ch * cur_h * cur_w);
+    if (flux_vae_progress_callback)
+        flux_vae_progress_callback(progress++, total_blocks);
 
     int block_idx = 0;
     int up_idx = 0;
@@ -480,6 +526,8 @@ flux_image *flux_vae_decode(flux_vae_t *vae, const float *latent,
             resblock_forward(work, x, block, vae->work3,
                              batch, cur_h, cur_w, vae->num_groups, vae->eps);
             flux_copy(x, work, batch * ch_out * cur_h * cur_w);
+            if (flux_vae_progress_callback)
+                flux_vae_progress_callback(progress++, total_blocks);
         }
 
         /* Upsample (except level 0) */

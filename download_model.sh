@@ -1,10 +1,24 @@
 #!/bin/bash
 set -e
 
-BASE="https://huggingface.co/black-forest-labs/FLUX.2-klein-4B/resolve/main"
+# Default: distilled model. Use --base for undistilled base model.
+REPO="FLUX.2-klein-4B"
 OUT="./flux-klein-model"
 
+if [ "$1" = "--base" ]; then
+    REPO="FLUX.2-klein-base-4B"
+    OUT="./flux-klein-base-model"
+    echo "Downloading base (undistilled) model..."
+else
+    echo "Downloading distilled model... (use --base for base model)"
+fi
+
+BASE="https://huggingface.co/black-forest-labs/$REPO/resolve/main"
+
 mkdir -p "$OUT"/{text_encoder,tokenizer,transformer,vae}
+
+# model_index.json (needed for autodetection)
+curl -L -o "$OUT/model_index.json" "$BASE/model_index.json"
 
 # text_encoder (Qwen3 - ~8GB total)
 curl -L -o "$OUT/text_encoder/config.json" "$BASE/text_encoder/config.json"
@@ -30,4 +44,4 @@ curl -L -o "$OUT/transformer/diffusion_pytorch_model.safetensors" "$BASE/transfo
 curl -L -o "$OUT/vae/config.json" "$BASE/vae/config.json"
 curl -L -o "$OUT/vae/diffusion_pytorch_model.safetensors" "$BASE/vae/diffusion_pytorch_model.safetensors"
 
-echo "Done. Total ~16GB"
+echo "Done. Total ~16GB -> $OUT"

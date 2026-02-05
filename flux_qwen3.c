@@ -11,6 +11,7 @@
 
 #include "flux_qwen3.h"
 #include "flux_safetensors.h"
+#include "flux_kernels.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -125,10 +126,12 @@ struct qwen3_model {
 /* Forward declarations for mmap streaming mode */
 static int load_layer_weights(qwen3_layer_t *layer, safetensors_file_t **files,
                               int num_files, int layer_idx);
+#ifdef USE_METAL
 static int load_layer_weights_small_f32(qwen3_layer_t *layer, safetensors_file_t **files,
                                         int num_files, int layer_idx);
 static int load_layer_weights_bf16(qwen3_layer_t *layer, safetensors_file_t **files,
                                    int num_files, int layer_idx);
+#endif
 static void free_layer_weights(qwen3_layer_t *layer);
 
 /* ========================================================================
@@ -866,11 +869,9 @@ float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
             memcpy(model->layer_outputs[2], model->hidden_state, seq_len * hidden * sizeof(float));
         }
 
-        /* Progress indicator */
-        if ((layer_idx + 1) % 6 == 0) {
-            fprintf(stderr, ".");
-            fflush(stderr);
-        }
+        /* Progress callback */
+        if (flux_text_progress_callback)
+            flux_text_progress_callback(layer_idx, model->num_layers);
     }
 
 #ifdef USE_METAL
@@ -918,6 +919,7 @@ static float *load_tensor(safetensors_file_t **files, int num_files, const char 
     return NULL;
 }
 
+#ifdef USE_METAL
 /* Helper to load bf16 tensor directly (zero-copy from mmap region) */
 static uint16_t *load_tensor_bf16(safetensors_file_t **files, int num_files, const char *name) {
     for (int f = 0; f < num_files; f++) {
@@ -952,6 +954,7 @@ static int load_layer_weights_small_f32(qwen3_layer_t *layer, safetensors_file_t
     return (layer->input_layernorm_weight && layer->post_attention_layernorm_weight &&
             layer->attn.q_norm_weight && layer->attn.k_norm_weight) ? 0 : -1;
 }
+#endif
 
 static int load_layer_weights(qwen3_layer_t *layer, safetensors_file_t **files,
                               int num_files, int layer_idx) {
@@ -1008,6 +1011,7 @@ static int load_layer_weights(qwen3_layer_t *layer, safetensors_file_t **files,
     return 0;
 }
 
+#ifdef USE_METAL
 /* Load bf16 weights for a layer (GPU acceleration path).
  * Returns 1 if all bf16 weights loaded successfully, 0 otherwise.
  * bf16 pointers are direct into mmap region - do NOT free them. */
@@ -1051,6 +1055,7 @@ static int load_layer_weights_bf16(qwen3_layer_t *layer, safetensors_file_t **fi
             layer->mlp.gate_proj_weight_bf16 && layer->mlp.up_proj_weight_bf16 &&
             layer->mlp.down_proj_weight_bf16);
 }
+#endif
 
 /* Free a single layer's weights (used in mmap streaming mode) */
 static void free_layer_weights(qwen3_layer_t *layer) {
@@ -1183,7 +1188,8 @@ qwen3_model_t *qwen3_model_load_mmap(const char *model_dir) {
      * Set FLUX_QWEN3_NO_BF16=1 to disable for debugging. */
     model->use_bf16 = (flux_metal_available() && !getenv("FLUX_QWEN3_NO_BF16")) ? 1 : 0;
     if (model->use_bf16) {
-        fprintf(stderr, "Qwen3: bf16 GPU acceleration enabled\n");
+        if (flux_verbose)
+            fprintf(stderr, "Qwen3: bf16 GPU acceleration enabled\n");
     }
 #endif
     model->layers = calloc(model->num_layers, sizeof(qwen3_layer_t));
@@ -1222,7 +1228,8 @@ qwen3_model_t *qwen3_model_load_mmap(const char *model_dir) {
     }
 
     /* DON'T load layer weights - they'll be loaded on-demand in forward pass */
-    fprintf(stderr, "Mmap mode: layer weights will be loaded on-demand\n");
+    if (flux_verbose)
+        fprintf(stderr, "Mmap mode: layer weights will be loaded on-demand\n");
 
     /* Compute RoPE frequencies */
     int max_seq = QWEN3_MAX_SEQ_LEN;

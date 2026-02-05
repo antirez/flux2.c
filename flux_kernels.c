@@ -34,6 +34,9 @@ flux_step_callback_t flux_step_callback = NULL;
 flux_phase_callback_t flux_phase_callback = NULL;
 flux_step_image_callback_t flux_step_image_callback = NULL;
 void *flux_step_image_vae = NULL;
+flux_text_progress_callback_t flux_text_progress_callback = NULL;
+flux_vae_progress_callback_t flux_vae_progress_callback = NULL;
+int flux_verbose = 0;
 
 /* ========================================================================
  * Random Number Generator (xoshiro256**)

@@ -276,4 +276,23 @@ typedef void (*flux_step_image_callback_t)(int step, int total, const struct flu
 extern flux_step_image_callback_t flux_step_image_callback;
 extern void *flux_step_image_vae;  /* Set to flux_vae_t* for step image decoding */
 
+/*
+ * Text encoder progress callback - called once per Qwen3 layer.
+ * layer: current layer (0-based)
+ * total: total number of layers (36)
+ */
+typedef void (*flux_text_progress_callback_t)(int layer, int total);
+extern flux_text_progress_callback_t flux_text_progress_callback;
+
+/*
+ * VAE progress callback - called once per resblock/attention block.
+ * block: current block (0-based)
+ * total: total number of blocks (11 for encoder, 15 for decoder)
+ */
+typedef void (*flux_vae_progress_callback_t)(int block, int total);
+extern flux_vae_progress_callback_t flux_vae_progress_callback;
+
+/* Global verbose flag - when 0, library code suppresses diagnostic output */
+extern int flux_verbose;
+
 #endif /* FLUX_KERNELS_H */

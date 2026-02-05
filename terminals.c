@@ -16,12 +16,22 @@
 #include <unistd.h>
 
 /* ======================================================================
+ * Zoom Setting
+ * ====================================================================== */
+
+static int terminal_zoom = 2;  /* Default: 2x for Retina displays */
+
+void terminal_set_zoom(int zoom) {
+    if (zoom >= 1) terminal_zoom = zoom;
+}
+
+/* ======================================================================
  * Terminal Detection
  * ====================================================================== */
 
 /*
  * Detect terminal graphics capability from environment variables.
- * Checks for Kitty, Ghostty, and iTerm2.
+ * Checks for Kitty, Ghostty, iTerm2, and Konsole.
  */
 term_graphics_proto detect_terminal_graphics(void) {
     /* Kitty: KITTY_WINDOW_ID is set */
@@ -36,6 +46,10 @@ term_graphics_proto detect_terminal_graphics(void) {
     const char *term_program = getenv("TERM_PROGRAM");
     if ((term_program && strcmp(term_program, "iTerm.app") == 0) ||
         getenv("ITERM_SESSION_ID"))
+        return TERM_PROTO_ITERM2;
+
+    /* Konsole: supports iTerm2 inline image protocol */
+    if (getenv("KONSOLE_VERSION"))
         return TERM_PROTO_ITERM2;
 
     return TERM_PROTO_NONE;
@@ -88,8 +102,28 @@ static char *base64_encode(const unsigned char *data, size_t len, size_t *out_le
  * ====================================================================== */
 
 /*
+ * Get PNG dimensions from header (bytes 16-23 contain width and height).
+ * Returns 0 on success, -1 on failure.
+ */
+static int png_get_dimensions(const unsigned char *data, size_t size,
+                              int *width, int *height) {
+    /* PNG signature (8 bytes) + IHDR chunk (length:4 + type:4 + data:13+) */
+    if (size < 24) return -1;
+
+    /* Check PNG signature */
+    static const unsigned char png_sig[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+    if (memcmp(data, png_sig, 8) != 0) return -1;
+
+    /* IHDR chunk starts at byte 8, width at 16, height at 20 (big-endian) */
+    *width = (data[16] << 24) | (data[17] << 16) | (data[18] << 8) | data[19];
+    *height = (data[20] << 24) | (data[21] << 16) | (data[22] << 8) | data[23];
+    return 0;
+}
+
+/*
  * Send data using Kitty graphics protocol in chunks.
  * format: 24=RGB, 32=RGBA, 100=PNG
+ * width/height: image dimensions in pixels
  */
 static int kitty_send_data(const unsigned char *data, size_t size,
                            int format, int width, int height) {
@@ -108,14 +142,19 @@ static int kitty_send_data(const unsigned char *data, size_t size,
         int more = (offset + this_chunk) < b64_len;
 
         if (first) {
-            /* First chunk: a=T (transmit+display), f=format, t=d (direct) */
+            /* First chunk: a=T (transmit+display), f=format, t=d (direct)
+             * Apply zoom factor for HiDPI/Retina display. */
+            int display_w = width * terminal_zoom;
+            int display_h = height * terminal_zoom;
+
             if (format == 100) {
-                /* PNG: no dimensions needed */
-                printf("\033_Ga=T,f=100,t=d,m=%d;", more ? 1 : 0);
+                /* PNG format */
+                printf("\033_Ga=T,f=100,t=d,w=%d,h=%d,m=%d;",
+                       display_w, display_h, more ? 1 : 0);
             } else {
-                /* Raw: include dimensions */
-                printf("\033_Ga=T,f=%d,s=%d,v=%d,m=%d;",
-                       format, width, height, more ? 1 : 0);
+                /* Raw RGB/RGBA: s,v = source dimensions */
+                printf("\033_Ga=T,f=%d,s=%d,v=%d,w=%d,h=%d,m=%d;",
+                       format, width, height, display_w, display_h, more ? 1 : 0);
             }
             first = 0;
         } else {
@@ -162,7 +201,11 @@ int kitty_display_png(const char *path) {
     }
     fclose(f);
 
-    int result = kitty_send_data(png_data, size, 100, 0, 0);
+    /* Get PNG dimensions for correct HiDPI display */
+    int width = 0, height = 0;
+    png_get_dimensions(png_data, size, &width, &height);
+
+    int result = kitty_send_data(png_data, size, 100, width, height);
     free(png_data);
     printf("\n");
     return result;
@@ -188,13 +231,19 @@ int kitty_display_image(const flux_image *img) {
  * See: https://iterm2.com/documentation-images.html
  * ====================================================================== */
 
-static int iterm2_send_png(const unsigned char *png_data, size_t png_size) {
+static int iterm2_send_png(const unsigned char *png_data, size_t png_size,
+                           int width, int height) {
     size_t b64_len;
     char *b64_data = base64_encode(png_data, png_size, &b64_len);
     if (!b64_data) return -1;
 
-    /* iTerm2 protocol: OSC 1337 ; File=inline=1 : <base64> BEL */
-    printf("\033]1337;File=inline=1:");
+    /* iTerm2 protocol: OSC 1337 ; File=inline=1;width=Npx;height=Npx : <base64> BEL
+     * Apply zoom factor for HiDPI/Retina display. */
+    int display_w = width * terminal_zoom;
+    int display_h = height * terminal_zoom;
+
+    printf("\033]1337;File=inline=1;width=%dpx;height=%dpx:",
+           display_w, display_h);
     fwrite(b64_data, 1, b64_len, stdout);
     printf("\a\n");
     fflush(stdout);
@@ -232,7 +281,11 @@ int iterm2_display_png(const char *path) {
     }
     fclose(f);
 
-    int result = iterm2_send_png(png_data, size);
+    /* Get PNG dimensions for correct HiDPI display */
+    int width = 0, height = 0;
+    png_get_dimensions(png_data, size, &width, &height);
+
+    int result = iterm2_send_png(png_data, size, width, height);
     free(png_data);
     return result;
 }
@@ -260,7 +313,7 @@ int iterm2_display_image(const flux_image *img) {
         return -1;
     }
 
-    /* Display the PNG */
+    /* Display the PNG (extracts dimensions and applies zoom) */
     int result = iterm2_display_png(tmppath);
 
     /* Clean up */

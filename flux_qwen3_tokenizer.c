@@ -10,6 +10,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <stdint.h>
+#include "flux_kernels.h"
 
 /* ========================================================================
  * Configuration
@@ -584,8 +585,9 @@ qwen3_tokenizer_t *qwen3_tokenizer_load(const char *tokenizer_json_path) {
 
     free(json);
 
-    fprintf(stderr, " Qwen3 tokenizer loaded (%d vocab)",
-            tok->vocab_size);
+    if (flux_verbose)
+        fprintf(stderr, " Qwen3 tokenizer loaded (%d vocab)\n",
+                tok->vocab_size);
 
     return tok;
 

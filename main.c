@@ -239,16 +239,23 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "Generation options:\n");
     fprintf(stderr, "  -W, --width N         Output width (default: %d)\n", DEFAULT_WIDTH);
     fprintf(stderr, "  -H, --height N        Output height (default: %d)\n", DEFAULT_HEIGHT);
-    fprintf(stderr, "  -s, --steps N         Sampling steps (default: %d)\n", DEFAULT_STEPS);
-    fprintf(stderr, "  -S, --seed N          Random seed (-1 for random)\n\n");
+    fprintf(stderr, "  -s, --steps N         Sampling steps (default: auto, 4 distilled / 50 base)\n");
+    fprintf(stderr, "  -g, --guidance N      CFG guidance scale (default: auto, 1.0 distilled / 4.0 base)\n");
+    fprintf(stderr, "  -S, --seed N          Random seed (-1 for random)\n");
+    fprintf(stderr, "      --linear          Use linear timestep schedule (default: shifted sigmoid)\n");
+    fprintf(stderr, "      --power           Use power curve timestep schedule (default alpha: 2.0)\n");
+    fprintf(stderr, "      --power-alpha N   Set power schedule exponent (default: 2.0)\n\n");
+    fprintf(stderr, "Model options:\n");
+    fprintf(stderr, "      --base            Force base model mode (undistilled, CFG enabled)\n\n");
     fprintf(stderr, "Reference images (img2img / multi-reference):\n");
     fprintf(stderr, "  -i, --input PATH      Reference image (can specify up to %d)\n", MAX_INPUT_IMAGES);
     fprintf(stderr, "                        Multiple -i flags combine images via in-context conditioning\n\n");
     fprintf(stderr, "Output options:\n");
     fprintf(stderr, "  -q, --quiet           Silent mode, no output\n");
     fprintf(stderr, "  -v, --verbose         Detailed output\n");
-    fprintf(stderr, "      --show            Display image in terminal (auto-detects Kitty/Ghostty/iTerm2)\n");
-    fprintf(stderr, "      --show-steps      Display each denoising step (slower)\n\n");
+    fprintf(stderr, "      --show            Display image in terminal (auto-detects Kitty/Ghostty/iTerm2/Konsole)\n");
+    fprintf(stderr, "      --show-steps      Display each denoising step (slower)\n");
+    fprintf(stderr, "      --zoom N          Terminal image zoom factor (default: 2 for Retina)\n\n");
     fprintf(stderr, "Other options:\n");
     fprintf(stderr, "  -e, --embeddings PATH Load pre-computed text embeddings\n");
     fprintf(stderr, "  -m, --mmap            Use memory-mapped weights (default, fastest on MPS)\n");
@@ -281,6 +288,7 @@ int main(int argc, char *argv[]) {
         {"width",      required_argument, 0, 'W'},
         {"height",     required_argument, 0, 'H'},
         {"steps",      required_argument, 0, 's'},
+        {"guidance",   required_argument, 0, 'g'},
         {"seed",       required_argument, 0, 'S'},
         {"input",      required_argument, 0, 'i'},
         {"embeddings", required_argument, 0, 'e'},
@@ -293,6 +301,11 @@ int main(int argc, char *argv[]) {
         {"no-mmap",    no_argument,       0, 'M'},
         {"show",       no_argument,       0, 'k'},
         {"show-steps", no_argument,       0, 'K'},
+        {"zoom",       required_argument, 0, 'z'},
+        {"base",       no_argument,       0, 'B'},
+        {"linear",     no_argument,       0, 'L'},
+        {"power",      no_argument,       0, 256},
+        {"power-alpha",required_argument, 0, 257},
         {"debug-py",   no_argument,       0, 'D'},
         {0, 0, 0, 0}
     };
@@ -309,15 +322,18 @@ int main(int argc, char *argv[]) {
     flux_params params = {
         .width = DEFAULT_WIDTH,
         .height = DEFAULT_HEIGHT,
-        .num_steps = DEFAULT_STEPS,
-        .seed = -1
+        .num_steps = 0,   /* 0 = auto from model type */
+        .seed = -1,
+        .guidance = 0.0f, /* 0 = auto from model type */
+        .power_alpha = 2.0f
     };
 
-    int width_set = 0, height_set = 0;
+    int width_set = 0, height_set = 0, steps_set = 0;
     int use_mmap = 1;  /* mmap is default (fastest on MPS) */
     int show_image = 0;
     int show_steps = 0;
     int debug_py = 0;
+    int force_base = 0;
     term_graphics_proto graphics_proto = detect_terminal_graphics();
 
     int opt;
@@ -329,7 +345,8 @@ int main(int argc, char *argv[]) {
             case 'o': output_path = optarg; break;
             case 'W': params.width = atoi(optarg); width_set = 1; break;
             case 'H': params.height = atoi(optarg); height_set = 1; break;
-            case 's': params.num_steps = atoi(optarg); break;
+            case 's': params.num_steps = atoi(optarg); steps_set = 1; break;
+            case 'g': params.guidance = atof(optarg); break;
             case 'S': params.seed = atoll(optarg); break;
             case 'i':
                 if (num_inputs < MAX_INPUT_IMAGES) {
@@ -341,7 +358,7 @@ int main(int argc, char *argv[]) {
             case 'e': embeddings_path = optarg; break;
             case 'n': noise_path = optarg; break;
             case 'q': output_level = OUTPUT_QUIET; break;
-            case 'v': output_level = OUTPUT_VERBOSE; break;
+            case 'v': output_level = OUTPUT_VERBOSE; flux_verbose = 1; break;
             case 'h': print_usage(argv[0]); return 0;
             case 'V':
                 fprintf(stderr, "FLUX.2 klein 4B v1.0.0\n");
@@ -350,6 +367,11 @@ int main(int argc, char *argv[]) {
             case 'M': use_mmap = 0; break;
             case 'k': show_image = 1; break;
             case 'K': show_steps = 1; break;
+            case 'z': terminal_set_zoom(atoi(optarg)); break;
+            case 'B': force_base = 1; break;
+            case 'L': params.linear_schedule = 1; break;
+            case 256: params.power_schedule = 1; break;
+            case 257: params.power_alpha = atof(optarg); params.power_schedule = 1; break;
             case 'D': debug_py = 1; break;
             default:
                 print_usage(argv[0]);
@@ -389,7 +411,7 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Error: Height must be between 64 and 4096\n");
         return 1;
     }
-    if (params.num_steps < 1 || params.num_steps > FLUX_MAX_STEPS) {
+    if (steps_set && (params.num_steps < 1 || params.num_steps > FLUX_MAX_STEPS)) {
         fprintf(stderr, "Error: Steps must be between 1 and %d\n", FLUX_MAX_STEPS);
         return 1;
     }
@@ -437,9 +459,22 @@ int main(int argc, char *argv[]) {
         LOG_VERBOSE("  Using mmap mode for text encoder (lower memory)\n");
     }
 
+    /* Override model type if --base was specified */
+    if (force_base) {
+        flux_set_base_mode(ctx);
+    }
+
+    /* Resolve auto-parameters now that we know the model type */
+    if (!steps_set || params.num_steps <= 0) {
+        params.num_steps = flux_is_distilled(ctx) ? 4 : 50;
+    }
+    if (params.guidance <= 0) {
+        params.guidance = flux_is_distilled(ctx) ? 1.0f : 4.0f;
+    }
+
     double load_time = timer_end();
     LOG_NORMAL(" done (%.1fs)\n", load_time);
-    LOG_VERBOSE("  Model info: %s\n", flux_model_info(ctx));
+    LOG_NORMAL("Model: %s\n", flux_model_info(ctx));
 
     /* Interactive mode: start REPL */
     if (interactive_mode) {
@@ -456,7 +491,7 @@ int main(int argc, char *argv[]) {
     /* Set up step image callback if requested */
     if (show_steps) {
         if (graphics_proto == TERM_PROTO_NONE) {
-            fprintf(stderr, "Warning: --show-steps requires a supported terminal (Kitty, Ghostty, or iTerm2)\n");
+            fprintf(stderr, "Warning: --show-steps requires a supported terminal (Kitty, Ghostty, iTerm2, or Konsole)\n");
         } else {
             cli_graphics_proto = graphics_proto;
             flux_set_step_image_callback(ctx, cli_step_image_callback);

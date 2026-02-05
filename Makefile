@@ -10,7 +10,7 @@ UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 
 # Source files
-SRCS = flux.c flux_kernels.c flux_tokenizer.c flux_vae.c flux_transformer.c flux_sample.c flux_image.c flux_safetensors.c flux_qwen3.c flux_qwen3_tokenizer.c terminals.c
+SRCS = flux.c flux_kernels.c flux_tokenizer.c flux_vae.c flux_transformer.c flux_sample.c flux_image.c jpeg.c flux_safetensors.c flux_qwen3.c flux_qwen3_tokenizer.c terminals.c
 OBJS = $(SRCS:.c=.o)
 CLI_SRCS = flux_cli.c linenoise.c embcache.c
 CLI_OBJS = $(CLI_SRCS:.c=.o)
