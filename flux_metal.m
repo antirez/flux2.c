@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <pthread.h>
 
 static int bf16_debug_enabled(void) {
@@ -230,18 +231,55 @@ typedef struct {
     const void *cpu_ptr;      /* CPU pointer (key) */
     id<MTLBuffer> gpu_buffer; /* Cached GPU buffer */
     size_t size;              /* Buffer size */
+    uint64_t fingerprint;     /* Content fingerprint (guards pointer reuse) */
 } weight_cache_entry_t;
 
 static weight_cache_entry_t g_weight_cache[WEIGHT_CACHE_SIZE];
 static int g_weight_cache_count = 0;
 static pthread_mutex_t g_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* Lightweight content fingerprint used to detect stale cache hits when
+ * malloc reuses CPU addresses for different weight tensors. */
+static uint64_t weight_fingerprint(const float *weights, size_t size) {
+    const unsigned char *bytes = (const unsigned char *)weights;
+    size_t count = size / sizeof(uint32_t);
+    uint64_t h = 0x9e3779b97f4a7c15ULL ^ (uint64_t)size;
+
+    if (!weights || count == 0) return h;
+
+    size_t samples = count < 64 ? count : 64;
+    size_t stride = count / samples;
+    if (stride == 0) stride = 1;
+
+    for (size_t i = 0; i < samples; i++) {
+        size_t idx = i * stride;
+        if (idx >= count) idx = count - 1;
+        uint32_t bits = 0;
+        memcpy(&bits, bytes + idx * sizeof(uint32_t), sizeof(bits));
+        uint64_t v = (uint64_t)bits | ((uint64_t)idx << 32);
+        h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+    }
+
+    return h;
+}
+
 static id<MTLBuffer> get_cached_weight_buffer(const float *weights, size_t size) {
     pthread_mutex_lock(&g_cache_mutex);
+    uint64_t fp = weight_fingerprint(weights, size);
 
     /* Look for existing entry */
     for (int i = 0; i < g_weight_cache_count; i++) {
         if (g_weight_cache[i].cpu_ptr == weights && g_weight_cache[i].size == size) {
+            if (g_weight_cache[i].fingerprint != fp) {
+                /* Same CPU address reused for different contents: refresh slot. */
+                id<MTLBuffer> new_buf = [g_device newBufferWithBytes:weights
+                                                               length:size
+                                                              options:MTLResourceStorageModeShared];
+                g_weight_cache[i].gpu_buffer = new_buf;
+                g_weight_cache[i].fingerprint = fp;
+                pthread_mutex_unlock(&g_cache_mutex);
+                return new_buf;
+            }
             id<MTLBuffer> buf = g_weight_cache[i].gpu_buffer;
             pthread_mutex_unlock(&g_cache_mutex);
             return buf;
@@ -264,6 +302,7 @@ static id<MTLBuffer> get_cached_weight_buffer(const float *weights, size_t size)
     g_weight_cache[g_weight_cache_count].cpu_ptr = weights;
     g_weight_cache[g_weight_cache_count].gpu_buffer = buf;
     g_weight_cache[g_weight_cache_count].size = size;
+    g_weight_cache[g_weight_cache_count].fingerprint = fp;
     g_weight_cache_count++;
 
     pthread_mutex_unlock(&g_cache_mutex);
@@ -275,6 +314,7 @@ static void clear_weight_cache(void) {
     for (int i = 0; i < g_weight_cache_count; i++) {
         g_weight_cache[i].gpu_buffer = nil;
         g_weight_cache[i].cpu_ptr = NULL;
+        g_weight_cache[i].fingerprint = 0;
     }
     g_weight_cache_count = 0;
     pthread_mutex_unlock(&g_cache_mutex);
