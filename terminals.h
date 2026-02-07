@@ -91,4 +91,24 @@ int terminal_display_png(const char *path, term_graphics_proto proto);
  */
 int terminal_display_image(const flux_image *img, term_graphics_proto proto);
 
+/* ==================================================================
+ * OSC 9.4 Progress Protocol (ConEmu/Windows Terminal)
+ * Format: ESC ] 9 ; 4 ; st ; pr ST
+ * ================================================================== */
+
+/* Remove progress indicator */
+void terminal_progress_remove(void);
+
+/* Set progress value (0-100) */
+void terminal_progress_set(int percent);
+
+/* Set error state in progress */
+void terminal_progress_error(void);
+
+/* Set indeterminate progress state */
+void terminal_progress_indeterminate(void);
+
+/* Set paused state in progress */
+void terminal_progress_paused(void);
+
 #endif /* TERMINALS_H */

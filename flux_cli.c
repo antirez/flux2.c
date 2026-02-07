@@ -319,6 +319,14 @@ static void cli_progress_end(void) {
  * Generation
  * ====================================================================== */
 
+static int cli_current_step = 0;
+
+static void cli_step_callback(int step, int total) {
+    cli_current_step = step;
+    int percent = (step * 100) / total;
+    terminal_progress_set(percent);
+}
+
 static int generate_image(const char *prompt, const char *ref_image,
                           int explicit_width, int explicit_height) {
     flux_params params = FLUX_PARAMS_DEFAULT;
@@ -337,6 +345,11 @@ static int generate_image(const char *prompt, const char *ref_image,
     }
     params.seed = actual_seed;
     printf("Seed: %lld\n", (long long)actual_seed);
+
+    /* Setup progress callback */
+    cli_current_step = 0;
+    flux_step_callback = cli_step_callback;
+    terminal_progress_indeterminate();
 
     /* Start timing */
     struct timespec start_time, end_time;
@@ -417,6 +430,8 @@ static int generate_image(const char *prompt, const char *ref_image,
 
     if (!img) {
         fprintf(stderr, "Error: Generation failed: %s\n", flux_get_error());
+        flux_step_callback = NULL;
+        terminal_progress_remove();
         return -1;
     }
 
@@ -429,6 +444,10 @@ static int generate_image(const char *prompt, const char *ref_image,
     /* Update last image and register as reference */
     snprintf(state.last_image, sizeof(state.last_image), "%s", path);
     int ref_id = ref_add(path);
+
+    /* Cleanup progress */
+    flux_step_callback = NULL;
+    terminal_progress_remove();
 
     printf("Done -> %s (ref $%d) [%.2fs]\n", path, ref_id, elapsed);
     display_image(path);
@@ -454,6 +473,11 @@ static int generate_multiref(const char *prompt, const char **ref_paths, int num
     }
     params.seed = actual_seed;
     printf("Seed: %lld\n", (long long)actual_seed);
+
+    /* Setup progress callback */
+    cli_current_step = 0;
+    flux_step_callback = cli_step_callback;
+    terminal_progress_indeterminate();
 
     /* Start timing */
     struct timespec start_time, end_time;
@@ -506,6 +530,8 @@ static int generate_multiref(const char *prompt, const char **ref_paths, int num
 
     if (!img) {
         fprintf(stderr, "Error: Generation failed: %s\n", flux_get_error());
+        flux_step_callback = NULL;
+        terminal_progress_remove();
         return -1;
     }
 
@@ -518,6 +544,10 @@ static int generate_multiref(const char *prompt, const char **ref_paths, int num
     /* Update last image and register as reference */
     snprintf(state.last_image, sizeof(state.last_image), "%s", path);
     int ref_id = ref_add(path);
+
+    /* Cleanup progress */
+    flux_step_callback = NULL;
+    terminal_progress_remove();
 
     printf("Done -> %s (ref $%d) [%.2fs]\n", path, ref_id, elapsed);
     display_image(path);

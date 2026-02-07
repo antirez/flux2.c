@@ -348,3 +348,36 @@ int terminal_display_image(const flux_image *img, term_graphics_proto proto) {
             return -1;
     }
 }
+
+/* ==================================================================
+ * OSC 9.4 Progress Protocol
+ * Format: ESC ] 9 ; 4 ; state ; value ST
+ * ST (String Terminator) = ESC \ or BEL
+ * ================================================================== */
+
+void terminal_progress_remove(void) {
+    printf("\033]9;4;0\033\\");
+    fflush(stdout);
+}
+
+void terminal_progress_set(int percent) {
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+    printf("\033]9;4;1;%d\033\\", percent);
+    fflush(stdout);
+}
+
+void terminal_progress_error(void) {
+    printf("\033]9;4;2\033\\");
+    fflush(stdout);
+}
+
+void terminal_progress_indeterminate(void) {
+    printf("\033]9;4;3\033\\");
+    fflush(stdout);
+}
+
+void terminal_progress_paused(void) {
+    printf("\033]9;4;4\033\\");
+    fflush(stdout);
+}
