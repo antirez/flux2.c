@@ -14,6 +14,10 @@
 #include "flux.h"
 #include "flux_kernels.h"
 #include "flux_safetensors.h"
+#ifdef USE_CUDA
+#include "flux_cuda.h"
+#include <cuda_runtime.h>
+#endif
 #ifdef USE_METAL
 #include "flux_metal.h"
 #endif
@@ -115,6 +119,15 @@ typedef struct flux_vae {
     int max_h, max_w;
     float *work1, *work2, *work3;
     size_t work_size;
+
+    /* Reusable attention scratch (avoid per-call malloc/free in mid-attention). */
+    float *attn_q_t;
+    float *attn_k_t;
+    float *attn_v_t;
+    float *attn_o_t;
+    float *attn_scores;
+    size_t attn_qkv_capacity;     /* floats per q/k/v/o buffer */
+    size_t attn_scores_capacity;  /* floats in scores buffer */
 } flux_vae_t;
 
 /* Forward declarations */
@@ -175,6 +188,39 @@ static void swish_inplace(float *x, int n) {
     flux_silu(x, n);
 }
 
+static int vae_ensure_attn_scratch(flux_vae_t *vae, int spatial, int ch) {
+    size_t qkv_need = (size_t)spatial * (size_t)ch;
+    size_t scores_need = (size_t)spatial * (size_t)spatial;
+
+    if (qkv_need == 0 || scores_need == 0) return 0;
+
+    if (vae->attn_qkv_capacity < qkv_need) {
+        float *tmp = NULL;
+        tmp = (float *)realloc(vae->attn_q_t, qkv_need * sizeof(float));
+        if (!tmp) return 0;
+        vae->attn_q_t = tmp;
+        tmp = (float *)realloc(vae->attn_k_t, qkv_need * sizeof(float));
+        if (!tmp) return 0;
+        vae->attn_k_t = tmp;
+        tmp = (float *)realloc(vae->attn_v_t, qkv_need * sizeof(float));
+        if (!tmp) return 0;
+        vae->attn_v_t = tmp;
+        tmp = (float *)realloc(vae->attn_o_t, qkv_need * sizeof(float));
+        if (!tmp) return 0;
+        vae->attn_o_t = tmp;
+        vae->attn_qkv_capacity = qkv_need;
+    }
+
+    if (vae->attn_scores_capacity < scores_need) {
+        float *new_scores = (float *)realloc(vae->attn_scores, scores_need * sizeof(float));
+        if (!new_scores) return 0;
+        vae->attn_scores = new_scores;
+        vae->attn_scores_capacity = scores_need;
+    }
+
+    return 1;
+}
+
 /* Apply residual block */
 static void resblock_forward(float *out, const float *x,
                              const vae_resblock_t *block,
@@ -220,7 +266,7 @@ static void resblock_forward(float *out, const float *x,
 
 /* Apply self-attention block */
 /* Returns 0 on success, -1 on OOM */
-static int attnblock_forward(float *out, const float *x,
+static int attnblock_forward(flux_vae_t *vae, float *out, const float *x,
                              const vae_attnblock_t *block,
                              float *work, int batch, int H, int W,
                              int num_groups, float eps) {
@@ -249,22 +295,15 @@ static int attnblock_forward(float *out, const float *x,
 
     float *attn_out = v + batch * ch * spatial;
 
-    /* Allocate attention work buffers once outside the batch loop */
-    float *q_t = (float *)malloc(spatial * ch * sizeof(float));
-    float *k_t = (float *)malloc(spatial * ch * sizeof(float));
-    float *v_t = (float *)malloc(spatial * ch * sizeof(float));
-    float *o_t = (float *)malloc(spatial * ch * sizeof(float));
-    float *scores = (float *)malloc((size_t)spatial * spatial * sizeof(float));
-
-    /* Check for allocation failures */
-    if (!q_t || !k_t || !v_t || !o_t || !scores) {
-        free(q_t);
-        free(k_t);
-        free(v_t);
-        free(o_t);
-        free(scores);
+    if (!vae_ensure_attn_scratch(vae, spatial, ch)) {
         return -1;  /* OOM */
     }
+
+    float *q_t = vae->attn_q_t;
+    float *k_t = vae->attn_k_t;
+    float *v_t = vae->attn_v_t;
+    float *o_t = vae->attn_o_t;
+    float *scores = vae->attn_scores;
 
     for (int b = 0; b < batch; b++) {
         float *qb = q + b * ch * spatial;
@@ -275,20 +314,35 @@ static int attnblock_forward(float *out, const float *x,
         /* Transpose [C, HW] -> [HW, C] */
         for (int c = 0; c < ch; c++) {
             for (int i = 0; i < spatial; i++) {
-                q_t[i * ch + c] = qb[c * spatial + i] * scale;
+                q_t[i * ch + c] = qb[c * spatial + i];
                 k_t[i * ch + c] = kb[c * spatial + i];
                 v_t[i * ch + c] = vb[c * spatial + i];
             }
         }
 
-        /* Q @ K^T using BLAS: [HW, C] @ [C, HW] -> [HW, HW] */
-        flux_matmul_t(scores, q_t, k_t, spatial, ch, spatial);
+        int used_cuda_attention = 0;
+#ifdef USE_CUDA
+        if (!getenv("FLUX_CUDA_NO_VAE_ATTN")) {
+            used_cuda_attention = flux_cuda_attention_single(o_t, q_t, k_t, v_t,
+                                                             spatial, spatial, ch,
+                                                             scale, 0, NULL, 0);
+        }
+#endif
 
-        /* Softmax */
-        flux_softmax(scores, spatial, spatial);
+        if (!used_cuda_attention) {
+            /* Scale Q before BLAS fallback. */
+            int q_elems = spatial * ch;
+            for (int i = 0; i < q_elems; i++) q_t[i] *= scale;
 
-        /* scores @ V using BLAS: [HW, HW] @ [HW, C] -> [HW, C] */
-        flux_matmul(o_t, scores, v_t, spatial, spatial, ch);
+            /* Q @ K^T using BLAS: [HW, C] @ [C, HW] -> [HW, HW] */
+            flux_matmul_t(scores, q_t, k_t, spatial, ch, spatial);
+
+            /* Softmax */
+            flux_softmax(scores, spatial, spatial);
+
+            /* scores @ V using BLAS: [HW, HW] @ [HW, C] -> [HW, C] */
+            flux_matmul(o_t, scores, v_t, spatial, spatial, ch);
+        }
 
         /* Transpose output back [HW, C] -> [C, HW] */
         for (int c = 0; c < ch; c++) {
@@ -297,12 +351,6 @@ static int attnblock_forward(float *out, const float *x,
             }
         }
     }
-
-    free(q_t);
-    free(k_t);
-    free(v_t);
-    free(o_t);
-    free(scores);
 
     /* Project output */
     vae_conv2d(work, attn_out, block->out_weight, block->out_bias,
@@ -382,7 +430,7 @@ float *flux_vae_encode(flux_vae_t *vae, const float *img,
                      batch, cur_h, cur_w, vae->num_groups, vae->eps);
     if (flux_vae_progress_callback)
         flux_vae_progress_callback(progress++, total_blocks);
-    if (attnblock_forward(x, work, &vae->enc_mid_attn, vae->work3,
+    if (attnblock_forward(vae, x, work, &vae->enc_mid_attn, vae->work3,
                           batch, cur_h, cur_w, vae->num_groups, vae->eps) < 0) {
         return NULL;  /* OOM in attention */
     }
@@ -575,7 +623,7 @@ static flux_image *vae_decode_gpu(flux_vae_t *vae, const float *latent,
 
         /* Run attention on CPU (uses existing attnblock_forward) */
         float *cpu_attn_out = cpu_x;
-        if (attnblock_forward(cpu_attn_out, cpu_attn_in, &vae->dec_mid_attn,
+        if (attnblock_forward(vae, cpu_attn_out, cpu_attn_in, &vae->dec_mid_attn,
                                vae->work3, batch, cur_h, cur_w,
                                vae->num_groups, vae->eps) < 0) {
             flux_gpu_tensor_free(x);
@@ -683,6 +731,442 @@ static flux_image *vae_decode_gpu(flux_vae_t *vae, const float *latent,
 
 #endif /* USE_METAL */
 
+#ifdef USE_CUDA
+typedef struct {
+    float *d_col; size_t col_cap;
+    float *d_rows; size_t rows_cap;
+    float *d_bias; size_t bias_cap;
+    float *d_gamma; size_t gamma_cap;
+    float *d_beta; size_t beta_cap;
+    float *d_tmp1; size_t tmp1_cap;
+    float *d_tmp2; size_t tmp2_cap;
+    float *d_q; size_t q_cap;
+    float *d_k; size_t k_cap;
+    float *d_v; size_t v_cap;
+    float *d_attn; size_t attn_cap;
+    float *d_q_rows; size_t q_rows_cap;
+    float *d_k_rows; size_t k_rows_cap;
+    float *d_v_rows; size_t v_rows_cap;
+    float *d_o_rows; size_t o_rows_cap;
+    size_t tile_bytes;
+} vae_cuda_decode_scratch_t;
+
+static void vae_cuda_scratch_free(vae_cuda_decode_scratch_t *s) {
+    if (!s) return;
+    if (s->d_col) cudaFree(s->d_col);
+    if (s->d_rows) cudaFree(s->d_rows);
+    if (s->d_bias) cudaFree(s->d_bias);
+    if (s->d_gamma) cudaFree(s->d_gamma);
+    if (s->d_beta) cudaFree(s->d_beta);
+    if (s->d_tmp1) cudaFree(s->d_tmp1);
+    if (s->d_tmp2) cudaFree(s->d_tmp2);
+    if (s->d_q) cudaFree(s->d_q);
+    if (s->d_k) cudaFree(s->d_k);
+    if (s->d_v) cudaFree(s->d_v);
+    if (s->d_attn) cudaFree(s->d_attn);
+    if (s->d_q_rows) cudaFree(s->d_q_rows);
+    if (s->d_k_rows) cudaFree(s->d_k_rows);
+    if (s->d_v_rows) cudaFree(s->d_v_rows);
+    if (s->d_o_rows) cudaFree(s->d_o_rows);
+    memset(s, 0, sizeof(*s));
+}
+
+static int vae_cuda_ensure_f32(float **ptr, size_t *cap_elems, size_t need_elems) {
+    if (*cap_elems >= need_elems) return 1;
+    if (*ptr) cudaFree(*ptr);
+    *ptr = NULL;
+    *cap_elems = 0;
+    if (cudaMalloc((void **)ptr, need_elems * sizeof(float)) != cudaSuccess) return 0;
+    *cap_elems = need_elems;
+    return 1;
+}
+
+static int vae_cuda_group_norm(float *d_out, const float *d_x,
+                               const float *gamma, const float *beta,
+                               int batch, int channels, int H, int W,
+                               int num_groups, float eps,
+                               vae_cuda_decode_scratch_t *s) {
+    if (!vae_cuda_ensure_f32(&s->d_gamma, &s->gamma_cap, channels)) return 0;
+    if (!vae_cuda_ensure_f32(&s->d_beta, &s->beta_cap, channels)) return 0;
+    if (cudaMemcpy(s->d_gamma, gamma, (size_t)channels * sizeof(float),
+                   cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+    if (cudaMemcpy(s->d_beta, beta, (size_t)channels * sizeof(float),
+                   cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+    return flux_cuda_group_norm_nchw_device(d_out, d_x, s->d_gamma, s->d_beta,
+                                            batch, channels, H, W, num_groups, eps);
+}
+
+static int vae_conv2d_cuda_tiled(float *d_out, const float *d_in,
+                                 const float *weight, const float *bias,
+                                 int in_ch, int out_ch, int H, int W,
+                                 int kH, int kW, int stride, int padding,
+                                 vae_cuda_decode_scratch_t *s) {
+    int outH = (H + 2 * padding - kH) / stride + 1;
+    int outW = (W + 2 * padding - kW) / stride + 1;
+    int K = in_ch * kH * kW;
+    if (outH <= 0 || outW <= 0 || K <= 0) return 0;
+
+    size_t limit = s->tile_bytes ? s->tile_bytes : (size_t)64 * 1024 * 1024;
+    size_t by_col = limit / (sizeof(float) * (size_t)K);
+    size_t by_rows = limit / (sizeof(float) * (size_t)out_ch);
+    size_t tile_pixels_max = by_col < by_rows ? by_col : by_rows;
+    if (tile_pixels_max < (size_t)outW) tile_pixels_max = (size_t)outW;
+    int tile_rows = (int)(tile_pixels_max / (size_t)outW);
+    if (tile_rows < 1) tile_rows = 1;
+    if (tile_rows > outH) tile_rows = outH;
+
+    if (bias) {
+        if (!vae_cuda_ensure_f32(&s->d_bias, &s->bias_cap, out_ch)) return 0;
+        if (cudaMemcpy(s->d_bias, bias, (size_t)out_ch * sizeof(float),
+                       cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+    }
+
+    for (int row = 0; row < outH; row += tile_rows) {
+        int tile_h = tile_rows;
+        if (row + tile_h > outH) tile_h = outH - row;
+        int tile_pixels = tile_h * outW;
+        size_t col_elems = (size_t)tile_pixels * K;
+        size_t row_elems = (size_t)tile_pixels * out_ch;
+
+        if (!vae_cuda_ensure_f32(&s->d_col, &s->col_cap, col_elems)) return 0;
+        if (!vae_cuda_ensure_f32(&s->d_rows, &s->rows_cap, row_elems)) return 0;
+
+        if (!flux_cuda_im2col_nchw_rows_device(s->d_col, d_in,
+                                               in_ch, H, W, kH, kW, stride, padding,
+                                               outH, outW, row, tile_h)) return 0;
+
+        if (!flux_cuda_linear_nobias_device(s->d_rows, s->d_col, weight,
+                                            tile_pixels, K, out_ch)) return 0;
+
+        if (bias && !flux_cuda_add_bias_rows_device(s->d_rows, s->d_bias,
+                                                    tile_pixels, out_ch)) return 0;
+
+        if (!flux_cuda_rows_to_nchw_tile_device(d_out, s->d_rows,
+                                                out_ch, outH, outW, row, tile_h)) return 0;
+    }
+
+    return 1;
+}
+
+static float *vae_resblock_forward_cuda(const float *d_x, const vae_resblock_t *block,
+                                        int batch, int H, int W,
+                                        int num_groups, float eps,
+                                        vae_cuda_decode_scratch_t *s) {
+    int in_ch = block->in_channels;
+    int out_ch = block->out_channels;
+    int spatial = H * W;
+    size_t in_elems = (size_t)batch * in_ch * spatial;
+    size_t out_elems = (size_t)batch * out_ch * spatial;
+
+    if (!vae_cuda_ensure_f32(&s->d_tmp1, &s->tmp1_cap, out_elems > in_elems ? out_elems : in_elems))
+        return NULL;
+    if (!vae_cuda_ensure_f32(&s->d_tmp2, &s->tmp2_cap, out_elems))
+        return NULL;
+
+    float *d_skip = NULL;
+    if (cudaMalloc((void **)&d_skip, out_elems * sizeof(float)) != cudaSuccess) return NULL;
+
+    if (in_ch != out_ch) {
+        if (!vae_conv2d_cuda_tiled(d_skip, d_x, block->skip_weight, block->skip_bias,
+                                   in_ch, out_ch, H, W, 1, 1, 1, 0, s)) {
+            cudaFree(d_skip);
+            return NULL;
+        }
+    } else {
+        if (cudaMemcpy(d_skip, d_x, out_elems * sizeof(float),
+                       cudaMemcpyDeviceToDevice) != cudaSuccess) {
+            cudaFree(d_skip);
+            return NULL;
+        }
+    }
+
+    if (!vae_cuda_group_norm(s->d_tmp1, d_x, block->norm1_weight, block->norm1_bias,
+                             batch, in_ch, H, W, num_groups, eps, s)) {
+        cudaFree(d_skip);
+        return NULL;
+    }
+    if (!flux_cuda_silu_device(s->d_tmp1, (int)in_elems)) {
+        cudaFree(d_skip);
+        return NULL;
+    }
+    if (!vae_conv2d_cuda_tiled(s->d_tmp2, s->d_tmp1, block->conv1_weight, block->conv1_bias,
+                               in_ch, out_ch, H, W, 3, 3, 1, 1, s)) {
+        cudaFree(d_skip);
+        return NULL;
+    }
+    if (!vae_cuda_group_norm(s->d_tmp1, s->d_tmp2, block->norm2_weight, block->norm2_bias,
+                             batch, out_ch, H, W, num_groups, eps, s)) {
+        cudaFree(d_skip);
+        return NULL;
+    }
+    if (!flux_cuda_silu_device(s->d_tmp1, (int)out_elems)) {
+        cudaFree(d_skip);
+        return NULL;
+    }
+    if (!vae_conv2d_cuda_tiled(s->d_tmp2, s->d_tmp1, block->conv2_weight, block->conv2_bias,
+                               out_ch, out_ch, H, W, 3, 3, 1, 1, s)) {
+        cudaFree(d_skip);
+        return NULL;
+    }
+    if (!flux_cuda_add_inplace_device(d_skip, s->d_tmp2, (int)out_elems)) {
+        cudaFree(d_skip);
+        return NULL;
+    }
+
+    return d_skip;
+}
+
+static float *vae_attnblock_forward_cuda(const float *d_x, const vae_attnblock_t *block,
+                                         int batch, int H, int W,
+                                         int num_groups, float eps,
+                                         vae_cuda_decode_scratch_t *s) {
+    if (batch != 1) return NULL;  /* Current CUDA attention path handles batch=1 decode. */
+
+    int ch = block->channels;
+    int spatial = H * W;
+    size_t n = (size_t)ch * spatial;
+
+    if (!vae_cuda_ensure_f32(&s->d_tmp1, &s->tmp1_cap, n)) return NULL;
+    if (!vae_cuda_ensure_f32(&s->d_tmp2, &s->tmp2_cap, n)) return NULL;
+    if (!vae_cuda_ensure_f32(&s->d_q, &s->q_cap, n)) return NULL;
+    if (!vae_cuda_ensure_f32(&s->d_k, &s->k_cap, n)) return NULL;
+    if (!vae_cuda_ensure_f32(&s->d_v, &s->v_cap, n)) return NULL;
+    if (!vae_cuda_ensure_f32(&s->d_attn, &s->attn_cap, n)) return NULL;
+
+    size_t rows_elems = (size_t)spatial * ch;
+    if (!vae_cuda_ensure_f32(&s->d_q_rows, &s->q_rows_cap, rows_elems)) return NULL;
+    if (!vae_cuda_ensure_f32(&s->d_k_rows, &s->k_rows_cap, rows_elems)) return NULL;
+    if (!vae_cuda_ensure_f32(&s->d_v_rows, &s->v_rows_cap, rows_elems)) return NULL;
+    if (!vae_cuda_ensure_f32(&s->d_o_rows, &s->o_rows_cap, rows_elems)) return NULL;
+
+    if (!vae_cuda_group_norm(s->d_tmp1, d_x, block->norm_weight, block->norm_bias,
+                             batch, ch, H, W, num_groups, eps, s)) return NULL;
+
+    if (!vae_conv2d_cuda_tiled(s->d_q, s->d_tmp1, block->q_weight, block->q_bias,
+                               ch, ch, H, W, 1, 1, 1, 0, s)) return NULL;
+    if (!vae_conv2d_cuda_tiled(s->d_k, s->d_tmp1, block->k_weight, block->k_bias,
+                               ch, ch, H, W, 1, 1, 1, 0, s)) return NULL;
+    if (!vae_conv2d_cuda_tiled(s->d_v, s->d_tmp1, block->v_weight, block->v_bias,
+                               ch, ch, H, W, 1, 1, 1, 0, s)) return NULL;
+
+    if (!flux_cuda_nchw_to_rows_device(s->d_q_rows, s->d_q, ch, H, W)) return NULL;
+    if (!flux_cuda_nchw_to_rows_device(s->d_k_rows, s->d_k, ch, H, W)) return NULL;
+    if (!flux_cuda_nchw_to_rows_device(s->d_v_rows, s->d_v, ch, H, W)) return NULL;
+
+    float scale = 1.0f / sqrtf((float)ch);
+    if (!flux_cuda_attention_batched_shd_device(s->d_o_rows, s->d_q_rows, s->d_k_rows, s->d_v_rows,
+                                                1, spatial, spatial, ch, scale, 0, NULL)) {
+        return NULL;
+    }
+    if (!flux_cuda_rows_to_nchw_device(s->d_attn, s->d_o_rows, ch, H, W)) return NULL;
+
+    if (!vae_conv2d_cuda_tiled(s->d_tmp2, s->d_attn, block->out_weight, block->out_bias,
+                               ch, ch, H, W, 1, 1, 1, 0, s)) return NULL;
+
+    float *d_out = NULL;
+    if (cudaMalloc((void **)&d_out, n * sizeof(float)) != cudaSuccess) return NULL;
+    if (cudaMemcpy(d_out, d_x, n * sizeof(float), cudaMemcpyDeviceToDevice) != cudaSuccess) {
+        cudaFree(d_out);
+        return NULL;
+    }
+    if (!flux_cuda_add_inplace_device(d_out, s->d_tmp2, (int)n)) {
+        cudaFree(d_out);
+        return NULL;
+    }
+
+    return d_out;
+}
+
+static flux_image *vae_decode_cuda(flux_vae_t *vae, const float *latent,
+                                   int batch, int latent_h, int latent_w) {
+    if (!latent || !vae) return NULL;
+    if (batch != 1) return NULL;
+
+    int ch_mult[4] = {1, 2, 4, 4};
+    int z_spatial = latent_h * latent_w;
+    float *cpu_x = vae->work1;
+    float *cpu_work = vae->work2;
+
+    /* CPU pre-processing: denorm + unpatchify (small tensors). */
+    flux_copy(cpu_x, latent, batch * FLUX_LATENT_CHANNELS * z_spatial);
+    for (int b = 0; b < batch; b++) {
+        for (int c = 0; c < FLUX_LATENT_CHANNELS; c++) {
+            float mean = vae->bn_mean[c];
+            float std = sqrtf(vae->bn_var[c] + vae->eps);
+            for (int i = 0; i < z_spatial; i++) {
+                int idx = b * FLUX_LATENT_CHANNELS * z_spatial + c * z_spatial + i;
+                cpu_x[idx] = cpu_x[idx] * std + mean;
+            }
+        }
+    }
+
+    int cur_h = latent_h * 2;
+    int cur_w = latent_w * 2;
+    flux_unpatchify(cpu_work, cpu_x, batch, vae->z_channels, latent_h, latent_w, 2);
+    flux_copy(cpu_x, cpu_work, batch * vae->z_channels * cur_h * cur_w);
+
+    float *d_x = NULL;
+    size_t x_elems = (size_t)batch * vae->z_channels * cur_h * cur_w;
+    if (cudaMalloc((void **)&d_x, x_elems * sizeof(float)) != cudaSuccess) return NULL;
+    if (cudaMemcpy(d_x, cpu_x, x_elems * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaFree(d_x);
+        return NULL;
+    }
+
+    vae_cuda_decode_scratch_t s;
+    memset(&s, 0, sizeof(s));
+    s.tile_bytes = (size_t)64 * 1024 * 1024;
+    const char *tile_env = getenv("FLUX_CUDA_CONV_TILE_MB");
+    if (tile_env) {
+        long mb = strtol(tile_env, NULL, 10);
+        if (mb >= 4) s.tile_bytes = (size_t)mb * 1024 * 1024;
+    }
+
+    int progress = 0;
+    int total_blocks = 3 + 4 * (vae->num_res_blocks + 1);
+    float *d_next = NULL;
+
+#define CUDA_DECODE_FAIL do { if (d_x) cudaFree(d_x); if (d_next) cudaFree(d_next); vae_cuda_scratch_free(&s); return NULL; } while (0)
+
+    /* Post-quantization conv (1x1): 32 -> 32 */
+    x_elems = (size_t)batch * vae->z_channels * cur_h * cur_w;
+    if (cudaMalloc((void **)&d_next, x_elems * sizeof(float)) != cudaSuccess) CUDA_DECODE_FAIL;
+    if (!vae_conv2d_cuda_tiled(d_next, d_x, vae->post_quant_conv_weight, vae->post_quant_conv_bias,
+                               vae->z_channels, vae->z_channels, cur_h, cur_w, 1, 1, 1, 0, &s))
+        CUDA_DECODE_FAIL;
+    cudaFree(d_x);
+    d_x = d_next;
+    d_next = NULL;
+
+    /* Conv in: 32 -> 512 */
+    int mid_ch = vae->base_channels * ch_mult[3];
+    x_elems = (size_t)batch * mid_ch * cur_h * cur_w;
+    if (cudaMalloc((void **)&d_next, x_elems * sizeof(float)) != cudaSuccess) CUDA_DECODE_FAIL;
+    if (!vae_conv2d_cuda_tiled(d_next, d_x, vae->dec_conv_in_weight, vae->dec_conv_in_bias,
+                               vae->z_channels, mid_ch, cur_h, cur_w, 3, 3, 1, 1, &s))
+        CUDA_DECODE_FAIL;
+    cudaFree(d_x);
+    d_x = d_next;
+    d_next = NULL;
+
+    /* Mid block: resblock -> attn -> resblock */
+    d_next = vae_resblock_forward_cuda(d_x, &vae->dec_mid_block1, batch, cur_h, cur_w,
+                                       vae->num_groups, vae->eps, &s);
+    if (!d_next) CUDA_DECODE_FAIL;
+    cudaFree(d_x);
+    d_x = d_next;
+    d_next = NULL;
+    if (flux_vae_progress_callback) flux_vae_progress_callback(progress++, total_blocks);
+
+    d_next = vae_attnblock_forward_cuda(d_x, &vae->dec_mid_attn, batch, cur_h, cur_w,
+                                        vae->num_groups, vae->eps, &s);
+    if (!d_next) CUDA_DECODE_FAIL;
+    cudaFree(d_x);
+    d_x = d_next;
+    d_next = NULL;
+    if (flux_vae_progress_callback) flux_vae_progress_callback(progress++, total_blocks);
+
+    d_next = vae_resblock_forward_cuda(d_x, &vae->dec_mid_block2, batch, cur_h, cur_w,
+                                       vae->num_groups, vae->eps, &s);
+    if (!d_next) CUDA_DECODE_FAIL;
+    cudaFree(d_x);
+    d_x = d_next;
+    d_next = NULL;
+    if (flux_vae_progress_callback) flux_vae_progress_callback(progress++, total_blocks);
+
+    int block_idx = 0;
+    int up_idx = 0;
+    for (int level = 3; level >= 0; level--) {
+        int ch_out = vae->base_channels * ch_mult[level];
+
+        for (int r = 0; r < vae->num_res_blocks + 1; r++) {
+            vae_resblock_t *block = &vae->dec_up_blocks[block_idx++];
+            d_next = vae_resblock_forward_cuda(d_x, block, batch, cur_h, cur_w,
+                                               vae->num_groups, vae->eps, &s);
+            if (!d_next) CUDA_DECODE_FAIL;
+            cudaFree(d_x);
+            d_x = d_next;
+            d_next = NULL;
+            if (flux_vae_progress_callback) flux_vae_progress_callback(progress++, total_blocks);
+        }
+
+        if (level > 0) {
+            vae_upsample_t *us = &vae->dec_upsample[up_idx++];
+            int new_h = cur_h * 2;
+            int new_w = cur_w * 2;
+
+            size_t up_elems = (size_t)batch * ch_out * new_h * new_w;
+            if (cudaMalloc((void **)&d_next, up_elems * sizeof(float)) != cudaSuccess) CUDA_DECODE_FAIL;
+            if (!flux_cuda_upsample_nearest2x_nchw_device(d_next, d_x, ch_out, cur_h, cur_w))
+                CUDA_DECODE_FAIL;
+            cudaFree(d_x);
+            d_x = d_next;
+            d_next = NULL;
+
+            if (cudaMalloc((void **)&d_next, up_elems * sizeof(float)) != cudaSuccess) CUDA_DECODE_FAIL;
+            if (!vae_conv2d_cuda_tiled(d_next, d_x, us->conv_weight, us->conv_bias,
+                                       ch_out, ch_out, new_h, new_w, 3, 3, 1, 1, &s))
+                CUDA_DECODE_FAIL;
+            cudaFree(d_x);
+            d_x = d_next;
+            d_next = NULL;
+
+            cur_h = new_h;
+            cur_w = new_w;
+        }
+    }
+
+    /* Output: norm -> swish -> conv_out */
+    size_t final_elems = (size_t)batch * vae->base_channels * cur_h * cur_w;
+    if (!vae_cuda_ensure_f32(&s.d_tmp1, &s.tmp1_cap, final_elems)) CUDA_DECODE_FAIL;
+    if (!vae_cuda_group_norm(s.d_tmp1, d_x, vae->dec_norm_out_weight, vae->dec_norm_out_bias,
+                             batch, vae->base_channels, cur_h, cur_w,
+                             vae->num_groups, vae->eps, &s)) CUDA_DECODE_FAIL;
+    if (!flux_cuda_silu_device(s.d_tmp1, (int)final_elems)) CUDA_DECODE_FAIL;
+
+    size_t rgb_elems = (size_t)batch * 3 * cur_h * cur_w;
+    if (cudaMalloc((void **)&d_next, rgb_elems * sizeof(float)) != cudaSuccess) CUDA_DECODE_FAIL;
+    if (!vae_conv2d_cuda_tiled(d_next, s.d_tmp1, vae->dec_conv_out_weight, vae->dec_conv_out_bias,
+                               vae->base_channels, 3, cur_h, cur_w, 3, 3, 1, 1, &s))
+        CUDA_DECODE_FAIL;
+    cudaFree(d_x);
+    d_x = d_next;
+    d_next = NULL;
+
+    float *rgb = (float *)malloc(rgb_elems * sizeof(float));
+    if (!rgb) CUDA_DECODE_FAIL;
+    if (cudaMemcpy(rgb, d_x, rgb_elems * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        free(rgb);
+        CUDA_DECODE_FAIL;
+    }
+
+    flux_image *img = flux_image_create(cur_w, cur_h, 3);
+    if (!img) {
+        free(rgb);
+        CUDA_DECODE_FAIL;
+    }
+
+    for (int y = 0; y < cur_h; y++) {
+        for (int x = 0; x < cur_w; x++) {
+            for (int c = 0; c < 3; c++) {
+                float val = rgb[c * cur_h * cur_w + y * cur_w + x];
+                val = (val + 1.0f) * 0.5f * 255.0f;
+                if (val < 0.0f) val = 0.0f;
+                if (val > 255.0f) val = 255.0f;
+                img->data[(y * cur_w + x) * 3 + c] = (unsigned char)(val + 0.5f);
+            }
+        }
+    }
+
+    free(rgb);
+    cudaFree(d_x);
+    vae_cuda_scratch_free(&s);
+    return img;
+
+#undef CUDA_DECODE_FAIL
+}
+#endif /* USE_CUDA */
+
 /* ========================================================================
  * Decoder Forward Pass
  * ======================================================================== */
@@ -693,6 +1177,14 @@ flux_image *flux_vae_decode(flux_vae_t *vae, const float *latent,
     /* Try GPU-resident path first (eliminates CPU<->GPU round-trips per conv) */
     if (flux_metal_available()) {
         flux_image *gpu_result = vae_decode_gpu(vae, latent, batch, latent_h, latent_w);
+        if (gpu_result) return gpu_result;
+        /* Fall through to CPU path on failure */
+    }
+#endif
+
+#ifdef USE_CUDA
+    if (!getenv("FLUX_CUDA_NO_VAE_RESIDENT")) {
+        flux_image *gpu_result = vae_decode_cuda(vae, latent, batch, latent_h, latent_w);
         if (gpu_result) return gpu_result;
         /* Fall through to CPU path on failure */
     }
@@ -754,7 +1246,7 @@ flux_image *flux_vae_decode(flux_vae_t *vae, const float *latent,
                      batch, cur_h, cur_w, vae->num_groups, vae->eps);
     if (flux_vae_progress_callback)
         flux_vae_progress_callback(progress++, total_blocks);
-    if (attnblock_forward(x, work, &vae->dec_mid_attn, vae->work3,
+    if (attnblock_forward(vae, x, work, &vae->dec_mid_attn, vae->work3,
                           batch, cur_h, cur_w, vae->num_groups, vae->eps) < 0) {
         return NULL;  /* OOM in attention */
     }
@@ -1098,6 +1590,11 @@ void flux_vae_free(flux_vae_t *vae) {
     free(vae->work1);
     free(vae->work2);
     free(vae->work3);
+    free(vae->attn_q_t);
+    free(vae->attn_k_t);
+    free(vae->attn_v_t);
+    free(vae->attn_o_t);
+    free(vae->attn_scores);
 
     free(vae);
 }

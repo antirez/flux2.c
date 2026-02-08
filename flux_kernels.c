@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <errno.h>
 
 /* Use Metal for GPU acceleration on Apple Silicon */
 #ifdef USE_METAL
@@ -25,10 +26,796 @@
 #endif
 #endif
 
-/* Minimum matrix size to use GPU (smaller matrices are faster on CPU) */
+#ifdef USE_CUDA
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
+#endif
+
+/* Minimum matrix size to use Metal GPU (smaller matrices are faster on CPU) */
 #define MIN_GPU_ELEMENTS (512 * 512)
 
-/* fast_expf is defined in flux_kernels.h */
+#ifdef USE_CUDA
+/* Default minimum GEMM op-count (M*K*N) to dispatch to CUDA.
+ * Tunable with FLUX_CUDA_MIN_OPS env var.
+ * Lowered after CUDA-attention batching benchmarks (2M was consistently faster
+ * than 8M-20M on FLUX.2-klein 256x256 runs). */
+#define MIN_CUDA_OPS_DEFAULT ((size_t)2 * 1024 * 1024)
+#define CUDA_WEIGHT_CACHE_DEFAULT_MB 1024ULL
+#define CUDA_WEIGHT_CACHE_MAX_ENTRIES 256
+#define CUDA_WEIGHT_CACHE_MIN_BYTES ((size_t)1 * 1024 * 1024)
+
+static cublasHandle_t g_cuda_handle = NULL;
+static cudaStream_t g_cuda_stream = NULL;
+static float *g_cuda_a = NULL;
+static float *g_cuda_b = NULL;
+static float *g_cuda_c = NULL;
+static uint16_t *g_cuda_b_bf16 = NULL;
+static size_t g_cuda_a_bytes = 0;
+static size_t g_cuda_b_bytes = 0;
+static size_t g_cuda_c_bytes = 0;
+static size_t g_cuda_b_bf16_bytes = 0;
+static int g_cuda_available = -1;
+static int g_cuda_warned = 0;
+static size_t g_cuda_min_ops = 0;
+static int g_cuda_bf16_linear_ok = -1;
+static int g_cuda_tf32_mode = -1;
+static int g_cuda_weight_cache_configured = 0;
+static size_t g_cuda_weight_cache_limit_bytes = 0;
+static size_t g_cuda_weight_cache_used_bytes = 0;
+static uint64_t g_cuda_weight_cache_tick = 1;
+
+typedef struct {
+    const void *host_ptr;
+    void *device_ptr;
+    size_t bytes;
+    int k;
+    int n;
+    int transpose_b;
+    int data_type;                 /* 0=f32, 1=bf16 */
+    uint64_t fingerprint;
+    uint64_t last_use;
+} cuda_weight_cache_entry_t;
+
+static cuda_weight_cache_entry_t g_cuda_weight_cache[CUDA_WEIGHT_CACHE_MAX_ENTRIES];
+
+static void flux_cuda_warn_once(const char *msg) {
+    if (!g_cuda_warned) {
+        fprintf(stderr, "%s\n", msg);
+        g_cuda_warned = 1;
+    }
+}
+
+static size_t flux_cuda_get_min_ops(void) {
+    if (g_cuda_min_ops != 0) {
+        return g_cuda_min_ops;
+    }
+
+    g_cuda_min_ops = MIN_CUDA_OPS_DEFAULT;
+    const char *env = getenv("FLUX_CUDA_MIN_OPS");
+    if (!env || !*env) {
+        return g_cuda_min_ops;
+    }
+
+    errno = 0;
+    char *end = NULL;
+    unsigned long long parsed = strtoull(env, &end, 10);
+    if (errno == 0 && end && *end == '\0' && parsed > 0ULL) {
+        g_cuda_min_ops = (size_t)parsed;
+    } else {
+        flux_cuda_warn_once("CUDA: invalid FLUX_CUDA_MIN_OPS value, using default threshold");
+    }
+
+    return g_cuda_min_ops;
+}
+
+static int flux_cuda_tf32_enabled(void) {
+    if (g_cuda_tf32_mode != -1) {
+        return g_cuda_tf32_mode;
+    }
+    g_cuda_tf32_mode = getenv("FLUX_CUDA_NO_TF32") ? 0 : 1;
+    return g_cuda_tf32_mode;
+}
+
+static uint64_t flux_cuda_weight_fingerprint(const void *data, size_t bytes) {
+    if (!data || bytes == 0) {
+        return 0;
+    }
+
+    const uint8_t *p = (const uint8_t *)data;
+    uint64_t h = 1469598103934665603ULL ^ (uint64_t)bytes;
+    const int samples = 16;
+
+    for (int i = 0; i < samples; i++) {
+        size_t idx = (size_t)i * (bytes - 1) / (size_t)(samples - 1);
+        h ^= (uint64_t)p[idx];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static uint64_t flux_cuda_next_cache_tick(void) {
+    g_cuda_weight_cache_tick++;
+    if (g_cuda_weight_cache_tick == 0) {
+        g_cuda_weight_cache_tick = 1;
+    }
+    return g_cuda_weight_cache_tick;
+}
+
+static void flux_cuda_weight_cache_clear_entry(int idx) {
+    cuda_weight_cache_entry_t *e = &g_cuda_weight_cache[idx];
+    if (e->device_ptr) {
+        cudaFree(e->device_ptr);
+    }
+    if (g_cuda_weight_cache_used_bytes >= e->bytes) {
+        g_cuda_weight_cache_used_bytes -= e->bytes;
+    } else {
+        g_cuda_weight_cache_used_bytes = 0;
+    }
+    memset(e, 0, sizeof(*e));
+}
+
+static void flux_cuda_weight_cache_clear_all(void) {
+    for (int i = 0; i < CUDA_WEIGHT_CACHE_MAX_ENTRIES; i++) {
+        flux_cuda_weight_cache_clear_entry(i);
+    }
+    g_cuda_weight_cache_used_bytes = 0;
+}
+
+static int flux_cuda_weight_cache_find_lru(void) {
+    int lru_idx = -1;
+    uint64_t oldest = UINT64_MAX;
+
+    for (int i = 0; i < CUDA_WEIGHT_CACHE_MAX_ENTRIES; i++) {
+        cuda_weight_cache_entry_t *e = &g_cuda_weight_cache[i];
+        if (!e->device_ptr) continue;
+        if (e->last_use < oldest) {
+            oldest = e->last_use;
+            lru_idx = i;
+        }
+    }
+
+    return lru_idx;
+}
+
+static int flux_cuda_weight_cache_ensure_space(size_t need_bytes) {
+    if (need_bytes > g_cuda_weight_cache_limit_bytes) {
+        return 0;
+    }
+
+    while (g_cuda_weight_cache_used_bytes + need_bytes > g_cuda_weight_cache_limit_bytes) {
+        int lru_idx = flux_cuda_weight_cache_find_lru();
+        if (lru_idx < 0) {
+            return 0;
+        }
+        flux_cuda_weight_cache_clear_entry(lru_idx);
+    }
+
+    return 1;
+}
+
+static int flux_cuda_weight_cache_find(const void *host_ptr,
+                                       int k, int n, int transpose_b,
+                                       int data_type, uint64_t fingerprint) {
+    for (int i = 0; i < CUDA_WEIGHT_CACHE_MAX_ENTRIES; i++) {
+        cuda_weight_cache_entry_t *e = &g_cuda_weight_cache[i];
+        if (!e->device_ptr) continue;
+        if (e->host_ptr == host_ptr &&
+            e->k == k &&
+            e->n == n &&
+            e->transpose_b == transpose_b &&
+            e->data_type == data_type) {
+            if (e->fingerprint == fingerprint) {
+                e->last_use = flux_cuda_next_cache_tick();
+                return i;
+            }
+            /* Same address reused for different content. Evict stale entry. */
+            flux_cuda_weight_cache_clear_entry(i);
+            return -1;
+        }
+    }
+    return -1;
+}
+
+static int flux_cuda_weight_cache_select_slot(void) {
+    for (int i = 0; i < CUDA_WEIGHT_CACHE_MAX_ENTRIES; i++) {
+        if (!g_cuda_weight_cache[i].device_ptr) {
+            return i;
+        }
+    }
+
+    int lru_idx = flux_cuda_weight_cache_find_lru();
+    if (lru_idx >= 0) {
+        flux_cuda_weight_cache_clear_entry(lru_idx);
+    }
+    return lru_idx;
+}
+
+static void *flux_cuda_weight_cache_insert(const void *host_ptr,
+                                            int k, int n, int transpose_b, int data_type,
+                                            uint64_t fingerprint,
+                                            size_t bytes) {
+    if (bytes > g_cuda_weight_cache_limit_bytes || g_cuda_weight_cache_limit_bytes == 0) {
+        return NULL;
+    }
+
+    if (!flux_cuda_weight_cache_ensure_space(bytes)) {
+        return NULL;
+    }
+
+    int slot = flux_cuda_weight_cache_select_slot();
+    if (slot < 0) {
+        return NULL;
+    }
+
+    void *device_ptr = NULL;
+    if (cudaMalloc(&device_ptr, bytes) != cudaSuccess) {
+        return NULL;
+    }
+    if (cudaMemcpy(device_ptr, host_ptr, bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaFree(device_ptr);
+        return NULL;
+    }
+
+    cuda_weight_cache_entry_t *e = &g_cuda_weight_cache[slot];
+    e->host_ptr = host_ptr;
+    e->device_ptr = device_ptr;
+    e->bytes = bytes;
+    e->k = k;
+    e->n = n;
+    e->transpose_b = transpose_b;
+    e->data_type = data_type;
+    e->fingerprint = fingerprint;
+    e->last_use = flux_cuda_next_cache_tick();
+    g_cuda_weight_cache_used_bytes += bytes;
+    return device_ptr;
+}
+
+static void flux_cuda_weight_cache_configure(void) {
+    if (g_cuda_weight_cache_configured) {
+        return;
+    }
+    g_cuda_weight_cache_configured = 1;
+
+    size_t limit_bytes = (size_t)(CUDA_WEIGHT_CACHE_DEFAULT_MB * 1024ULL * 1024ULL);
+    const char *env = getenv("FLUX_CUDA_WEIGHT_CACHE_MB");
+
+    if (env && *env) {
+        errno = 0;
+        char *end = NULL;
+        unsigned long long parsed = strtoull(env, &end, 10);
+        if (errno == 0 && end && *end == '\0') {
+            if (parsed == 0ULL) {
+                g_cuda_weight_cache_limit_bytes = 0;
+                return;
+            }
+            if (parsed > (unsigned long long)(SIZE_MAX / (1024ULL * 1024ULL))) {
+                limit_bytes = SIZE_MAX;
+            } else {
+                limit_bytes = (size_t)parsed * 1024ULL * 1024ULL;
+            }
+        } else {
+            flux_cuda_warn_once("CUDA: invalid FLUX_CUDA_WEIGHT_CACHE_MB value, using default cache size");
+        }
+    } else {
+        size_t free_mem = 0, total_mem = 0;
+        if (cudaMemGetInfo(&free_mem, &total_mem) == cudaSuccess && free_mem > 0) {
+            size_t auto_limit = free_mem / 4;   /* Keep cache under 25% of currently free VRAM. */
+            size_t max_default = (size_t)(CUDA_WEIGHT_CACHE_DEFAULT_MB * 1024ULL * 1024ULL);
+            if (auto_limit < CUDA_WEIGHT_CACHE_MIN_BYTES) auto_limit = CUDA_WEIGHT_CACHE_MIN_BYTES;
+            if (auto_limit < max_default) limit_bytes = auto_limit;
+        }
+    }
+
+    g_cuda_weight_cache_limit_bytes = limit_bytes;
+}
+
+static void flux_cuda_cleanup_impl(void) {
+    flux_cuda_weight_cache_clear_all();
+
+    if (g_cuda_a) cudaFree(g_cuda_a);
+    if (g_cuda_b) cudaFree(g_cuda_b);
+    if (g_cuda_c) cudaFree(g_cuda_c);
+    if (g_cuda_b_bf16) cudaFree(g_cuda_b_bf16);
+    g_cuda_a = g_cuda_b = g_cuda_c = NULL;
+    g_cuda_b_bf16 = NULL;
+    g_cuda_a_bytes = g_cuda_b_bytes = g_cuda_c_bytes = 0;
+    g_cuda_b_bf16_bytes = 0;
+
+    if (g_cuda_handle) {
+        cublasDestroy(g_cuda_handle);
+        g_cuda_handle = NULL;
+    }
+}
+
+static int flux_cuda_ensure_initialized(void) {
+    if (g_cuda_available != -1) {
+        return g_cuda_available;
+    }
+
+    g_cuda_available = 0;
+
+    int device_count = 0;
+    cudaError_t cuda_err = cudaGetDeviceCount(&device_count);
+    if (cuda_err != cudaSuccess || device_count <= 0) {
+        return 0;
+    }
+
+    if (cublasCreate(&g_cuda_handle) != CUBLAS_STATUS_SUCCESS) {
+        flux_cuda_warn_once("CUDA: failed to initialize cuBLAS, falling back to CPU/BLAS");
+        flux_cuda_cleanup_impl();
+        return 0;
+    }
+
+    if (cublasSetPointerMode(g_cuda_handle, CUBLAS_POINTER_MODE_HOST) != CUBLAS_STATUS_SUCCESS) {
+        flux_cuda_warn_once("CUDA: failed to configure cuBLAS pointer mode, falling back to CPU/BLAS");
+        flux_cuda_cleanup_impl();
+        return 0;
+    }
+    if (cublasSetStream(g_cuda_handle, g_cuda_stream) != CUBLAS_STATUS_SUCCESS) {
+        flux_cuda_warn_once("CUDA: failed to configure cuBLAS stream, falling back to CPU/BLAS");
+        flux_cuda_cleanup_impl();
+        return 0;
+    }
+
+    flux_cuda_weight_cache_configure();
+    atexit(flux_cuda_cleanup_impl);
+    g_cuda_available = 1;
+    return 1;
+}
+
+static int flux_cuda_ensure_buffer(float **buffer, size_t *capacity_bytes, size_t needed_bytes) {
+    if (*capacity_bytes >= needed_bytes) {
+        return 1;
+    }
+
+    size_t new_capacity = needed_bytes;
+    if (*capacity_bytes > 0) {
+        new_capacity = *capacity_bytes;
+        while (new_capacity < needed_bytes) {
+            new_capacity *= 2;
+        }
+    }
+
+    float *new_buffer = NULL;
+    if (cudaMalloc((void **)&new_buffer, new_capacity) != cudaSuccess) {
+        flux_cuda_warn_once("CUDA: device allocation failed, falling back to CPU/BLAS");
+        return 0;
+    }
+
+    if (*buffer) {
+        cudaFree(*buffer);
+    }
+    *buffer = new_buffer;
+    *capacity_bytes = new_capacity;
+    return 1;
+}
+
+int flux_cuda_linear_set_stream(void *stream_handle) {
+#ifdef USE_CUDA
+    g_cuda_stream = (cudaStream_t)stream_handle;
+    if (!flux_cuda_ensure_initialized()) return 0;
+    return cublasSetStream(g_cuda_handle, g_cuda_stream) == CUBLAS_STATUS_SUCCESS;
+#else
+    (void)stream_handle;
+    return 0;
+#endif
+}
+
+static int flux_cuda_ensure_buffer_bf16(uint16_t **buffer,
+                                        size_t *capacity_bytes,
+                                        size_t needed_bytes) {
+    if (*capacity_bytes >= needed_bytes) {
+        return 1;
+    }
+
+    size_t new_capacity = needed_bytes;
+    if (*capacity_bytes > 0) {
+        new_capacity = *capacity_bytes;
+        while (new_capacity < needed_bytes) {
+            new_capacity *= 2;
+        }
+    }
+
+    uint16_t *new_buffer = NULL;
+    if (cudaMalloc((void **)&new_buffer, new_capacity) != cudaSuccess) {
+        flux_cuda_warn_once("CUDA: bf16 device allocation failed, falling back to CPU/BLAS");
+        return 0;
+    }
+
+    if (*buffer) {
+        cudaFree(*buffer);
+    }
+    *buffer = new_buffer;
+    *capacity_bytes = new_capacity;
+    return 1;
+}
+
+static int flux_cuda_probe_bf16_linear(void) {
+    if (!flux_cuda_ensure_initialized()) {
+        return 0;
+    }
+
+    float h_a[16];
+    uint16_t h_b[16];
+    float h_c[16];
+    for (int i = 0; i < 16; i++) {
+        float a = 0.01f * (float)(i + 1);
+        h_a[i] = a;
+        uint32_t bits;
+        memcpy(&bits, &a, sizeof(bits));
+        h_b[i] = (uint16_t)(bits >> 16);  /* f32 -> bf16 */
+        h_c[i] = 0.0f;
+    }
+
+    float *d_a = NULL;
+    uint16_t *d_b = NULL;
+    float *d_c = NULL;
+    size_t a_bytes = sizeof(h_a);
+    size_t b_bytes = sizeof(h_b);
+    size_t c_bytes = sizeof(h_c);
+
+    if (cudaMalloc((void **)&d_a, a_bytes) != cudaSuccess ||
+        cudaMalloc((void **)&d_b, b_bytes) != cudaSuccess ||
+        cudaMalloc((void **)&d_c, c_bytes) != cudaSuccess) {
+        if (d_a) cudaFree(d_a);
+        if (d_b) cudaFree(d_b);
+        if (d_c) cudaFree(d_c);
+        return 0;
+    }
+
+    int ok = 1;
+    if (cudaMemcpy(d_a, h_a, a_bytes, cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(d_b, h_b, b_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        ok = 0;
+        goto done;
+    }
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+#ifdef CUBLAS_COMPUTE_32F_FAST_16BF
+    cublasComputeType_t compute_type = CUBLAS_COMPUTE_32F_FAST_16BF;
+#else
+    cublasComputeType_t compute_type = CUBLAS_COMPUTE_32F;
+#endif
+    cublasStatus_t st = cublasGemmEx(g_cuda_handle,
+                                     CUBLAS_OP_T, CUBLAS_OP_N,
+                                     4, 4, 4,
+                                     &alpha,
+                                     d_b, CUDA_R_16BF, 4,
+                                     d_a, CUDA_R_32F, 4,
+                                     &beta,
+                                     d_c, CUDA_R_32F, 4,
+                                     compute_type, CUBLAS_GEMM_DEFAULT);
+    if (st != CUBLAS_STATUS_SUCCESS) {
+        ok = 0;
+        goto done;
+    }
+
+    if (cudaMemcpy(h_c, d_c, c_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        ok = 0;
+    }
+
+done:
+    cudaFree(d_a);
+    cudaFree(d_b);
+    cudaFree(d_c);
+    return ok;
+}
+
+/* Row-major SGEMM wrapper.
+ * Computes C = A @ B (transpose_b=0) or C = A @ B^T (transpose_b=1). */
+static int flux_cuda_sgemm_rowmajor(float *C, const float *A, const float *B,
+                                    int M, int K, int N, int transpose_b,
+                                    int cache_b) {
+    if (!flux_cuda_ensure_initialized()) {
+        return 0;
+    }
+
+    size_t a_bytes = (size_t)M * K * sizeof(float);
+    size_t b_bytes = transpose_b
+        ? (size_t)N * K * sizeof(float)
+        : (size_t)K * N * sizeof(float);
+    size_t c_bytes = (size_t)M * N * sizeof(float);
+
+    if (!flux_cuda_ensure_buffer(&g_cuda_a, &g_cuda_a_bytes, a_bytes) ||
+        !flux_cuda_ensure_buffer(&g_cuda_c, &g_cuda_c_bytes, c_bytes)) {
+        return 0;
+    }
+
+    cudaError_t cuda_err = cudaMemcpy(g_cuda_a, A, a_bytes, cudaMemcpyHostToDevice);
+    if (cuda_err != cudaSuccess) {
+        flux_cuda_warn_once("CUDA: host-to-device copy failed, falling back to CPU/BLAS");
+        return 0;
+    }
+
+    const float *d_b = NULL;
+    if (cache_b && g_cuda_weight_cache_limit_bytes > 0 && b_bytes >= CUDA_WEIGHT_CACHE_MIN_BYTES) {
+        uint64_t fingerprint = flux_cuda_weight_fingerprint(B, b_bytes);
+        int cache_idx = flux_cuda_weight_cache_find(B, K, N, transpose_b, 0, fingerprint);
+        if (cache_idx >= 0) {
+            d_b = (const float *)g_cuda_weight_cache[cache_idx].device_ptr;
+        } else {
+            d_b = (const float *)flux_cuda_weight_cache_insert(B, K, N, transpose_b,
+                                                               0, fingerprint, b_bytes);
+        }
+    }
+
+    if (!d_b) {
+        if (!flux_cuda_ensure_buffer(&g_cuda_b, &g_cuda_b_bytes, b_bytes)) {
+            return 0;
+        }
+        cuda_err = cudaMemcpy(g_cuda_b, B, b_bytes, cudaMemcpyHostToDevice);
+        if (cuda_err != cudaSuccess) {
+            flux_cuda_warn_once("CUDA: host-to-device copy failed, falling back to CPU/BLAS");
+            return 0;
+        }
+        d_b = g_cuda_b;
+    }
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasStatus_t status;
+    cublasOperation_t op_a = transpose_b ? CUBLAS_OP_T : CUBLAS_OP_N;
+    int lda = transpose_b ? K : N;
+
+    /* Prefer TF32 tensor-core GEMM on supported GPUs.
+     * Disable with FLUX_CUDA_NO_TF32=1 for exact-fp32 fallback testing. */
+    if (flux_cuda_tf32_enabled()) {
+#ifdef CUBLAS_COMPUTE_32F_FAST_TF32
+        cublasComputeType_t compute_type = CUBLAS_COMPUTE_32F_FAST_TF32;
+#else
+        cublasComputeType_t compute_type = CUBLAS_COMPUTE_32F;
+#endif
+        status = cublasGemmEx(g_cuda_handle,
+                              op_a, CUBLAS_OP_N,
+                              N, M, K,
+                              &alpha,
+                              d_b, CUDA_R_32F, lda,
+                              g_cuda_a, CUDA_R_32F, K,
+                              &beta,
+                              g_cuda_c, CUDA_R_32F, N,
+                              compute_type, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    } else {
+        status = CUBLAS_STATUS_NOT_SUPPORTED;
+    }
+
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        /* Row-major A[M,K] @ B[*,K] -> column-major mapping for cuBLAS */
+        status = cublasSgemm(g_cuda_handle,
+                             op_a, CUBLAS_OP_N,
+                             N, M, K,
+                             &alpha,
+                             d_b, lda,
+                             g_cuda_a, K,
+                             &beta,
+                             g_cuda_c, N);
+    }
+
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        flux_cuda_warn_once("CUDA: cuBLAS SGEMM failed, falling back to CPU/BLAS");
+        return 0;
+    }
+
+    cuda_err = cudaMemcpy(C, g_cuda_c, c_bytes, cudaMemcpyDeviceToHost);
+    if (cuda_err != cudaSuccess) {
+        flux_cuda_warn_once("CUDA: device-to-host copy failed, falling back to CPU/BLAS");
+        return 0;
+    }
+
+    return 1;
+}
+
+/* Row-major SGEMM wrapper with device input/output and host-side weight matrix.
+ * d_C = d_A @ B (transpose_b=0) or d_A @ B^T (transpose_b=1)
+ * d_A/d_C are device pointers, B is host pointer (cached on device when possible). */
+static int flux_cuda_sgemm_rowmajor_device_weight(float *d_C,
+                                                  const float *d_A,
+                                                  const float *B,
+                                                  int M, int K, int N,
+                                                  int transpose_b,
+                                                  int cache_b) {
+    if (!flux_cuda_ensure_initialized()) {
+        return 0;
+    }
+    if (!d_C || !d_A || !B || M <= 0 || K <= 0 || N <= 0) {
+        return 0;
+    }
+
+    size_t b_bytes = transpose_b
+        ? (size_t)N * K * sizeof(float)
+        : (size_t)K * N * sizeof(float);
+
+    const float *d_b = NULL;
+    if (cache_b && g_cuda_weight_cache_limit_bytes > 0 && b_bytes >= CUDA_WEIGHT_CACHE_MIN_BYTES) {
+        uint64_t fingerprint = flux_cuda_weight_fingerprint(B, b_bytes);
+        int cache_idx = flux_cuda_weight_cache_find(B, K, N, transpose_b, 0, fingerprint);
+        if (cache_idx >= 0) {
+            d_b = (const float *)g_cuda_weight_cache[cache_idx].device_ptr;
+        } else {
+            d_b = (const float *)flux_cuda_weight_cache_insert(B, K, N, transpose_b,
+                                                               0, fingerprint, b_bytes);
+        }
+    }
+
+    if (!d_b) {
+        if (!flux_cuda_ensure_buffer(&g_cuda_b, &g_cuda_b_bytes, b_bytes)) {
+            return 0;
+        }
+        if (cudaMemcpy(g_cuda_b, B, b_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+            flux_cuda_warn_once("CUDA: host-to-device copy failed, falling back to CPU/BLAS");
+            return 0;
+        }
+        d_b = g_cuda_b;
+    }
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasOperation_t op_a = transpose_b ? CUBLAS_OP_T : CUBLAS_OP_N;
+    int lda = transpose_b ? K : N;
+
+    cublasStatus_t status = CUBLAS_STATUS_NOT_SUPPORTED;
+    if (flux_cuda_tf32_enabled()) {
+#ifdef CUBLAS_COMPUTE_32F_FAST_TF32
+        cublasComputeType_t compute_type = CUBLAS_COMPUTE_32F_FAST_TF32;
+#else
+        cublasComputeType_t compute_type = CUBLAS_COMPUTE_32F;
+#endif
+        status = cublasGemmEx(g_cuda_handle,
+                              op_a, CUBLAS_OP_N,
+                              N, M, K,
+                              &alpha,
+                              d_b, CUDA_R_32F, lda,
+                              d_A, CUDA_R_32F, K,
+                              &beta,
+                              d_C, CUDA_R_32F, N,
+                              compute_type, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    }
+
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        status = cublasSgemm(g_cuda_handle,
+                             op_a, CUBLAS_OP_N,
+                             N, M, K,
+                             &alpha,
+                             d_b, lda,
+                             d_A, K,
+                             &beta,
+                             d_C, N);
+    }
+
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        flux_cuda_warn_once("CUDA: cuBLAS SGEMM failed, falling back to CPU/BLAS");
+        return 0;
+    }
+
+    return 1;
+}
+
+/* Row-major SGEMM wrapper with bf16 weights:
+ * C = A @ B (transpose_b=0) or C = A @ B^T (transpose_b=1)
+ * A/C are f32, B is bf16 (uint16 storage). */
+static int flux_cuda_sgemm_rowmajor_bf16_weight(float *C,
+                                                const float *A,
+                                                const uint16_t *B_bf16,
+                                                int M, int K, int N,
+                                                int transpose_b,
+                                                int cache_b) {
+    if (!flux_cuda_ensure_initialized()) {
+        return 0;
+    }
+
+    size_t a_bytes = (size_t)M * K * sizeof(float);
+    size_t b_bytes = transpose_b
+        ? (size_t)N * K * sizeof(uint16_t)
+        : (size_t)K * N * sizeof(uint16_t);
+    size_t c_bytes = (size_t)M * N * sizeof(float);
+
+    if (!flux_cuda_ensure_buffer(&g_cuda_a, &g_cuda_a_bytes, a_bytes) ||
+        !flux_cuda_ensure_buffer(&g_cuda_c, &g_cuda_c_bytes, c_bytes)) {
+        return 0;
+    }
+
+    cudaError_t cuda_err = cudaMemcpy(g_cuda_a, A, a_bytes, cudaMemcpyHostToDevice);
+    if (cuda_err != cudaSuccess) {
+        flux_cuda_warn_once("CUDA: bf16 host-to-device copy failed, falling back to CPU/BLAS");
+        return 0;
+    }
+
+    const uint16_t *d_b = NULL;
+    if (cache_b && g_cuda_weight_cache_limit_bytes > 0 && b_bytes >= CUDA_WEIGHT_CACHE_MIN_BYTES) {
+        uint64_t fingerprint = flux_cuda_weight_fingerprint(B_bf16, b_bytes);
+        int cache_idx = flux_cuda_weight_cache_find(B_bf16, K, N, transpose_b, 1, fingerprint);
+        if (cache_idx >= 0) {
+            d_b = (const uint16_t *)g_cuda_weight_cache[cache_idx].device_ptr;
+        } else {
+            d_b = (const uint16_t *)flux_cuda_weight_cache_insert(B_bf16, K, N, transpose_b,
+                                                                  1, fingerprint, b_bytes);
+        }
+    }
+
+    if (!d_b) {
+        if (!flux_cuda_ensure_buffer_bf16(&g_cuda_b_bf16, &g_cuda_b_bf16_bytes, b_bytes)) {
+            return 0;
+        }
+        cuda_err = cudaMemcpy(g_cuda_b_bf16, B_bf16, b_bytes, cudaMemcpyHostToDevice);
+        if (cuda_err != cudaSuccess) {
+            flux_cuda_warn_once("CUDA: bf16 host-to-device copy failed, falling back to CPU/BLAS");
+            return 0;
+        }
+        d_b = g_cuda_b_bf16;
+    }
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+#ifdef CUBLAS_COMPUTE_32F_FAST_16BF
+    cublasComputeType_t compute_type = CUBLAS_COMPUTE_32F_FAST_16BF;
+#else
+    cublasComputeType_t compute_type = CUBLAS_COMPUTE_32F;
+#endif
+
+    cublasStatus_t status;
+    if (transpose_b) {
+        status = cublasGemmEx(g_cuda_handle,
+                              CUBLAS_OP_T, CUBLAS_OP_N,
+                              N, M, K,
+                              &alpha,
+                              d_b, CUDA_R_16BF, K,
+                              g_cuda_a, CUDA_R_32F, K,
+                              &beta,
+                              g_cuda_c, CUDA_R_32F, N,
+                              compute_type, CUBLAS_GEMM_DEFAULT);
+    } else {
+        status = cublasGemmEx(g_cuda_handle,
+                              CUBLAS_OP_N, CUBLAS_OP_N,
+                              N, M, K,
+                              &alpha,
+                              d_b, CUDA_R_16BF, N,
+                              g_cuda_a, CUDA_R_32F, K,
+                              &beta,
+                              g_cuda_c, CUDA_R_32F, N,
+                              compute_type, CUBLAS_GEMM_DEFAULT);
+    }
+
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        flux_cuda_warn_once("CUDA: bf16 cuBLAS GEMM failed, falling back to CPU/BLAS");
+        return 0;
+    }
+
+    cuda_err = cudaMemcpy(C, g_cuda_c, c_bytes, cudaMemcpyDeviceToHost);
+    if (cuda_err != cudaSuccess) {
+        flux_cuda_warn_once("CUDA: bf16 device-to-host copy failed, falling back to CPU/BLAS");
+        return 0;
+    }
+
+    return 1;
+}
+
+int flux_cuda_bf16_linear_available(void) {
+    if (g_cuda_bf16_linear_ok != -1) {
+        return g_cuda_bf16_linear_ok;
+    }
+
+    g_cuda_bf16_linear_ok = flux_cuda_probe_bf16_linear() ? 1 : 0;
+    return g_cuda_bf16_linear_ok;
+}
+#endif
+
+#ifndef USE_CUDA
+int flux_cuda_bf16_linear_available(void) {
+    return 0;
+}
+#endif
+
+int flux_cuda_linear_nobias_device(float *d_y, const float *d_x, const float *W,
+                                   int seq_len, int in_dim, int out_dim) {
+#ifdef USE_CUDA
+    return flux_cuda_sgemm_rowmajor_device_weight(d_y, d_x, W,
+                                                  seq_len, in_dim, out_dim,
+                                                  1, 1);
+#else
+    (void)d_y; (void)d_x; (void)W; (void)seq_len; (void)in_dim; (void)out_dim;
+    return 0;
+#endif
+}
 
 /* Progress callbacks - set by caller before inference */
 flux_substep_callback_t flux_substep_callback = NULL;
@@ -153,6 +940,14 @@ void flux_matmul(float *C, const float *A, const float *B,
     }
 #endif
 
+#ifdef USE_CUDA
+    size_t matrix_ops_cuda = (size_t)M * K * N;
+    if (matrix_ops_cuda >= flux_cuda_get_min_ops() &&
+        flux_cuda_sgemm_rowmajor(C, A, B, M, K, N, 0, 0)) {
+        return;
+    }
+#endif
+
 #ifdef USE_BLAS
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                 M, N, K,
@@ -186,6 +981,14 @@ void flux_matmul_t(float *C, const float *A, const float *B,
                          B, K,
                          0.0f,
                          C, N);
+        return;
+    }
+#endif
+
+#ifdef USE_CUDA
+    size_t matrix_ops_cuda = (size_t)M * K * N;
+    if (matrix_ops_cuda >= flux_cuda_get_min_ops() &&
+        flux_cuda_sgemm_rowmajor(C, A, B, M, K, N, 1, 0)) {
         return;
     }
 #endif
@@ -231,6 +1034,21 @@ void flux_linear(float *y, const float *x, const float *W, const float *b,
                          y, out_dim);
 
         /* Add bias if present */
+        if (b != NULL) {
+            for (int s = 0; s < seq_len; s++) {
+                for (int o = 0; o < out_dim; o++) {
+                    y[s * out_dim + o] += b[o];
+                }
+            }
+        }
+        return;
+    }
+#endif
+
+#ifdef USE_CUDA
+    size_t matrix_ops_cuda = (size_t)seq_len * in_dim * out_dim;
+    if (matrix_ops_cuda >= flux_cuda_get_min_ops() &&
+        flux_cuda_sgemm_rowmajor(y, x, W, seq_len, in_dim, out_dim, 1, 1)) {
         if (b != NULL) {
             for (int s = 0; s < seq_len; s++) {
                 for (int o = 0; o < out_dim; o++) {
@@ -303,6 +1121,16 @@ void flux_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
                               W_bf16, in_dim,
                               0.0f,
                               y, out_dim);
+        return;
+    }
+#endif
+
+#ifdef USE_CUDA
+    size_t matrix_ops_cuda = (size_t)seq_len * in_dim * out_dim;
+    if (matrix_ops_cuda >= flux_cuda_get_min_ops() &&
+        flux_cuda_sgemm_rowmajor_bf16_weight(y, x, W_bf16,
+                                             seq_len, in_dim, out_dim,
+                                             1, 1)) {
         return;
     }
 #endif
@@ -404,15 +1232,28 @@ void flux_conv2d(float *out, const float *in, const float *weight, const float *
              * where K = in_ch * kH * kW */
             int K = in_ch * kH * kW;
 
-            /* Write sgemm output directly to out_b using strided ldc.
-             * Row oc of sgemm output goes to out_b[oc * outH*outW + tile_start*outW],
-             * which is exactly the right position in NCHW layout. */
-            float *out_tile = out_b + tile_start * outW;
+            /* Allocate temporary contiguous buffer for tile output */
+            float *tmp = malloc((size_t)out_ch * tile_pixels * sizeof(float));
+            if (!tmp) {
+                free(col);
+                goto naive_fallback;
+            }
+
+            /* sgemm: tmp[out_ch, tile_pixels] = weight[out_ch, K] @ col[K, tile_pixels] */
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                         out_ch, tile_pixels, K,
                         1.0f, weight, K,
                         col, tile_pixels,
-                        0.0f, out_tile, outH * outW);
+                        0.0f, tmp, tile_pixels);
+
+            /* Scatter tile output to correct positions in out_b */
+            for (int oc = 0; oc < out_ch; oc++) {
+                float *out_tile = out_b + oc * outH * outW + tile_start * outW;
+                float *tmp_row = tmp + oc * tile_pixels;
+                memcpy(out_tile, tmp_row, tile_pixels * sizeof(float));
+            }
+
+            free(tmp);
         }
 
         /* Add bias */
@@ -578,11 +1419,11 @@ void flux_silu(float *x, int n) {
 
     for (int i = 0; i < n; i++) {
         float val = x[i];
-        x[i] = val / (1.0f + fast_expf(-val));
+        x[i] = val / (1.0f + expf(-val));
     }
 }
 
-/* Fused SiLU(gate) * up in a single pass - avoids double memory traversal */
+/* Fused SiLU(gate) * up in a single pass. */
 void flux_silu_mul(float *gate, const float *up, int n) {
 #ifdef USE_METAL
     if (flux_metal_shaders_available() && n >= 4 * 1024 * 1024) {
@@ -590,36 +1431,9 @@ void flux_silu_mul(float *gate, const float *up, int n) {
         return;
     }
 #endif
-
     for (int i = 0; i < n; i++) {
-        float val = gate[i];
-        gate[i] = (val / (1.0f + fast_expf(-val))) * up[i];
-    }
-}
-
-/* CPU-only softmax. Safe to call from worker threads (no Metal dispatch). */
-void flux_softmax_cpu(float *x, int rows, int cols) {
-    for (int r = 0; r < rows; r++) {
-        float *row = x + r * cols;
-
-        /* Find max for numerical stability */
-        float max_val = row[0];
-        for (int c = 1; c < cols; c++) {
-            if (row[c] > max_val) max_val = row[c];
-        }
-
-        /* Compute exp and sum */
-        float sum = 0.0f;
-        for (int c = 0; c < cols; c++) {
-            row[c] = fast_expf(row[c] - max_val);
-            sum += row[c];
-        }
-
-        /* Normalize */
-        float inv_sum = 1.0f / sum;
-        for (int c = 0; c < cols; c++) {
-            row[c] *= inv_sum;
-        }
+        float v = gate[i];
+        gate[i] = (v / (1.0f + expf(-v))) * up[i];
     }
 }
 
@@ -632,7 +1446,29 @@ void flux_softmax(float *x, int rows, int cols) {
         return;
     }
 #endif
-    flux_softmax_cpu(x, rows, cols);
+
+    for (int r = 0; r < rows; r++) {
+        float *row = x + r * cols;
+
+        /* Find max for numerical stability */
+        float max_val = row[0];
+        for (int c = 1; c < cols; c++) {
+            if (row[c] > max_val) max_val = row[c];
+        }
+
+        /* Compute exp and sum */
+        float sum = 0.0f;
+        for (int c = 0; c < cols; c++) {
+            row[c] = expf(row[c] - max_val);
+            sum += row[c];
+        }
+
+        /* Normalize */
+        float inv_sum = 1.0f / sum;
+        for (int c = 0; c < cols; c++) {
+            row[c] *= inv_sum;
+        }
+    }
 }
 
 /* ========================================================================
@@ -737,7 +1573,7 @@ static void flash_attention_head(float *out,
             /* Online softmax update */
             if (score > max_score) {
                 /* New maximum found - rescale previous accumulations */
-                float correction = fast_expf(max_score - score);
+                float correction = expf(max_score - score);
                 sum_exp = sum_exp * correction + 1.0f;
                 for (int d = 0; d < head_dim; d++) {
                     o_row[d] = o_row[d] * correction + v_row[d];
@@ -745,7 +1581,7 @@ static void flash_attention_head(float *out,
                 max_score = score;
             } else {
                 /* Score is less than current max */
-                float weight = fast_expf(score - max_score);
+                float weight = expf(score - max_score);
                 sum_exp += weight;
                 for (int d = 0; d < head_dim; d++) {
                     o_row[d] += weight * v_row[d];
@@ -836,7 +1672,7 @@ static void flash_attention_head_tiled(float *out,
 
                 /* Rescale old accumulations if needed */
                 if (old_max > -1e29f) {  /* Check if we have prior accumulations */
-                    float correction = fast_expf(old_max - new_max);
+                    float correction = expf(old_max - new_max);
                     sum_exps[i] *= correction;
                     for (int d = 0; d < head_dim; d++) {
                         o_row[d] *= correction;
@@ -845,7 +1681,7 @@ static void flash_attention_head_tiled(float *out,
 
                 /* Accumulate this tile's contribution */
                 for (int ki = 0; ki < k_len; ki++) {
-                    float weight = fast_expf(score_row[ki] - new_max);
+                    float weight = expf(score_row[ki] - new_max);
                     sum_exps[i] += weight;
                     const float *v_row = V_tile + ki * head_dim;
                     for (int d = 0; d < head_dim; d++) {

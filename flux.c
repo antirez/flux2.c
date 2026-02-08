@@ -14,6 +14,9 @@
 #include <string.h>
 #include <time.h>
 #include <sys/stat.h>
+#if defined(__unix__) || defined(__APPLE__)
+#include <pthread.h>
+#endif
 
 #ifdef USE_METAL
 #include "flux_metal.h"
@@ -43,8 +46,8 @@ extern flux_image *flux_vae_decode(flux_vae_t *vae, const float *latent,
 extern float *flux_image_to_tensor(const flux_image *img);
 
 extern flux_transformer_t *flux_transformer_load(FILE *f);
-extern flux_transformer_t *flux_transformer_load_safetensors(const char *model_dir);
-extern flux_transformer_t *flux_transformer_load_safetensors_mmap(const char *model_dir);
+extern flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf);
+extern flux_transformer_t *flux_transformer_load_safetensors_mmap(safetensors_file_t *sf);
 extern void flux_transformer_free(flux_transformer_t *tf);
 extern float *flux_transformer_forward(flux_transformer_t *tf,
                                         const float *img_latent, int img_h, int img_w,
@@ -338,17 +341,27 @@ void flux_release_text_encoder(flux_ctx *ctx) {
 #endif
 }
 
-/* Load transformer on-demand if not already loaded */
-static int flux_load_transformer_if_needed(flux_ctx *ctx) {
+/* Load transformer on-demand if not already loaded. */
+static int flux_load_transformer_internal(flux_ctx *ctx, int emit_phase_callbacks) {
     if (ctx->transformer) return 1;  /* Already loaded */
 
-    if (flux_phase_callback) flux_phase_callback("Loading FLUX.2 transformer", 0);
-    if (ctx->use_mmap) {
-        ctx->transformer = flux_transformer_load_safetensors_mmap(ctx->model_dir);
-    } else {
-        ctx->transformer = flux_transformer_load_safetensors(ctx->model_dir);
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/transformer/diffusion_pytorch_model.safetensors",
+             ctx->model_dir);
+
+    if (emit_phase_callbacks && flux_phase_callback) flux_phase_callback("Loading FLUX.2 transformer", 0);
+    safetensors_file_t *sf = safetensors_open(path);
+    if (sf) {
+        if (ctx->use_mmap) {
+            /* Mmap mode: load only small weights, keep sf open for on-demand loading.
+             * The transformer takes ownership of sf and will close it on free. */
+            ctx->transformer = flux_transformer_load_safetensors_mmap(sf);
+        } else {
+            ctx->transformer = flux_transformer_load_safetensors(sf);
+            safetensors_close(sf);
+        }
     }
-    if (flux_phase_callback) flux_phase_callback("Loading FLUX.2 transformer", 1);
+    if (emit_phase_callbacks && flux_phase_callback) flux_phase_callback("Loading FLUX.2 transformer", 1);
 
     if (!ctx->transformer) {
         set_error("Failed to load transformer");
@@ -356,6 +369,59 @@ static int flux_load_transformer_if_needed(flux_ctx *ctx) {
     }
     return 1;
 }
+
+static int flux_load_transformer_if_needed(flux_ctx *ctx) {
+    return flux_load_transformer_internal(ctx, 1);
+}
+
+#if defined(__unix__) || defined(__APPLE__)
+typedef struct {
+    flux_ctx *ctx;
+    pthread_t thread;
+    int started;
+    int ok;
+} flux_tf_preload_task_t;
+
+static int flux_overlap_preload_enabled(void) {
+    static int cached = -1;
+    if (cached == -1) {
+        cached = getenv("FLUX_OVERLAP_PRELOAD") ? 1 : 0;
+    }
+    return cached;
+}
+
+static void *flux_transformer_preload_thread(void *arg) {
+    flux_tf_preload_task_t *task = (flux_tf_preload_task_t *)arg;
+    task->ok = flux_load_transformer_internal(task->ctx, 0);
+    return NULL;
+}
+
+static void flux_transformer_preload_begin(flux_ctx *ctx, flux_tf_preload_task_t *task) {
+    if (!task) return;
+    memset(task, 0, sizeof(*task));
+    task->ctx = ctx;
+
+    if (!ctx || ctx->transformer) return;
+    if (!flux_overlap_preload_enabled()) return;
+
+    if (pthread_create(&task->thread, NULL, flux_transformer_preload_thread, task) == 0) {
+        task->started = 1;
+    }
+}
+
+static void flux_transformer_preload_join(flux_tf_preload_task_t *task) {
+    if (!task || !task->started) return;
+    pthread_join(task->thread, NULL);
+    task->started = 0;
+}
+#else
+typedef struct { int started; int ok; } flux_tf_preload_task_t;
+static void flux_transformer_preload_begin(flux_ctx *ctx, flux_tf_preload_task_t *task) {
+    (void)ctx;
+    if (task) memset(task, 0, sizeof(*task));
+}
+static void flux_transformer_preload_join(flux_tf_preload_task_t *task) { (void)task; }
+#endif
 
 /* Get transformer for debugging */
 void *flux_get_transformer(flux_ctx *ctx) {
@@ -432,10 +498,16 @@ flux_image *flux_generate(flux_ctx *ctx, const char *prompt,
         return NULL;
     }
 
+    /* Optional overlap: load transformer in parallel while text is encoding.
+     * This is disabled by default and enabled via FLUX_OVERLAP_PRELOAD=1. */
+    flux_tf_preload_task_t tf_preload;
+    flux_transformer_preload_begin(ctx, &tf_preload);
+
     /* Encode text (and unconditioned text for CFG in base model) */
     int text_seq;
     float *text_emb = flux_encode_text(ctx, prompt, &text_seq);
     if (!text_emb) {
+        flux_transformer_preload_join(&tf_preload);
         set_error("Failed to encode prompt");
         return NULL;
     }
@@ -445,14 +517,19 @@ flux_image *flux_generate(flux_ctx *ctx, const char *prompt,
     if (!ctx->is_distilled) {
         text_emb_uncond = flux_encode_text(ctx, "", &text_seq_uncond);
         if (!text_emb_uncond) {
+            flux_transformer_preload_join(&tf_preload);
             free(text_emb);
             set_error("Failed to encode empty prompt for CFG");
             return NULL;
         }
     }
 
-    /* Release text encoder to free ~8GB before loading transformer */
-    flux_release_text_encoder(ctx);
+    /* Ensure any async preload attempt is complete before load checks/fallback. */
+    flux_transformer_preload_join(&tf_preload);
+
+    /* Release text encoder only before first transformer load.
+     * Once transformer is loaded, keeping encoder avoids reload cost on later calls. */
+    if (!ctx->transformer) flux_release_text_encoder(ctx);
 
     /* Load transformer now (after text encoder is freed to reduce peak memory) */
     if (!flux_load_transformer_if_needed(ctx)) {
@@ -830,10 +907,15 @@ flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
     if (p.num_steps <= 0) p.num_steps = ctx->default_steps;
     float guidance = (p.guidance > 0) ? p.guidance : ctx->default_guidance;
 
+    /* Optional overlap: load transformer in parallel while text is encoding. */
+    flux_tf_preload_task_t tf_preload;
+    flux_transformer_preload_begin(ctx, &tf_preload);
+
     /* Encode text */
     int text_seq;
     float *text_emb = flux_encode_text(ctx, prompt, &text_seq);
     if (!text_emb) {
+        flux_transformer_preload_join(&tf_preload);
         if (resized) flux_image_free(resized);
         set_error("Failed to encode prompt");
         return NULL;
@@ -844,6 +926,7 @@ flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
     if (!ctx->is_distilled) {
         text_emb_uncond = flux_encode_text(ctx, "", &text_seq_uncond);
         if (!text_emb_uncond) {
+            flux_transformer_preload_join(&tf_preload);
             free(text_emb);
             if (resized) flux_image_free(resized);
             set_error("Failed to encode empty prompt for CFG");
@@ -851,8 +934,11 @@ flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
         }
     }
 
-    /* Release text encoder to free ~8GB before loading transformer */
-    flux_release_text_encoder(ctx);
+    flux_transformer_preload_join(&tf_preload);
+
+    /* Release text encoder only before first transformer load.
+     * Once transformer is loaded, keeping encoder avoids reload cost on later calls. */
+    if (!ctx->transformer) flux_release_text_encoder(ctx);
 
     /* Load transformer now (after text encoder is freed to reduce peak memory) */
     if (!flux_load_transformer_if_needed(ctx)) {
@@ -1013,10 +1099,15 @@ flux_image *flux_multiref(flux_ctx *ctx, const char *prompt,
     if (p.num_steps <= 0) p.num_steps = ctx->default_steps;
     float guidance = (p.guidance > 0) ? p.guidance : ctx->default_guidance;
 
+    /* Optional overlap: load transformer in parallel while text is encoding. */
+    flux_tf_preload_task_t tf_preload;
+    flux_transformer_preload_begin(ctx, &tf_preload);
+
     /* Encode text */
     int text_seq;
     float *text_emb = flux_encode_text(ctx, prompt, &text_seq);
     if (!text_emb) {
+        flux_transformer_preload_join(&tf_preload);
         set_error("Failed to encode prompt");
         return NULL;
     }
@@ -1026,13 +1117,18 @@ flux_image *flux_multiref(flux_ctx *ctx, const char *prompt,
     if (!ctx->is_distilled) {
         text_emb_uncond = flux_encode_text(ctx, "", &text_seq_uncond);
         if (!text_emb_uncond) {
+            flux_transformer_preload_join(&tf_preload);
             free(text_emb);
             set_error("Failed to encode empty prompt for CFG");
             return NULL;
         }
     }
 
-    flux_release_text_encoder(ctx);
+    flux_transformer_preload_join(&tf_preload);
+
+    /* Release text encoder only before first transformer load.
+     * Once transformer is loaded, keeping encoder avoids reload cost on later calls. */
+    if (!ctx->transformer) flux_release_text_encoder(ctx);
 
     if (!flux_load_transformer_if_needed(ctx)) {
         free(text_emb);
