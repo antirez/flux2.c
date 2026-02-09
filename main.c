@@ -544,6 +544,12 @@ int main(int argc, char *argv[]) {
         flux_set_base_mode(ctx);
     }
 
+    /* In persistent stdin server mode, keep text encoder resident so
+     * per-request latency does not include encoder reload. */
+    if (server_mode) {
+        flux_set_keep_text_encoder(ctx, 1);
+    }
+
     /* Resolve auto-parameters now that we know the model type */
     if (!steps_set || params.num_steps <= 0) {
         params.num_steps = flux_is_distilled(ctx) ? 4 : 50;

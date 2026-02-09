@@ -155,6 +155,7 @@ struct flux_ctx {
 
     /* Memory mode */
     int use_mmap;  /* Use mmap for text encoder (lower memory, slower) */
+    int keep_text_encoder_loaded;  /* Keep Qwen resident across generations */
 };
 
 /* Global error message */
@@ -314,6 +315,10 @@ void flux_set_mmap(flux_ctx *ctx, int enable) {
     if (ctx) ctx->use_mmap = enable;
 }
 
+void flux_set_keep_text_encoder(flux_ctx *ctx, int enable) {
+    if (ctx) ctx->keep_text_encoder_loaded = enable ? 1 : 0;
+}
+
 int flux_is_distilled(flux_ctx *ctx) {
     return ctx ? ctx->is_distilled : 1;
 }
@@ -372,6 +377,32 @@ static int flux_load_transformer_internal(flux_ctx *ctx, int emit_phase_callback
 
 static int flux_load_transformer_if_needed(flux_ctx *ctx) {
     return flux_load_transformer_internal(ctx, 1);
+}
+
+/* Load transformer with server-friendly fallback:
+ * keep text encoder resident when requested, but retry after releasing it
+ * if peak memory is too high during first transformer load. */
+static int flux_ensure_transformer_ready(flux_ctx *ctx) {
+    if (ctx->transformer) return 1;
+
+    if (!ctx->keep_text_encoder_loaded && ctx->qwen3_encoder) {
+        flux_release_text_encoder(ctx);
+        return flux_load_transformer_if_needed(ctx);
+    }
+
+    if (flux_load_transformer_if_needed(ctx)) {
+        return 1;
+    }
+
+    if (ctx->keep_text_encoder_loaded && ctx->qwen3_encoder) {
+        fprintf(stderr,
+                "Warning: Transformer load failed with persistent text encoder; "
+                "retrying after releasing text encoder\n");
+        flux_release_text_encoder(ctx);
+        return flux_load_transformer_if_needed(ctx);
+    }
+
+    return 0;
 }
 
 #if defined(__unix__) || defined(__APPLE__)
@@ -527,12 +558,8 @@ flux_image *flux_generate(flux_ctx *ctx, const char *prompt,
     /* Ensure any async preload attempt is complete before load checks/fallback. */
     flux_transformer_preload_join(&tf_preload);
 
-    /* Release text encoder only before first transformer load.
-     * Once transformer is loaded, keeping encoder avoids reload cost on later calls. */
-    if (!ctx->transformer) flux_release_text_encoder(ctx);
-
-    /* Load transformer now (after text encoder is freed to reduce peak memory) */
-    if (!flux_load_transformer_if_needed(ctx)) {
+    /* Ensure transformer is ready (with optional low-memory fallback). */
+    if (!flux_ensure_transformer_ready(ctx)) {
         free(text_emb);
         free(text_emb_uncond);
         return NULL;
@@ -936,12 +963,8 @@ flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
 
     flux_transformer_preload_join(&tf_preload);
 
-    /* Release text encoder only before first transformer load.
-     * Once transformer is loaded, keeping encoder avoids reload cost on later calls. */
-    if (!ctx->transformer) flux_release_text_encoder(ctx);
-
-    /* Load transformer now (after text encoder is freed to reduce peak memory) */
-    if (!flux_load_transformer_if_needed(ctx)) {
+    /* Ensure transformer is ready (with optional low-memory fallback). */
+    if (!flux_ensure_transformer_ready(ctx)) {
         free(text_emb);
         free(text_emb_uncond);
         if (resized) flux_image_free(resized);
@@ -1126,11 +1149,8 @@ flux_image *flux_multiref(flux_ctx *ctx, const char *prompt,
 
     flux_transformer_preload_join(&tf_preload);
 
-    /* Release text encoder only before first transformer load.
-     * Once transformer is loaded, keeping encoder avoids reload cost on later calls. */
-    if (!ctx->transformer) flux_release_text_encoder(ctx);
-
-    if (!flux_load_transformer_if_needed(ctx)) {
+    /* Ensure transformer is ready (with optional low-memory fallback). */
+    if (!flux_ensure_transformer_ready(ctx)) {
         free(text_emb);
         free(text_emb_uncond);
         return NULL;
