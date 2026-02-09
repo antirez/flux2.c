@@ -21,7 +21,7 @@ LIB = libflux.a
 # Debug build flags
 DEBUG_CFLAGS = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address
 
-.PHONY: all clean debug lib install info test pngtest help generic blas mps
+.PHONY: all clean debug lib install info test pngtest help generic blas cuda mps
 
 # Default: show available targets
 all: help
@@ -32,6 +32,9 @@ help:
 	@echo "Choose a backend:"
 	@echo "  make generic  - Pure C, no dependencies (slow)"
 	@echo "  make blas     - With BLAS acceleration (~30x faster)"
+ifeq ($(UNAME_S),Linux)
+	@echo "  make cuda     - NVIDIA CUDA + cuBLAS (GPU acceleration)"
+endif
 ifeq ($(UNAME_S),Darwin)
 ifeq ($(UNAME_M),arm64)
 	@echo "  make mps      - Apple Silicon with Metal GPU (fastest)"
@@ -69,6 +72,25 @@ endif
 blas: clean $(TARGET)
 	@echo ""
 	@echo "Built with BLAS backend (~30x faster than generic)"
+
+# =============================================================================
+# Backend: cuda (NVIDIA CUDA + cuBLAS, Linux)
+# =============================================================================
+ifeq ($(UNAME_S),Linux)
+CUDA_HOME ?= /usr/local/cuda
+CUDA_CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_OPENBLAS -DUSE_CUDA -I/usr/include/openblas -I$(CUDA_HOME)/include
+CUDA_LDFLAGS = -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcublasLt -lcublas -lcudart -lopenblas -lstdc++ -lm
+
+cuda: CFLAGS = $(CUDA_CFLAGS)
+cuda: LDFLAGS = $(CUDA_LDFLAGS)
+cuda: clean cuda-build
+	@echo ""
+	@echo "Built with CUDA backend (cuBLAS GPU acceleration)"
+else
+cuda:
+	@echo "Error: CUDA backend requires Linux with NVIDIA CUDA toolkit"
+	@exit 1
+endif
 
 # =============================================================================
 # Backend: mps (Apple Silicon Metal GPU)
@@ -113,6 +135,9 @@ endif
 $(TARGET): $(OBJS) $(CLI_OBJS) main.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
+cuda-build: $(OBJS) $(CLI_OBJS) main.o flux_cuda.o
+	$(CC) $(CUDA_CFLAGS) -o $(TARGET) $^ $(CUDA_LDFLAGS)
+
 lib: $(LIB)
 
 $(LIB): $(OBJS)
@@ -153,8 +178,11 @@ install: $(TARGET) $(LIB)
 	install -m 644 flux_kernels.h /usr/local/include/
 
 clean:
-	rm -f $(OBJS) $(CLI_OBJS) *.mps.o flux_metal.o main.o $(TARGET) $(LIB)
+	rm -f $(OBJS) $(CLI_OBJS) *.mps.o flux_metal.o flux_cuda.o main.o $(TARGET) $(LIB)
 	rm -f flux_shaders_source.h
+
+flux_cuda.o: flux_cuda.cu flux_cuda.h
+	nvcc -O3 -U_GNU_SOURCE -c -o $@ $<
 
 info:
 	@echo "Platform: $(UNAME_S) $(UNAME_M)"
@@ -169,6 +197,7 @@ ifeq ($(UNAME_M),arm64)
 endif
 else
 	@echo "  blas    - OpenBLAS (requires libopenblas-dev)"
+	@echo "  cuda    - NVIDIA CUDA + cuBLAS (requires CUDA toolkit + OpenBLAS)"
 endif
 
 # =============================================================================
@@ -183,9 +212,11 @@ flux_sample.o: flux_sample.c flux.h flux_kernels.h
 flux_image.o: flux_image.c flux.h
 flux_safetensors.o: flux_safetensors.c flux_safetensors.h
 flux_qwen3.o: flux_qwen3.c flux_qwen3.h flux_safetensors.h
+flux_qwen3.o: flux_cuda.h
 flux_qwen3_tokenizer.o: flux_qwen3_tokenizer.c flux_qwen3.h
 terminals.o: terminals.c terminals.h flux.h
 flux_cli.o: flux_cli.c flux_cli.h flux.h flux_qwen3.h embcache.h linenoise.h terminals.h
 linenoise.o: linenoise.c linenoise.h
 embcache.o: embcache.c embcache.h
 main.o: main.c flux.h flux_kernels.h flux_cli.h terminals.h
+flux_transformer.o: flux_cuda.h

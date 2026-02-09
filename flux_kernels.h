@@ -83,6 +83,22 @@ void flux_linear_nobias(float *y, const float *x, const float *W,
 void flux_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
                              int seq_len, int in_dim, int out_dim);
 
+/* Returns 1 when CUDA bf16 linear GEMM is available on this runtime, else 0.
+ * On non-CUDA builds, always returns 0. */
+int flux_cuda_bf16_linear_available(void);
+
+/* CUDA-only helper: linear without bias with device input/output.
+ * d_y: device [seq_len, out_dim], d_x: device [seq_len, in_dim], W: host [out_dim, in_dim]
+ * Returns 1 on success, 0 on failure/fallback condition.
+ */
+int flux_cuda_linear_nobias_device(float *d_y, const float *d_x, const float *W,
+                                   int seq_len, int in_dim, int out_dim);
+
+/* Set the CUDA stream used by CUDA linear helpers.
+ * Pass NULL to restore the default stream.
+ * Returns 1 on success, 0 on failure/non-CUDA builds. */
+int flux_cuda_linear_set_stream(void *stream_handle);
+
 /* ========================================================================
  * GPU Batch Operations
  * These functions allow batching multiple GPU operations to reduce sync overhead.
