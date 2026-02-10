@@ -1,0 +1,8 @@
+.venv/
+.streamlit/
+data/
+outputs/
+uploads/
+__pycache__/
+*.pyc
+.DS_Store
