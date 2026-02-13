@@ -29,50 +29,16 @@ extern double flux_timing_transformer_double;
 extern double flux_timing_transformer_single;
 extern double flux_timing_transformer_final;
 
-/* Fine-grained profiling for BLAS optimization */
-static double prof_single_adaln = 0;
-static double prof_single_fused_matmul = 0;
-static double prof_single_split = 0;
-static double prof_single_qknorm_rope = 0;
-static double prof_single_attention = 0;
-static double prof_single_swiglu = 0;
-static double prof_single_proj_matmul = 0;
-static double prof_single_gated_add = 0;
-
-static double prof_get_time(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
-}
-
-void flux_print_blas_profile(void) {
-    double total = prof_single_adaln + prof_single_fused_matmul + prof_single_split +
-                   prof_single_qknorm_rope + prof_single_attention + prof_single_swiglu +
-                   prof_single_proj_matmul + prof_single_gated_add;
-    if (total < 1.0) return;
-    fprintf(stderr, "\nSingle block breakdown (cumulative):\n");
-    fprintf(stderr, "  AdaLN+mod:     %7.1fms (%4.1f%%)\n", prof_single_adaln, 100*prof_single_adaln/total);
-    fprintf(stderr, "  Fused QKV+MLP: %7.1fms (%4.1f%%)\n", prof_single_fused_matmul, 100*prof_single_fused_matmul/total);
-    fprintf(stderr, "  Split:         %7.1fms (%4.1f%%)\n", prof_single_split, 100*prof_single_split/total);
-    fprintf(stderr, "  QKnorm+RoPE:   %7.1fms (%4.1f%%)\n", prof_single_qknorm_rope, 100*prof_single_qknorm_rope/total);
-    fprintf(stderr, "  Attention:     %7.1fms (%4.1f%%)\n", prof_single_attention, 100*prof_single_attention/total);
-    fprintf(stderr, "  SwiGLU:        %7.1fms (%4.1f%%)\n", prof_single_swiglu, 100*prof_single_swiglu/total);
-    fprintf(stderr, "  Proj matmul:   %7.1fms (%4.1f%%)\n", prof_single_proj_matmul, 100*prof_single_proj_matmul/total);
-    fprintf(stderr, "  Gated add:     %7.1fms (%4.1f%%)\n", prof_single_gated_add, 100*prof_single_gated_add/total);
-    fprintf(stderr, "  Total:         %7.1fms\n", total);
-}
-
-void flux_reset_blas_profile(void) {
-    prof_single_adaln = prof_single_fused_matmul = prof_single_split = 0;
-    prof_single_qknorm_rope = prof_single_attention = prof_single_swiglu = 0;
-    prof_single_proj_matmul = prof_single_gated_add = 0;
-}
-
 /* Helper to get current time in ms (wall-clock) */
 static double tf_get_time_ms(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+}
+
+/* Compatibility hook used by sampler when BLAS profiling is enabled in
+ * some branches. This branch does not maintain per-op BLAS counters. */
+void flux_print_blas_profile(void) {
 }
 
 /* Use BLAS for matrix operations when enabled via Makefile */
@@ -82,13 +48,16 @@ static double tf_get_time_ms(void) {
 #else
 #include <cblas.h>
 #endif
-#include <pthread.h>
-#include <unistd.h>
 #endif
 
 /* Use Metal for GPU acceleration when available */
 #ifdef USE_METAL
 #include "flux_metal.h"
+#endif
+
+#ifdef USE_CUDA
+#include "flux_cuda.h"
+#include <cuda_runtime.h>
 #endif
 
 /* Enable BF16 pipeline debug logging when FLUX_BF16_DEBUG is set. */
@@ -295,6 +264,7 @@ typedef struct flux_transformer {
     float *t_emb_silu;              /* [hidden] */
     float *double_mod_img;          /* [hidden * 6] */
     float *double_mod_txt;          /* [hidden * 6] */
+    float *single_mod_params;       /* [hidden * 3] */
     float *double_img_attn_out;     /* [max_seq, hidden] */
     float *double_txt_attn_out;     /* [max_seq, hidden] */
 
@@ -322,175 +292,14 @@ typedef struct flux_transformer {
 
     /* Mmap mode: keep safetensors file open, load block weights on-demand */
     int use_mmap;
-    #define MAX_TF_SHARDS 4
-    safetensors_file_t *sf_files[MAX_TF_SHARDS];
-    int num_sf_files;
+    safetensors_file_t *sf;
 } flux_transformer_t;
-
-/* ========================================================================
- * Transformer Config Parsing
- * ======================================================================== */
-
-/* Parse transformer/config.json to get architecture dimensions.
- * Returns 0 on success, -1 on failure (caller should use defaults). */
-static int parse_transformer_config(const char *model_dir, flux_transformer_t *tf) {
-    char path[1024];
-    snprintf(path, sizeof(path), "%s/transformer/config.json", model_dir);
-
-    FILE *f = fopen(path, "r");
-    if (!f) return -1;
-
-    char buf[4096];
-    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
-    buf[n] = '\0';
-    fclose(f);
-
-    /* Simple JSON integer/float extraction.
-     * Look for "key": value patterns. */
-    char *p;
-    int num_heads = 0, head_dim = 0, num_layers = 0, num_single = 0;
-    int joint_attention_dim = 0, in_channels = 0;
-    float mlp_ratio = 0, rope_theta = 0;
-
-    if ((p = strstr(buf, "\"num_attention_heads\""))) {
-        if ((p = strchr(p, ':'))) num_heads = atoi(p + 1);
-    }
-    if ((p = strstr(buf, "\"attention_head_dim\""))) {
-        if ((p = strchr(p, ':'))) head_dim = atoi(p + 1);
-    }
-    if ((p = strstr(buf, "\"num_layers\""))) {
-        if ((p = strchr(p, ':'))) num_layers = atoi(p + 1);
-    }
-    if ((p = strstr(buf, "\"num_single_layers\""))) {
-        if ((p = strchr(p, ':'))) num_single = atoi(p + 1);
-    }
-    if ((p = strstr(buf, "\"joint_attention_dim\""))) {
-        if ((p = strchr(p, ':'))) joint_attention_dim = atoi(p + 1);
-    }
-    if ((p = strstr(buf, "\"in_channels\""))) {
-        if ((p = strchr(p, ':'))) in_channels = atoi(p + 1);
-    }
-    if ((p = strstr(buf, "\"mlp_ratio\""))) {
-        if ((p = strchr(p, ':'))) mlp_ratio = atof(p + 1);
-    }
-    if ((p = strstr(buf, "\"rope_theta\""))) {
-        if ((p = strchr(p, ':'))) rope_theta = atof(p + 1);
-    }
-
-    /* Validate: we need at least heads and head_dim */
-    if (num_heads <= 0 || head_dim <= 0) return -1;
-
-    tf->num_heads = num_heads;
-    tf->head_dim = head_dim;
-    tf->hidden_size = num_heads * head_dim;
-    tf->mlp_hidden = (int)(tf->hidden_size * (mlp_ratio > 0 ? mlp_ratio : 3.0f));
-    tf->num_double_layers = num_layers > 0 ? num_layers : 5;
-    tf->num_single_layers = num_single > 0 ? num_single : 20;
-    tf->text_dim = joint_attention_dim > 0 ? joint_attention_dim : 7680;
-    tf->latent_channels = in_channels > 0 ? in_channels : 128;
-    tf->rope_theta = rope_theta > 0 ? rope_theta : 2000.0f;
-    tf->rope_dim = head_dim;
-    tf->axis_dim = head_dim / 4;  /* 4 RoPE axes */
-
-    return 0;
-}
-
-/* Open transformer safetensors shards.
- * Reads diffusion_pytorch_model.safetensors.index.json for shard filenames,
- * falls back to single diffusion_pytorch_model.safetensors.
- * Returns number of files opened (0 on failure). */
-static int open_transformer_shards(const char *model_dir,
-                                   safetensors_file_t **files, int max_files) {
-    char path[1024];
-    int num_files = 0;
-
-    /* Try to read index JSON for sharded models */
-    snprintf(path, sizeof(path), "%s/transformer/diffusion_pytorch_model.safetensors.index.json",
-             model_dir);
-    FILE *fp = fopen(path, "r");
-    if (fp) {
-        fseek(fp, 0, SEEK_END);
-        long len = ftell(fp);
-        fseek(fp, 0, SEEK_SET);
-        char *json = malloc(len + 1);
-        if (json) {
-            fread(json, 1, len, fp);
-            json[len] = '\0';
-            fclose(fp);
-
-            /* Extract unique shard filenames from weight_map values */
-            char shard_names[MAX_TF_SHARDS][256];
-            int num_shards = 0;
-            const char *p = strstr(json, "\"weight_map\"");
-            if (p) {
-                p = strchr(p, '{');
-                if (p) p++;
-                while (p && num_shards < max_files) {
-                    /* Find next value (shard filename) */
-                    const char *colon = strchr(p, ':');
-                    if (!colon) break;
-                    const char *q1 = strchr(colon, '"');
-                    if (!q1) break;
-                    q1++;
-                    const char *q2 = strchr(q1, '"');
-                    if (!q2) break;
-                    int slen = (int)(q2 - q1);
-                    if (slen > 0 && slen < 256) {
-                        char fname[256];
-                        memcpy(fname, q1, slen);
-                        fname[slen] = '\0';
-                        /* Check if already seen */
-                        int dup = 0;
-                        for (int i = 0; i < num_shards; i++) {
-                            if (strcmp(shard_names[i], fname) == 0) { dup = 1; break; }
-                        }
-                        if (!dup) {
-                            strcpy(shard_names[num_shards], fname);
-                            num_shards++;
-                        }
-                    }
-                    p = q2 + 1;
-                    /* Skip to next key or end */
-                    const char *comma = strchr(p, ',');
-                    const char *brace = strchr(p, '}');
-                    if (brace && (!comma || brace < comma)) break;
-                    if (comma) p = comma + 1; else break;
-                }
-            }
-            free(json);
-
-            /* Open each shard - all must succeed */
-            for (int i = 0; i < num_shards; i++) {
-                snprintf(path, sizeof(path), "%s/transformer/%s", model_dir, shard_names[i]);
-                files[num_files] = safetensors_open(path);
-                if (files[num_files]) {
-                    num_files++;
-                } else {
-                    fprintf(stderr, "Error: failed to open transformer shard %s\n", shard_names[i]);
-                    for (int j = 0; j < num_files; j++) safetensors_close(files[j]);
-                    return 0;
-                }
-            }
-            if (num_files > 0) return num_files;
-        } else {
-            fclose(fp);
-        }
-    }
-
-    /* Fallback: single file */
-    snprintf(path, sizeof(path), "%s/transformer/diffusion_pytorch_model.safetensors",
-             model_dir);
-    files[0] = safetensors_open(path);
-    if (files[0]) return 1;
-
-    return 0;
-}
 
 /* Forward declarations */
 void flux_transformer_free(flux_transformer_t *tf);
-static int load_double_block_weights(double_block_t *b, safetensors_file_t **files, int num_files, int idx, int h, int mlp, int use_bf16);
+static int load_double_block_weights(double_block_t *b, safetensors_file_t *sf, int idx, int h, int mlp, int use_bf16);
 static void free_double_block_weights(double_block_t *b);
-static int load_single_block_weights(single_block_t *b, safetensors_file_t **files, int num_files, int idx, int h, int mlp, int use_bf16);
+static int load_single_block_weights(single_block_t *b, safetensors_file_t *sf, int idx, int h, int mlp, int use_bf16);
 static void free_single_block_weights(single_block_t *b);
 
 /* ========================================================================
@@ -498,62 +307,61 @@ static void free_single_block_weights(single_block_t *b);
  * ======================================================================== */
 
 /* Helper to get tensor as f32 (used by mmap load functions) */
-static float *mmap_get_f32(safetensors_file_t **files, int num_files, const char *name) {
-    for (int f = 0; f < num_files; f++) {
-        const safetensor_t *t = safetensors_find(files[f], name);
-        if (t) return safetensors_get_f32(files[f], t);
+static float *mmap_get_f32(safetensors_file_t *sf, const char *name) {
+    const safetensor_t *t = safetensors_find(sf, name);
+    if (!t) {
+        fprintf(stderr, "Error: required tensor %s not found\n", name);
+        return NULL;
     }
-    fprintf(stderr, "Error: required tensor %s not found\n", name);
-    return NULL;
+    return safetensors_get_f32(sf, t);
 }
 
 /* Helper to get tensor as bf16 direct pointer (used by mmap load functions)
  * Returns pointer into mmap'd region - caller must NOT free */
-static uint16_t *mmap_get_bf16(safetensors_file_t **files, int num_files, const char *name) {
-    for (int f = 0; f < num_files; f++) {
-        const safetensor_t *t = safetensors_find(files[f], name);
-        if (t && safetensor_is_bf16(t)) return safetensors_get_bf16_direct(files[f], t);
-    }
-    return NULL;
+static uint16_t *mmap_get_bf16(safetensors_file_t *sf, const char *name) {
+    const safetensor_t *t = safetensors_find(sf, name);
+    if (!t) return NULL;
+    if (!safetensor_is_bf16(t)) return NULL;
+    return safetensors_get_bf16_direct(sf, t);
 }
 
 /* Load weights for a single double_block on-demand */
-static int load_double_block_weights(double_block_t *b, safetensors_file_t **files,
-                                     int num_files, int idx, int h, int mlp, int use_bf16) {
+static int load_double_block_weights(double_block_t *b, safetensors_file_t *sf,
+                                     int idx, int h, int mlp, int use_bf16) {
     char name[256];
 
     /* Image attention - QK norm weights (always f32) */
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.norm_q.weight", idx);
-    b->img_norm_q_weight = mmap_get_f32(files, num_files, name);
+    b->img_norm_q_weight = mmap_get_f32(sf, name);
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.norm_k.weight", idx);
-    b->img_norm_k_weight = mmap_get_f32(files, num_files, name);
+    b->img_norm_k_weight = mmap_get_f32(sf, name);
 
     /* Image Q, K, V projections - skip f32 if bf16 available */
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_q.weight", idx);
-    if (use_bf16) b->img_q_weight_bf16 = mmap_get_bf16(files, num_files, name);
-    if (!use_bf16) b->img_q_weight = mmap_get_f32(files, num_files, name);
+    if (use_bf16) b->img_q_weight_bf16 = mmap_get_bf16(sf, name);
+    if (!use_bf16) b->img_q_weight = mmap_get_f32(sf, name);
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_k.weight", idx);
-    if (use_bf16) b->img_k_weight_bf16 = mmap_get_bf16(files, num_files, name);
-    if (!use_bf16) b->img_k_weight = mmap_get_f32(files, num_files, name);
+    if (use_bf16) b->img_k_weight_bf16 = mmap_get_bf16(sf, name);
+    if (!use_bf16) b->img_k_weight = mmap_get_f32(sf, name);
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_v.weight", idx);
-    if (use_bf16) b->img_v_weight_bf16 = mmap_get_bf16(files, num_files, name);
-    if (!use_bf16) b->img_v_weight = mmap_get_f32(files, num_files, name);
+    if (use_bf16) b->img_v_weight_bf16 = mmap_get_bf16(sf, name);
+    if (!use_bf16) b->img_v_weight = mmap_get_f32(sf, name);
 
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_out.0.weight", idx);
-    if (use_bf16) b->img_proj_weight_bf16 = mmap_get_bf16(files, num_files, name);
-    if (!use_bf16) b->img_proj_weight = mmap_get_f32(files, num_files, name);
+    if (use_bf16) b->img_proj_weight_bf16 = mmap_get_bf16(sf, name);
+    if (!use_bf16) b->img_proj_weight = mmap_get_f32(sf, name);
 
     /* Image FFN - linear_in contains gate and up fused - skip f32 if bf16 available */
     snprintf(name, sizeof(name), "transformer_blocks.%d.ff.linear_in.weight", idx);
     if (use_bf16) {
-        uint16_t *ff_in_bf16 = mmap_get_bf16(files, num_files, name);
+        uint16_t *ff_in_bf16 = mmap_get_bf16(sf, name);
         if (ff_in_bf16) {
             /* Direct pointers with offset - no malloc/copy needed */
             b->img_mlp_gate_weight_bf16 = ff_in_bf16;
             b->img_mlp_up_weight_bf16 = ff_in_bf16 + (size_t)mlp * h;
         }
     } else {
-        float *ff_in = mmap_get_f32(files, num_files, name);
+        float *ff_in = mmap_get_f32(sf, name);
         if (ff_in) {
             b->img_mlp_gate_weight = malloc(mlp * h * sizeof(float));
             b->img_mlp_up_weight = malloc(mlp * h * sizeof(float));
@@ -564,41 +372,41 @@ static int load_double_block_weights(double_block_t *b, safetensors_file_t **fil
     }
 
     snprintf(name, sizeof(name), "transformer_blocks.%d.ff.linear_out.weight", idx);
-    if (use_bf16) b->img_mlp_down_weight_bf16 = mmap_get_bf16(files, num_files, name);
-    if (!use_bf16) b->img_mlp_down_weight = mmap_get_f32(files, num_files, name);
+    if (use_bf16) b->img_mlp_down_weight_bf16 = mmap_get_bf16(sf, name);
+    if (!use_bf16) b->img_mlp_down_weight = mmap_get_f32(sf, name);
 
     /* Text stream - QK norm weights (always f32) */
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.norm_added_q.weight", idx);
-    b->txt_norm_q_weight = mmap_get_f32(files, num_files, name);
+    b->txt_norm_q_weight = mmap_get_f32(sf, name);
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.norm_added_k.weight", idx);
-    b->txt_norm_k_weight = mmap_get_f32(files, num_files, name);
+    b->txt_norm_k_weight = mmap_get_f32(sf, name);
 
     /* Text Q, K, V projections - skip f32 if bf16 available */
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.add_q_proj.weight", idx);
-    if (use_bf16) b->txt_q_weight_bf16 = mmap_get_bf16(files, num_files, name);
-    if (!use_bf16) b->txt_q_weight = mmap_get_f32(files, num_files, name);
+    if (use_bf16) b->txt_q_weight_bf16 = mmap_get_bf16(sf, name);
+    if (!use_bf16) b->txt_q_weight = mmap_get_f32(sf, name);
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.add_k_proj.weight", idx);
-    if (use_bf16) b->txt_k_weight_bf16 = mmap_get_bf16(files, num_files, name);
-    if (!use_bf16) b->txt_k_weight = mmap_get_f32(files, num_files, name);
+    if (use_bf16) b->txt_k_weight_bf16 = mmap_get_bf16(sf, name);
+    if (!use_bf16) b->txt_k_weight = mmap_get_f32(sf, name);
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.add_v_proj.weight", idx);
-    if (use_bf16) b->txt_v_weight_bf16 = mmap_get_bf16(files, num_files, name);
-    if (!use_bf16) b->txt_v_weight = mmap_get_f32(files, num_files, name);
+    if (use_bf16) b->txt_v_weight_bf16 = mmap_get_bf16(sf, name);
+    if (!use_bf16) b->txt_v_weight = mmap_get_f32(sf, name);
 
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_add_out.weight", idx);
-    if (use_bf16) b->txt_proj_weight_bf16 = mmap_get_bf16(files, num_files, name);
-    if (!use_bf16) b->txt_proj_weight = mmap_get_f32(files, num_files, name);
+    if (use_bf16) b->txt_proj_weight_bf16 = mmap_get_bf16(sf, name);
+    if (!use_bf16) b->txt_proj_weight = mmap_get_f32(sf, name);
 
     /* Text FFN - skip f32 if bf16 available */
     snprintf(name, sizeof(name), "transformer_blocks.%d.ff_context.linear_in.weight", idx);
     if (use_bf16) {
-        uint16_t *txt_ff_in_bf16 = mmap_get_bf16(files, num_files, name);
+        uint16_t *txt_ff_in_bf16 = mmap_get_bf16(sf, name);
         if (txt_ff_in_bf16) {
             /* Direct pointers with offset - no malloc/copy needed */
             b->txt_mlp_gate_weight_bf16 = txt_ff_in_bf16;
             b->txt_mlp_up_weight_bf16 = txt_ff_in_bf16 + (size_t)mlp * h;
         }
     } else {
-        float *txt_ff_in = mmap_get_f32(files, num_files, name);
+        float *txt_ff_in = mmap_get_f32(sf, name);
         if (txt_ff_in) {
             b->txt_mlp_gate_weight = malloc(mlp * h * sizeof(float));
             b->txt_mlp_up_weight = malloc(mlp * h * sizeof(float));
@@ -609,8 +417,8 @@ static int load_double_block_weights(double_block_t *b, safetensors_file_t **fil
     }
 
     snprintf(name, sizeof(name), "transformer_blocks.%d.ff_context.linear_out.weight", idx);
-    if (use_bf16) b->txt_mlp_down_weight_bf16 = mmap_get_bf16(files, num_files, name);
-    if (!use_bf16) b->txt_mlp_down_weight = mmap_get_f32(files, num_files, name);
+    if (use_bf16) b->txt_mlp_down_weight_bf16 = mmap_get_bf16(sf, name);
+    if (!use_bf16) b->txt_mlp_down_weight = mmap_get_f32(sf, name);
 
     return 0;
 }
@@ -618,11 +426,6 @@ static int load_double_block_weights(double_block_t *b, safetensors_file_t **fil
 /* Free weights for a single double_block (mmap mode only)
  * Note: bf16 pointers are direct mmap pointers, don't free them */
 static void free_double_block_weights(double_block_t *b) {
-#ifdef USE_METAL
-    /* Invalidate GPU weight cache before freeing CPU pointers.
-     * malloc can reuse freed addresses, causing stale cache hits. */
-    flux_metal_clear_weight_cache_only();
-#endif
     free(b->img_norm_q_weight); b->img_norm_q_weight = NULL;
     free(b->img_norm_k_weight); b->img_norm_k_weight = NULL;
     free(b->img_q_weight); b->img_q_weight = NULL;
@@ -660,26 +463,26 @@ static void free_double_block_weights(double_block_t *b) {
 }
 
 /* Load weights for a single single_block on-demand */
-static int load_single_block_weights(single_block_t *b, safetensors_file_t **files,
-                                     int num_files, int idx, int h, int mlp, int use_bf16) {
+static int load_single_block_weights(single_block_t *b, safetensors_file_t *sf,
+                                     int idx, int h, int mlp, int use_bf16) {
     char name[256];
     (void)h; (void)mlp;  /* Unused in single block */
 
     /* QK norm weights (always f32, small) */
     snprintf(name, sizeof(name), "single_transformer_blocks.%d.attn.norm_q.weight", idx);
-    b->norm_q_weight = mmap_get_f32(files, num_files, name);
+    b->norm_q_weight = mmap_get_f32(sf, name);
     snprintf(name, sizeof(name), "single_transformer_blocks.%d.attn.norm_k.weight", idx);
-    b->norm_k_weight = mmap_get_f32(files, num_files, name);
+    b->norm_k_weight = mmap_get_f32(sf, name);
 
     /* Fused QKV+MLP input projection - skip f32 if bf16 available */
     snprintf(name, sizeof(name), "single_transformer_blocks.%d.attn.to_qkv_mlp_proj.weight", idx);
-    if (use_bf16) b->qkv_mlp_weight_bf16 = mmap_get_bf16(files, num_files, name);
-    if (!use_bf16) b->qkv_mlp_weight = mmap_get_f32(files, num_files, name);
+    if (use_bf16) b->qkv_mlp_weight_bf16 = mmap_get_bf16(sf, name);
+    if (!use_bf16) b->qkv_mlp_weight = mmap_get_f32(sf, name);
 
     /* Fused attn out + MLP down projection - skip f32 if bf16 available */
     snprintf(name, sizeof(name), "single_transformer_blocks.%d.attn.to_out.weight", idx);
-    if (use_bf16) b->proj_mlp_weight_bf16 = mmap_get_bf16(files, num_files, name);
-    if (!use_bf16) b->proj_mlp_weight = mmap_get_f32(files, num_files, name);
+    if (use_bf16) b->proj_mlp_weight_bf16 = mmap_get_bf16(sf, name);
+    if (!use_bf16) b->proj_mlp_weight = mmap_get_f32(sf, name);
 
     return 0;
 }
@@ -687,9 +490,6 @@ static int load_single_block_weights(single_block_t *b, safetensors_file_t **fil
 /* Free weights for a single single_block (mmap mode only)
  * Note: bf16 pointers are direct mmap pointers, don't free them */
 static void free_single_block_weights(single_block_t *b) {
-#ifdef USE_METAL
-    flux_metal_clear_weight_cache_only();
-#endif
     free(b->norm_q_weight); b->norm_q_weight = NULL;
     free(b->norm_k_weight); b->norm_k_weight = NULL;
     free(b->qkv_mlp_weight); b->qkv_mlp_weight = NULL;
@@ -697,16 +497,6 @@ static void free_single_block_weights(single_block_t *b) {
     /* bf16 pointers are direct mmap pointers - just clear, don't free */
     b->qkv_mlp_weight_bf16 = NULL;
     b->proj_mlp_weight_bf16 = NULL;
-}
-
-/* Free cached mmap weights for all blocks.
- * Called after denoising completes to release memory held across steps. */
-void flux_transformer_free_mmap_cache(flux_transformer_t *tf) {
-    if (!tf || !tf->use_mmap) return;
-    for (int i = 0; i < tf->num_double_layers; i++)
-        free_double_block_weights(&tf->double_blocks[i]);
-    for (int i = 0; i < tf->num_single_layers; i++)
-        free_single_block_weights(&tf->single_blocks[i]);
 }
 
 #ifdef USE_METAL
@@ -732,7 +522,7 @@ static void warmup_mmap_bf16_buffers(flux_transformer_t *tf) {
 
     /* Double blocks */
     for (int i = 0; i < tf->num_double_layers; i++) {
-        load_double_block_weights(&tf->double_blocks[i], tf->sf_files, tf->num_sf_files, i, h, mlp, 1);
+        load_double_block_weights(&tf->double_blocks[i], tf->sf, i, h, mlp, 1);
         double_block_t *b = &tf->double_blocks[i];
 
         if (b->img_q_weight_bf16)
@@ -770,7 +560,7 @@ static void warmup_mmap_bf16_buffers(flux_transformer_t *tf) {
 
     /* Single blocks */
     for (int i = 0; i < tf->num_single_layers; i++) {
-        load_single_block_weights(&tf->single_blocks[i], tf->sf_files, tf->num_sf_files, i, h, mlp, 1);
+        load_single_block_weights(&tf->single_blocks[i], tf->sf, i, h, mlp, 1);
         single_block_t *b = &tf->single_blocks[i];
 
         if (b->qkv_mlp_weight_bf16)
@@ -1332,7 +1122,7 @@ static void apply_qk_norm(float *q, float *k,
 
 /* Multi-head self-attention */
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_BLAS)
 /* Transpose from [seq, heads, head_dim] to [heads, seq, head_dim]
  * Needed for batched attention that processes each head separately */
 static void transpose_shd_to_hsd(float *out, const float *in,
@@ -1357,7 +1147,7 @@ static void transpose_hsd_to_shd(float *out, const float *in,
         }
     }
 }
-#endif /* USE_METAL */
+#endif /* USE_METAL || USE_BLAS */
 
 /* Ensure attn_scores buffer is large enough for current sequence lengths.
  * Only needed for BLAS/Metal paths - flash attention doesn't use this buffer.
@@ -1464,105 +1254,6 @@ static int ensure_work_buffers(flux_transformer_t *tf, int total_seq) {
     return 0;
 }
 
-/* ========================================================================
- * Thread-parallel attention for BLAS path.
- * Per-head sgemm is too small for BLAS internal threading, so we
- * parallelize across heads using pthreads instead.
- * ======================================================================== */
-
-#ifdef USE_BLAS
-/* Work descriptor for self-attention (single blocks) */
-typedef struct {
-    const float *q, *k, *v;
-    float *out, *scores;
-    int seq, head_dim, hidden;
-    float scale;
-    int head_start, head_end;
-} mha_thread_work_t;
-
-static void *mha_thread_worker(void *arg) {
-    mha_thread_work_t *w = (mha_thread_work_t *)arg;
-    for (int h = w->head_start; h < w->head_end; h++) {
-        const float *qh = w->q + h * w->head_dim;
-        const float *kh = w->k + h * w->head_dim;
-        const float *vh = w->v + h * w->head_dim;
-        float *oh = w->out + h * w->head_dim;
-        float *sh = w->scores + (size_t)h * w->seq * w->seq;
-
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                    w->seq, w->seq, w->head_dim,
-                    w->scale, qh, w->hidden, kh, w->hidden,
-                    0.0f, sh, w->seq);
-        flux_softmax_cpu(sh, w->seq, w->seq);
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                    w->seq, w->head_dim, w->seq,
-                    1.0f, sh, w->seq, vh, w->hidden,
-                    0.0f, oh, w->hidden);
-    }
-    return NULL;
-}
-
-/* Work descriptor for joint attention (double blocks) */
-typedef struct {
-    const float *img_q, *txt_q, *cat_k, *cat_v;
-    float *img_out, *txt_out, *scores;
-    int img_seq, txt_seq, total_seq, head_dim, hidden;
-    float scale;
-    int head_start, head_end;
-} joint_attn_thread_work_t;
-
-static void *joint_attn_thread_worker(void *arg) {
-    joint_attn_thread_work_t *w = (joint_attn_thread_work_t *)arg;
-    for (int h = w->head_start; h < w->head_end; h++) {
-        const float *img_qh = w->img_q + h * w->head_dim;
-        const float *txt_qh = w->txt_q + h * w->head_dim;
-        const float *kh = w->cat_k + h * w->head_dim;
-        const float *vh = w->cat_v + h * w->head_dim;
-        float *img_oh = w->img_out + h * w->head_dim;
-        float *txt_oh = w->txt_out + h * w->head_dim;
-        float *img_sh = w->scores + (size_t)h * w->total_seq * w->total_seq;
-        float *txt_sh = img_sh + (size_t)w->img_seq * w->total_seq;
-
-        /* Image attention */
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                    w->img_seq, w->total_seq, w->head_dim,
-                    w->scale, img_qh, w->hidden, kh, w->hidden,
-                    0.0f, img_sh, w->total_seq);
-        flux_softmax_cpu(img_sh, w->img_seq, w->total_seq);
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                    w->img_seq, w->head_dim, w->total_seq,
-                    1.0f, img_sh, w->total_seq, vh, w->hidden,
-                    0.0f, img_oh, w->hidden);
-
-        /* Text attention */
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                    w->txt_seq, w->total_seq, w->head_dim,
-                    w->scale, txt_qh, w->hidden, kh, w->hidden,
-                    0.0f, txt_sh, w->total_seq);
-        flux_softmax_cpu(txt_sh, w->txt_seq, w->total_seq);
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                    w->txt_seq, w->head_dim, w->total_seq,
-                    1.0f, txt_sh, w->total_seq, vh, w->hidden,
-                    0.0f, txt_oh, w->hidden);
-    }
-    return NULL;
-}
-
-/* Get number of threads for head-parallel attention.
- * Uses CPU core count, capped to divide num_heads evenly. */
-static int get_attn_num_threads(int heads) {
-    static int cached = 0;
-    if (cached) return cached;
-    int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
-    if (ncpu < 2) { cached = 1; return 1; }
-    if (ncpu > heads) ncpu = heads;
-    /* Round down to divide heads evenly */
-    while (heads % ncpu != 0) ncpu--;
-    cached = ncpu;
-    return cached;
-}
-#endif /* USE_BLAS */
-
 /* Multi-head attention with BLAS optimization
  * Uses pre-allocated workspace buffers from transformer struct
  */
@@ -1601,58 +1292,78 @@ static void mha_forward(float *out, const float *q, const float *k, const float 
     }
 #endif
 
+#ifdef USE_CUDA
+    /* CUDA fast path for [seq, hidden] layout used by single-stream blocks.
+     * Avoids CPU SHD<->HSD transposes by doing them on-device. */
+    if (!getenv("FLUX_CUDA_NO_SHD_ATTN") &&
+        flux_cuda_attention_batched_shd(out, q, k, v,
+                                        tf->num_heads, seq, seq, head_dim,
+                                        scale, 0, NULL)) {
+        return;
+    }
+#endif
+
     /* CPU fallback: Use BLAS-optimized attention (faster) or flash attention (memory-efficient) */
 #ifdef USE_BLAS
-    /* BLAS path: thread-parallel per-head attention.
-     * Q, K, V are [seq, heads*head_dim] layout. We use lda=hidden to stride
-     * over heads, reading head_dim elements per row directly.
-     * Per-head sgemm is too small for BLAS internal threading, so we
-     * parallelize across heads with pthreads for better core utilization. */
+    /* BLAS path: transpose + batched matrix multiply per head */
     {
-        int hidden = tf->num_heads * head_dim;
+        float *q_t = tf->attn_q_t;
+        float *k_t = tf->attn_k_t;
+        float *v_t = tf->attn_v_t;
+        float *out_t = tf->attn_out_t;
         float *scores = tf->attn_scores;
-        int nthreads = get_attn_num_threads(tf->num_heads);
-        int heads_per_thread = tf->num_heads / nthreads;
 
-        if (nthreads <= 1) {
-            /* Serial fallback */
-            for (int h = 0; h < tf->num_heads; h++) {
-                const float *qh = q + h * head_dim;
-                const float *kh = k + h * head_dim;
-                const float *vh = v + h * head_dim;
-                float *oh = out + h * head_dim;
-                float *sh = scores + (size_t)h * seq * seq;
+        /* Transpose to [heads, seq, head_dim] for efficient BLAS operations */
+        transpose_shd_to_hsd(q_t, q, seq, tf->num_heads, head_dim);
+        transpose_shd_to_hsd(k_t, k, seq, tf->num_heads, head_dim);
+        transpose_shd_to_hsd(v_t, v, seq, tf->num_heads, head_dim);
 
-                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                            seq, seq, head_dim,
-                            scale, qh, hidden, kh, hidden,
-                            0.0f, sh, seq);
-                flux_softmax(sh, seq, seq);
-                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                            seq, head_dim, seq,
-                            1.0f, sh, seq, vh, hidden,
-                            0.0f, oh, hidden);
-            }
-        } else {
-            pthread_t threads[nthreads];
-            mha_thread_work_t work[nthreads];
-            int ok[nthreads];
-            for (int t = 0; t < nthreads; t++) {
-                work[t] = (mha_thread_work_t){
-                    .q = q, .k = k, .v = v,
-                    .out = out, .scores = scores,
-                    .seq = seq, .head_dim = head_dim, .hidden = hidden,
-                    .scale = scale,
-                    .head_start = t * heads_per_thread,
-                    .head_end = (t + 1) * heads_per_thread,
-                };
-                ok[t] = pthread_create(&threads[t], NULL, mha_thread_worker, &work[t]) == 0;
-                if (!ok[t]) mha_thread_worker(&work[t]);
-            }
-            for (int t = 0; t < nthreads; t++) {
-                if (ok[t]) pthread_join(threads[t], NULL);
-            }
+#ifdef USE_CUDA
+        if (flux_cuda_attention_batched(out_t, q_t, k_t, v_t,
+                                        tf->num_heads, seq, seq, head_dim,
+                                        scale, 0, NULL)) {
+            transpose_hsd_to_shd(out, out_t, seq, tf->num_heads, head_dim);
+            return;
         }
+#endif
+
+        /* Process each head with BLAS */
+        for (int h = 0; h < tf->num_heads; h++) {
+            float *qh = q_t + h * seq * head_dim;
+            float *kh = k_t + h * seq * head_dim;
+            float *vh = v_t + h * seq * head_dim;
+            float *oh = out_t + h * seq * head_dim;
+            float *sh = scores + h * seq * seq;
+
+            /* scores = Q @ K^T using BLAS */
+#ifdef USE_CUDA
+            flux_matmul_t(sh, qh, kh, seq, head_dim, seq);
+            for (int i = 0; i < seq * seq; i++) {
+                sh[i] *= scale;
+            }
+#else
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        seq, seq, head_dim,
+                        scale, qh, head_dim, kh, head_dim,
+                        0.0f, sh, seq);
+#endif
+
+            /* Softmax */
+            flux_softmax(sh, seq, seq);
+
+            /* out = scores @ V using BLAS */
+#ifdef USE_CUDA
+            flux_matmul(oh, sh, vh, seq, seq, head_dim);
+#else
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        seq, head_dim, seq,
+                        1.0f, sh, seq, vh, head_dim,
+                        0.0f, oh, head_dim);
+#endif
+        }
+
+        /* Transpose output back to [seq, heads, head_dim] */
+        transpose_hsd_to_shd(out, out_t, seq, tf->num_heads, head_dim);
     }
 #else
     /* Generic fallback: Use flash attention (memory-efficient, no transpose needed) */
@@ -1725,72 +1436,110 @@ static void joint_attention(float *img_out, float *txt_out,
     }
 #endif
 
+#ifdef USE_CUDA
+    /* CUDA fast path for [seq, hidden] layout in double-block joint attention.
+     * cat_k/cat_v are already built in [total_seq, hidden] sequence-major layout. */
+    if (!getenv("FLUX_CUDA_NO_SHD_ATTN") &&
+        flux_cuda_attention_batched_shd(img_out, img_q, cat_k, cat_v,
+                                        heads, img_seq, total_seq, head_dim,
+                                        scale, 0, NULL) &&
+        flux_cuda_attention_batched_shd(txt_out, txt_q, cat_k, cat_v,
+                                        heads, txt_seq, total_seq, head_dim,
+                                        scale, 0, NULL)) {
+        return;
+    }
+#endif
+
     /* CPU fallback: Use BLAS-optimized attention (faster) or flash attention (memory-efficient) */
 #ifdef USE_BLAS
-    /* BLAS path: thread-parallel per-head joint attention.
-     * All tensors are [seq, heads*head_dim] layout, use lda=hidden for strides.
-     * Each head gets its own scores slice for thread safety. */
+    /* BLAS path: transpose + batched matrix multiply per head */
     {
+        float *img_q_t = tf->attn_q_t;
+        float *txt_q_t = tf->attn_q_t + img_seq * hidden;
+        float *cat_k_t = tf->attn_k_t;
+        float *cat_v_t = tf->attn_v_t;
+        float *img_out_t = tf->attn_out_t;
+        float *txt_out_t = tf->attn_out_t + img_seq * hidden;
         float *scores = tf->attn_scores;
-        int nthreads = get_attn_num_threads(heads);
-        int heads_per_thread = heads / nthreads;
 
-        if (nthreads <= 1) {
-            /* Serial fallback */
-            for (int h = 0; h < heads; h++) {
-                const float *img_qh = img_q + h * head_dim;
-                const float *txt_qh = txt_q + h * head_dim;
-                const float *kh = cat_k + h * head_dim;
-                const float *vh = cat_v + h * head_dim;
-                float *img_oh = img_out + h * head_dim;
-                float *txt_oh = txt_out + h * head_dim;
-                float *img_sh = scores + (size_t)h * total_seq * total_seq;
-                float *txt_sh = img_sh + (size_t)img_seq * total_seq;
+        /* Transpose to [heads, seq, head_dim] for efficient BLAS operations */
+        transpose_shd_to_hsd(img_q_t, img_q, img_seq, heads, head_dim);
+        transpose_shd_to_hsd(txt_q_t, txt_q, txt_seq, heads, head_dim);
+        transpose_shd_to_hsd(cat_k_t, cat_k, total_seq, heads, head_dim);
+        transpose_shd_to_hsd(cat_v_t, cat_v, total_seq, heads, head_dim);
 
-                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                            img_seq, total_seq, head_dim,
-                            scale, img_qh, hidden, kh, hidden,
-                            0.0f, img_sh, total_seq);
-                flux_softmax(img_sh, img_seq, total_seq);
-                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                            img_seq, head_dim, total_seq,
-                            1.0f, img_sh, total_seq, vh, hidden,
-                            0.0f, img_oh, hidden);
-
-                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                            txt_seq, total_seq, head_dim,
-                            scale, txt_qh, hidden, kh, hidden,
-                            0.0f, txt_sh, total_seq);
-                flux_softmax(txt_sh, txt_seq, total_seq);
-                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                            txt_seq, head_dim, total_seq,
-                            1.0f, txt_sh, total_seq, vh, hidden,
-                            0.0f, txt_oh, hidden);
-            }
-        } else {
-            pthread_t threads[nthreads];
-            joint_attn_thread_work_t work[nthreads];
-            int ok[nthreads];
-            for (int t = 0; t < nthreads; t++) {
-                work[t] = (joint_attn_thread_work_t){
-                    .img_q = img_q, .txt_q = txt_q,
-                    .cat_k = cat_k, .cat_v = cat_v,
-                    .img_out = img_out, .txt_out = txt_out,
-                    .scores = scores,
-                    .img_seq = img_seq, .txt_seq = txt_seq,
-                    .total_seq = total_seq,
-                    .head_dim = head_dim, .hidden = hidden,
-                    .scale = scale,
-                    .head_start = t * heads_per_thread,
-                    .head_end = (t + 1) * heads_per_thread,
-                };
-                ok[t] = pthread_create(&threads[t], NULL, joint_attn_thread_worker, &work[t]) == 0;
-                if (!ok[t]) joint_attn_thread_worker(&work[t]);
-            }
-            for (int t = 0; t < nthreads; t++) {
-                if (ok[t]) pthread_join(threads[t], NULL);
-            }
+#ifdef USE_CUDA
+        if (flux_cuda_attention_batched(img_out_t, img_q_t, cat_k_t, cat_v_t,
+                                        heads, img_seq, total_seq, head_dim,
+                                        scale, 0, NULL) &&
+            flux_cuda_attention_batched(txt_out_t, txt_q_t, cat_k_t, cat_v_t,
+                                        heads, txt_seq, total_seq, head_dim,
+                                        scale, 0, NULL)) {
+            transpose_hsd_to_shd(img_out, img_out_t, img_seq, heads, head_dim);
+            transpose_hsd_to_shd(txt_out, txt_out_t, txt_seq, heads, head_dim);
+            return;
         }
+#endif
+
+        /* Process each head with BLAS */
+        for (int h = 0; h < heads; h++) {
+            float *img_qh = img_q_t + h * img_seq * head_dim;
+            float *txt_qh = txt_q_t + h * txt_seq * head_dim;
+            float *kh = cat_k_t + h * total_seq * head_dim;
+            float *vh = cat_v_t + h * total_seq * head_dim;
+            float *img_oh = img_out_t + h * img_seq * head_dim;
+            float *txt_oh = txt_out_t + h * txt_seq * head_dim;
+            float *img_sh = scores;  /* Reuse scores buffer */
+            float *txt_sh = scores + img_seq * total_seq;
+
+            /* Image attention: img_Q @ cat_K^T */
+#ifdef USE_CUDA
+            flux_matmul_t(img_sh, img_qh, kh, img_seq, head_dim, total_seq);
+            for (int i = 0; i < img_seq * total_seq; i++) {
+                img_sh[i] *= scale;
+            }
+#else
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        img_seq, total_seq, head_dim,
+                        scale, img_qh, head_dim, kh, head_dim,
+                        0.0f, img_sh, total_seq);
+#endif
+            flux_softmax(img_sh, img_seq, total_seq);
+#ifdef USE_CUDA
+            flux_matmul(img_oh, img_sh, vh, img_seq, total_seq, head_dim);
+#else
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        img_seq, head_dim, total_seq,
+                        1.0f, img_sh, total_seq, vh, head_dim,
+                        0.0f, img_oh, head_dim);
+#endif
+
+            /* Text attention: txt_Q @ cat_K^T */
+#ifdef USE_CUDA
+            flux_matmul_t(txt_sh, txt_qh, kh, txt_seq, head_dim, total_seq);
+            for (int i = 0; i < txt_seq * total_seq; i++) {
+                txt_sh[i] *= scale;
+            }
+#else
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        txt_seq, total_seq, head_dim,
+                        scale, txt_qh, head_dim, kh, head_dim,
+                        0.0f, txt_sh, total_seq);
+#endif
+            flux_softmax(txt_sh, txt_seq, total_seq);
+#ifdef USE_CUDA
+            flux_matmul(txt_oh, txt_sh, vh, txt_seq, total_seq, head_dim);
+#else
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        txt_seq, head_dim, total_seq,
+                        1.0f, txt_sh, total_seq, vh, head_dim,
+                        0.0f, txt_oh, head_dim);
+#endif
+        }
+
+        /* Transpose outputs back */
+        transpose_hsd_to_shd(img_out, img_out_t, img_seq, heads, head_dim);
+        transpose_hsd_to_shd(txt_out, txt_out_t, txt_seq, heads, head_dim);
     }
 #else
     /* Generic fallback: Use flash attention (memory-efficient, no transpose needed) */
@@ -2094,8 +1843,9 @@ static void swiglu_ffn_bf16(float *out, const float *x,
     LINEAR_BF16_OR_F32(up, x, up_weight, up_weight_bf16, seq, hidden, mlp_hidden);
     flux_gpu_end_batch();
 
-    /* SiLU(gate) * up - fused for better performance */
-    flux_silu_mul(gate, up, seq * mlp_hidden);
+    /* SiLU(gate) * up */
+    flux_silu(gate, seq * mlp_hidden);
+    flux_mul_inplace(gate, up, seq * mlp_hidden);
 
     /* Down projection */
     LINEAR_BF16_OR_F32(out, gate, down_weight, down_weight_bf16, seq, mlp_hidden, hidden);
@@ -2325,6 +2075,448 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
     block_idx++;
 #endif
 }
+
+#ifdef USE_CUDA
+/* CUDA-resident double-stream path:
+ * Keeps image/text hidden activations on device across all 5 double blocks.
+ */
+static int double_blocks_forward_cuda_resident(float *img_hidden, float *txt_hidden,
+                                               flux_transformer_t *tf,
+                                               const float *img_mod, const float *txt_mod,
+                                               const float *img_rope_cos, const float *img_rope_sin,
+                                               const float *txt_rope_cos, const float *txt_rope_sin,
+                                               int img_seq, int txt_seq) {
+    if (!img_hidden || !txt_hidden || !tf || !img_mod || !txt_mod ||
+        !img_rope_cos || !img_rope_sin || !txt_rope_cos || !txt_rope_sin) {
+        return 0;
+    }
+    if (tf->use_mmap || tf->use_bf16) {
+        return 0;
+    }
+
+    int hidden = tf->hidden_size;
+    int heads = tf->num_heads;
+    int head_dim = tf->head_dim;
+    int mlp_hidden = tf->mlp_hidden;
+    int total_seq = img_seq + txt_seq;
+    float eps = 1e-6f;
+    float attn_scale = 1.0f / sqrtf((float)head_dim);
+
+    const float *img_shift1 = img_mod;
+    const float *img_scale1 = img_mod + hidden;
+    const float *img_gate1 = img_mod + hidden * 2;
+    const float *img_shift2 = img_mod + hidden * 3;
+    const float *img_scale2 = img_mod + hidden * 4;
+    const float *img_gate2 = img_mod + hidden * 5;
+
+    const float *txt_shift1 = txt_mod;
+    const float *txt_scale1 = txt_mod + hidden;
+    const float *txt_gate1 = txt_mod + hidden * 2;
+    const float *txt_shift2 = txt_mod + hidden * 3;
+    const float *txt_scale2 = txt_mod + hidden * 4;
+    const float *txt_gate2 = txt_mod + hidden * 5;
+
+    typedef struct {
+        const flux_transformer_t *tf;
+        int img_seq, txt_seq;
+        const float *host_img_rope_cos, *host_img_rope_sin;
+        const float *host_txt_rope_cos, *host_txt_rope_sin;
+        int streams_ready;
+        cudaStream_t stream_main, stream_img, stream_txt;
+        float *d_img_hidden, *d_txt_hidden;
+        float *d_img_norm, *d_txt_norm;
+        float *d_img_q, *d_img_k, *d_img_v;
+        float *d_txt_q, *d_txt_k, *d_txt_v;
+        float *d_cat_k, *d_cat_v;
+        float *d_img_attn_out, *d_txt_attn_out;
+        float *d_img_proj, *d_txt_proj;
+        float *d_img_gate_ffn, *d_img_up_ffn, *d_img_down;
+        float *d_txt_gate_ffn, *d_txt_up_ffn, *d_txt_down;
+        float *d_img_shift1, *d_img_scale1, *d_img_gate1;
+        float *d_img_shift2, *d_img_scale2, *d_img_gate2;
+        float *d_txt_shift1, *d_txt_scale1, *d_txt_gate1;
+        float *d_txt_shift2, *d_txt_scale2, *d_txt_gate2;
+        float *d_img_rope_cos, *d_img_rope_sin;
+        float *d_txt_rope_cos, *d_txt_rope_sin;
+        float *d_img_norm_q_all, *d_img_norm_k_all;
+        float *d_txt_norm_q_all, *d_txt_norm_k_all;
+    } cuda_double_ctx_t;
+
+    static cuda_double_ctx_t s = {0};
+    int ok = 0;
+    int parallel = getenv("FLUX_CUDA_DOUBLE_PARALLEL") ? 1 : 0;
+
+#define CUDA_FREE_PTR(ptr) do { if (ptr) { cudaFree(ptr); ptr = NULL; } } while (0)
+#define CUDA_ALLOC_PTR(ptr, elems) \
+    do { \
+        if (cudaMalloc((void **)&(ptr), (size_t)(elems) * sizeof(float)) != cudaSuccess) goto fail; \
+    } while (0)
+#define CUDA_H2D(dst, src, elems) \
+    do { \
+        if (cudaMemcpy((dst), (src), (size_t)(elems) * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) goto fail; \
+    } while (0)
+#define CUDA_D2H(dst, src, elems) \
+    do { \
+        if (cudaMemcpy((dst), (src), (size_t)(elems) * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) goto fail; \
+    } while (0)
+#define CUDA_SET_STREAM(stream_) \
+    do { \
+        if (!flux_cuda_linear_set_stream((void *)(stream_))) goto fail; \
+        if (!flux_cuda_ops_set_stream((void *)(stream_))) goto fail; \
+    } while (0)
+
+    int need_realloc = (!s.d_img_hidden ||
+                        s.tf != tf ||
+                        s.img_seq != img_seq ||
+                        s.txt_seq != txt_seq);
+    if (need_realloc) {
+        CUDA_FREE_PTR(s.d_img_hidden);
+        CUDA_FREE_PTR(s.d_txt_hidden);
+        CUDA_FREE_PTR(s.d_img_norm);
+        CUDA_FREE_PTR(s.d_txt_norm);
+        CUDA_FREE_PTR(s.d_img_q);
+        CUDA_FREE_PTR(s.d_img_k);
+        CUDA_FREE_PTR(s.d_img_v);
+        CUDA_FREE_PTR(s.d_txt_q);
+        CUDA_FREE_PTR(s.d_txt_k);
+        CUDA_FREE_PTR(s.d_txt_v);
+        CUDA_FREE_PTR(s.d_cat_k);
+        CUDA_FREE_PTR(s.d_cat_v);
+        CUDA_FREE_PTR(s.d_img_attn_out);
+        CUDA_FREE_PTR(s.d_txt_attn_out);
+        CUDA_FREE_PTR(s.d_img_proj);
+        CUDA_FREE_PTR(s.d_txt_proj);
+        CUDA_FREE_PTR(s.d_img_gate_ffn);
+        CUDA_FREE_PTR(s.d_img_up_ffn);
+        CUDA_FREE_PTR(s.d_img_down);
+        CUDA_FREE_PTR(s.d_txt_gate_ffn);
+        CUDA_FREE_PTR(s.d_txt_up_ffn);
+        CUDA_FREE_PTR(s.d_txt_down);
+        CUDA_FREE_PTR(s.d_img_shift1);
+        CUDA_FREE_PTR(s.d_img_scale1);
+        CUDA_FREE_PTR(s.d_img_gate1);
+        CUDA_FREE_PTR(s.d_img_shift2);
+        CUDA_FREE_PTR(s.d_img_scale2);
+        CUDA_FREE_PTR(s.d_img_gate2);
+        CUDA_FREE_PTR(s.d_txt_shift1);
+        CUDA_FREE_PTR(s.d_txt_scale1);
+        CUDA_FREE_PTR(s.d_txt_gate1);
+        CUDA_FREE_PTR(s.d_txt_shift2);
+        CUDA_FREE_PTR(s.d_txt_scale2);
+        CUDA_FREE_PTR(s.d_txt_gate2);
+        CUDA_FREE_PTR(s.d_img_rope_cos);
+        CUDA_FREE_PTR(s.d_img_rope_sin);
+        CUDA_FREE_PTR(s.d_txt_rope_cos);
+        CUDA_FREE_PTR(s.d_txt_rope_sin);
+        CUDA_FREE_PTR(s.d_img_norm_q_all);
+        CUDA_FREE_PTR(s.d_img_norm_k_all);
+        CUDA_FREE_PTR(s.d_txt_norm_q_all);
+        CUDA_FREE_PTR(s.d_txt_norm_k_all);
+
+        CUDA_ALLOC_PTR(s.d_img_hidden, (size_t)img_seq * hidden);
+        CUDA_ALLOC_PTR(s.d_txt_hidden, (size_t)txt_seq * hidden);
+        CUDA_ALLOC_PTR(s.d_img_norm, (size_t)img_seq * hidden);
+        CUDA_ALLOC_PTR(s.d_txt_norm, (size_t)txt_seq * hidden);
+        CUDA_ALLOC_PTR(s.d_img_q, (size_t)img_seq * hidden);
+        CUDA_ALLOC_PTR(s.d_img_k, (size_t)img_seq * hidden);
+        CUDA_ALLOC_PTR(s.d_img_v, (size_t)img_seq * hidden);
+        CUDA_ALLOC_PTR(s.d_txt_q, (size_t)txt_seq * hidden);
+        CUDA_ALLOC_PTR(s.d_txt_k, (size_t)txt_seq * hidden);
+        CUDA_ALLOC_PTR(s.d_txt_v, (size_t)txt_seq * hidden);
+        CUDA_ALLOC_PTR(s.d_cat_k, (size_t)total_seq * hidden);
+        CUDA_ALLOC_PTR(s.d_cat_v, (size_t)total_seq * hidden);
+        CUDA_ALLOC_PTR(s.d_img_attn_out, (size_t)img_seq * hidden);
+        CUDA_ALLOC_PTR(s.d_txt_attn_out, (size_t)txt_seq * hidden);
+        CUDA_ALLOC_PTR(s.d_img_proj, (size_t)img_seq * hidden);
+        CUDA_ALLOC_PTR(s.d_txt_proj, (size_t)txt_seq * hidden);
+        CUDA_ALLOC_PTR(s.d_img_gate_ffn, (size_t)img_seq * mlp_hidden);
+        CUDA_ALLOC_PTR(s.d_img_up_ffn, (size_t)img_seq * mlp_hidden);
+        CUDA_ALLOC_PTR(s.d_img_down, (size_t)img_seq * hidden);
+        CUDA_ALLOC_PTR(s.d_txt_gate_ffn, (size_t)txt_seq * mlp_hidden);
+        CUDA_ALLOC_PTR(s.d_txt_up_ffn, (size_t)txt_seq * mlp_hidden);
+        CUDA_ALLOC_PTR(s.d_txt_down, (size_t)txt_seq * hidden);
+
+        CUDA_ALLOC_PTR(s.d_img_shift1, hidden);
+        CUDA_ALLOC_PTR(s.d_img_scale1, hidden);
+        CUDA_ALLOC_PTR(s.d_img_gate1, hidden);
+        CUDA_ALLOC_PTR(s.d_img_shift2, hidden);
+        CUDA_ALLOC_PTR(s.d_img_scale2, hidden);
+        CUDA_ALLOC_PTR(s.d_img_gate2, hidden);
+        CUDA_ALLOC_PTR(s.d_txt_shift1, hidden);
+        CUDA_ALLOC_PTR(s.d_txt_scale1, hidden);
+        CUDA_ALLOC_PTR(s.d_txt_gate1, hidden);
+        CUDA_ALLOC_PTR(s.d_txt_shift2, hidden);
+        CUDA_ALLOC_PTR(s.d_txt_scale2, hidden);
+        CUDA_ALLOC_PTR(s.d_txt_gate2, hidden);
+
+        CUDA_ALLOC_PTR(s.d_img_rope_cos, (size_t)img_seq * head_dim);
+        CUDA_ALLOC_PTR(s.d_img_rope_sin, (size_t)img_seq * head_dim);
+        CUDA_ALLOC_PTR(s.d_txt_rope_cos, (size_t)txt_seq * head_dim);
+        CUDA_ALLOC_PTR(s.d_txt_rope_sin, (size_t)txt_seq * head_dim);
+        CUDA_ALLOC_PTR(s.d_img_norm_q_all, (size_t)tf->num_double_layers * head_dim);
+        CUDA_ALLOC_PTR(s.d_img_norm_k_all, (size_t)tf->num_double_layers * head_dim);
+        CUDA_ALLOC_PTR(s.d_txt_norm_q_all, (size_t)tf->num_double_layers * head_dim);
+        CUDA_ALLOC_PTR(s.d_txt_norm_k_all, (size_t)tf->num_double_layers * head_dim);
+
+        for (int i = 0; i < tf->num_double_layers; i++) {
+            const double_block_t *b = &tf->double_blocks[i];
+            if (!b->img_norm_q_weight || !b->img_norm_k_weight ||
+                !b->txt_norm_q_weight || !b->txt_norm_k_weight) {
+                goto fail;
+            }
+            CUDA_H2D(s.d_img_norm_q_all + (size_t)i * head_dim, b->img_norm_q_weight, head_dim);
+            CUDA_H2D(s.d_img_norm_k_all + (size_t)i * head_dim, b->img_norm_k_weight, head_dim);
+            CUDA_H2D(s.d_txt_norm_q_all + (size_t)i * head_dim, b->txt_norm_q_weight, head_dim);
+            CUDA_H2D(s.d_txt_norm_k_all + (size_t)i * head_dim, b->txt_norm_k_weight, head_dim);
+        }
+
+        if (!s.stream_main) {
+            if (cudaStreamCreateWithFlags(&s.stream_main, cudaStreamNonBlocking) != cudaSuccess) goto fail;
+        }
+        if (parallel && !s.streams_ready) {
+            if (cudaStreamCreateWithFlags(&s.stream_img, cudaStreamNonBlocking) != cudaSuccess) goto fail;
+            if (cudaStreamCreateWithFlags(&s.stream_txt, cudaStreamNonBlocking) != cudaSuccess) goto fail;
+            s.streams_ready = 1;
+        }
+
+        s.tf = tf;
+        s.img_seq = img_seq;
+        s.txt_seq = txt_seq;
+        s.host_img_rope_cos = NULL;
+        s.host_img_rope_sin = NULL;
+        s.host_txt_rope_cos = NULL;
+        s.host_txt_rope_sin = NULL;
+    }
+
+    CUDA_H2D(s.d_img_hidden, img_hidden, (size_t)img_seq * hidden);
+    CUDA_H2D(s.d_txt_hidden, txt_hidden, (size_t)txt_seq * hidden);
+    CUDA_H2D(s.d_img_shift1, img_shift1, hidden);
+    CUDA_H2D(s.d_img_scale1, img_scale1, hidden);
+    CUDA_H2D(s.d_img_gate1, img_gate1, hidden);
+    CUDA_H2D(s.d_img_shift2, img_shift2, hidden);
+    CUDA_H2D(s.d_img_scale2, img_scale2, hidden);
+    CUDA_H2D(s.d_img_gate2, img_gate2, hidden);
+    CUDA_H2D(s.d_txt_shift1, txt_shift1, hidden);
+    CUDA_H2D(s.d_txt_scale1, txt_scale1, hidden);
+    CUDA_H2D(s.d_txt_gate1, txt_gate1, hidden);
+    CUDA_H2D(s.d_txt_shift2, txt_shift2, hidden);
+    CUDA_H2D(s.d_txt_scale2, txt_scale2, hidden);
+    CUDA_H2D(s.d_txt_gate2, txt_gate2, hidden);
+
+    if (s.host_img_rope_cos != img_rope_cos || s.host_img_rope_sin != img_rope_sin) {
+        CUDA_H2D(s.d_img_rope_cos, img_rope_cos, (size_t)img_seq * head_dim);
+        CUDA_H2D(s.d_img_rope_sin, img_rope_sin, (size_t)img_seq * head_dim);
+        s.host_img_rope_cos = img_rope_cos;
+        s.host_img_rope_sin = img_rope_sin;
+    }
+    if (s.host_txt_rope_cos != txt_rope_cos || s.host_txt_rope_sin != txt_rope_sin) {
+        CUDA_H2D(s.d_txt_rope_cos, txt_rope_cos, (size_t)txt_seq * head_dim);
+        CUDA_H2D(s.d_txt_rope_sin, txt_rope_sin, (size_t)txt_seq * head_dim);
+        s.host_txt_rope_cos = txt_rope_cos;
+        s.host_txt_rope_sin = txt_rope_sin;
+    }
+
+    CUDA_SET_STREAM(s.stream_main);
+
+    for (int i = 0; i < tf->num_double_layers; i++) {
+        const double_block_t *b = &tf->double_blocks[i];
+        const float *d_img_norm_q = s.d_img_norm_q_all + (size_t)i * head_dim;
+        const float *d_img_norm_k = s.d_img_norm_k_all + (size_t)i * head_dim;
+        const float *d_txt_norm_q = s.d_txt_norm_q_all + (size_t)i * head_dim;
+        const float *d_txt_norm_k = s.d_txt_norm_k_all + (size_t)i * head_dim;
+
+        if (!b->img_q_weight || !b->img_k_weight || !b->img_v_weight ||
+            !b->txt_q_weight || !b->txt_k_weight || !b->txt_v_weight ||
+            !b->img_proj_weight || !b->txt_proj_weight ||
+            !b->img_mlp_gate_weight || !b->img_mlp_up_weight || !b->img_mlp_down_weight ||
+            !b->txt_mlp_gate_weight || !b->txt_mlp_up_weight || !b->txt_mlp_down_weight) {
+            goto fail;
+        }
+
+        if (parallel && s.streams_ready) {
+            CUDA_SET_STREAM(s.stream_img);
+            if (!flux_cuda_adaln_norm_device(s.d_img_norm, s.d_img_hidden, s.d_img_shift1, s.d_img_scale1,
+                                             img_seq, hidden, eps)) goto fail;
+            CUDA_SET_STREAM(s.stream_txt);
+            if (!flux_cuda_adaln_norm_device(s.d_txt_norm, s.d_txt_hidden, s.d_txt_shift1, s.d_txt_scale1,
+                                             txt_seq, hidden, eps)) goto fail;
+            if (cudaStreamSynchronize(s.stream_img) != cudaSuccess) goto fail;
+            if (cudaStreamSynchronize(s.stream_txt) != cudaSuccess) goto fail;
+
+            CUDA_SET_STREAM(s.stream_img);
+            if (!flux_cuda_linear_nobias_device(s.d_img_q, s.d_img_norm, b->img_q_weight, img_seq, hidden, hidden)) goto fail;
+            if (!flux_cuda_linear_nobias_device(s.d_img_k, s.d_img_norm, b->img_k_weight, img_seq, hidden, hidden)) goto fail;
+            if (!flux_cuda_linear_nobias_device(s.d_img_v, s.d_img_norm, b->img_v_weight, img_seq, hidden, hidden)) goto fail;
+            CUDA_SET_STREAM(s.stream_txt);
+            if (!flux_cuda_linear_nobias_device(s.d_txt_q, s.d_txt_norm, b->txt_q_weight, txt_seq, hidden, hidden)) goto fail;
+            if (!flux_cuda_linear_nobias_device(s.d_txt_k, s.d_txt_norm, b->txt_k_weight, txt_seq, hidden, hidden)) goto fail;
+            if (!flux_cuda_linear_nobias_device(s.d_txt_v, s.d_txt_norm, b->txt_v_weight, txt_seq, hidden, hidden)) goto fail;
+            if (cudaStreamSynchronize(s.stream_img) != cudaSuccess) goto fail;
+            if (cudaStreamSynchronize(s.stream_txt) != cudaSuccess) goto fail;
+
+            CUDA_SET_STREAM(s.stream_img);
+            if (!flux_cuda_qk_rms_norm_device(s.d_img_q, s.d_img_k, d_img_norm_q, d_img_norm_k,
+                                              img_seq, heads, head_dim, eps)) goto fail;
+            if (!flux_cuda_rope_unified_device(s.d_img_q, s.d_img_k,
+                                               s.d_img_rope_cos, s.d_img_rope_sin,
+                                               s.d_img_rope_cos, s.d_img_rope_sin,
+                                               img_seq, 0, heads, head_dim)) goto fail;
+            CUDA_SET_STREAM(s.stream_txt);
+            if (!flux_cuda_qk_rms_norm_device(s.d_txt_q, s.d_txt_k, d_txt_norm_q, d_txt_norm_k,
+                                              txt_seq, heads, head_dim, eps)) goto fail;
+            if (!flux_cuda_rope_unified_device(s.d_txt_q, s.d_txt_k,
+                                               s.d_txt_rope_cos, s.d_txt_rope_sin,
+                                               s.d_txt_rope_cos, s.d_txt_rope_sin,
+                                               txt_seq, txt_seq, heads, head_dim)) goto fail;
+            if (cudaStreamSynchronize(s.stream_img) != cudaSuccess) goto fail;
+            if (cudaStreamSynchronize(s.stream_txt) != cudaSuccess) goto fail;
+        } else {
+            CUDA_SET_STREAM(s.stream_main);
+            if (!flux_cuda_adaln_norm_device(s.d_img_norm, s.d_img_hidden, s.d_img_shift1, s.d_img_scale1,
+                                             img_seq, hidden, eps)) goto fail;
+            if (!flux_cuda_adaln_norm_device(s.d_txt_norm, s.d_txt_hidden, s.d_txt_shift1, s.d_txt_scale1,
+                                             txt_seq, hidden, eps)) goto fail;
+
+            if (!flux_cuda_linear_nobias_device(s.d_img_q, s.d_img_norm, b->img_q_weight, img_seq, hidden, hidden)) goto fail;
+            if (!flux_cuda_linear_nobias_device(s.d_img_k, s.d_img_norm, b->img_k_weight, img_seq, hidden, hidden)) goto fail;
+            if (!flux_cuda_linear_nobias_device(s.d_img_v, s.d_img_norm, b->img_v_weight, img_seq, hidden, hidden)) goto fail;
+            if (!flux_cuda_linear_nobias_device(s.d_txt_q, s.d_txt_norm, b->txt_q_weight, txt_seq, hidden, hidden)) goto fail;
+            if (!flux_cuda_linear_nobias_device(s.d_txt_k, s.d_txt_norm, b->txt_k_weight, txt_seq, hidden, hidden)) goto fail;
+            if (!flux_cuda_linear_nobias_device(s.d_txt_v, s.d_txt_norm, b->txt_v_weight, txt_seq, hidden, hidden)) goto fail;
+
+            if (!flux_cuda_qk_rms_norm_device(s.d_img_q, s.d_img_k, d_img_norm_q, d_img_norm_k,
+                                              img_seq, heads, head_dim, eps)) goto fail;
+            if (!flux_cuda_qk_rms_norm_device(s.d_txt_q, s.d_txt_k, d_txt_norm_q, d_txt_norm_k,
+                                              txt_seq, heads, head_dim, eps)) goto fail;
+            if (!flux_cuda_rope_unified_device(s.d_img_q, s.d_img_k,
+                                               s.d_img_rope_cos, s.d_img_rope_sin,
+                                               s.d_img_rope_cos, s.d_img_rope_sin,
+                                               img_seq, 0, heads, head_dim)) goto fail;
+            if (!flux_cuda_rope_unified_device(s.d_txt_q, s.d_txt_k,
+                                               s.d_txt_rope_cos, s.d_txt_rope_sin,
+                                               s.d_txt_rope_cos, s.d_txt_rope_sin,
+                                               txt_seq, txt_seq, heads, head_dim)) goto fail;
+        }
+
+        CUDA_SET_STREAM(s.stream_main);
+        if (!flux_cuda_concat_seq_device(s.d_cat_k, s.d_txt_k, s.d_img_k, txt_seq, img_seq, hidden)) goto fail;
+        if (!flux_cuda_concat_seq_device(s.d_cat_v, s.d_txt_v, s.d_img_v, txt_seq, img_seq, hidden)) goto fail;
+
+        if (!flux_cuda_attention_batched_shd_device(s.d_img_attn_out, s.d_img_q, s.d_cat_k, s.d_cat_v,
+                                                    heads, img_seq, total_seq, head_dim,
+                                                    attn_scale, 0, NULL)) goto fail;
+        if (!flux_cuda_attention_batched_shd_device(s.d_txt_attn_out, s.d_txt_q, s.d_cat_k, s.d_cat_v,
+                                                    heads, txt_seq, total_seq, head_dim,
+                                                    attn_scale, 0, NULL)) goto fail;
+
+        if (parallel && s.streams_ready) {
+            CUDA_SET_STREAM(s.stream_img);
+            if (!flux_cuda_linear_nobias_device(s.d_img_proj, s.d_img_attn_out, b->img_proj_weight,
+                                                img_seq, hidden, hidden)) goto fail;
+            if (!flux_cuda_gated_add_device(s.d_img_hidden, s.d_img_gate1, s.d_img_proj, img_seq, hidden)) goto fail;
+            CUDA_SET_STREAM(s.stream_txt);
+            if (!flux_cuda_linear_nobias_device(s.d_txt_proj, s.d_txt_attn_out, b->txt_proj_weight,
+                                                txt_seq, hidden, hidden)) goto fail;
+            if (!flux_cuda_gated_add_device(s.d_txt_hidden, s.d_txt_gate1, s.d_txt_proj, txt_seq, hidden)) goto fail;
+            if (cudaStreamSynchronize(s.stream_img) != cudaSuccess) goto fail;
+            if (cudaStreamSynchronize(s.stream_txt) != cudaSuccess) goto fail;
+
+            CUDA_SET_STREAM(s.stream_img);
+            if (!flux_cuda_adaln_norm_device(s.d_img_norm, s.d_img_hidden, s.d_img_shift2, s.d_img_scale2,
+                                             img_seq, hidden, eps)) goto fail;
+            CUDA_SET_STREAM(s.stream_txt);
+            if (!flux_cuda_adaln_norm_device(s.d_txt_norm, s.d_txt_hidden, s.d_txt_shift2, s.d_txt_scale2,
+                                             txt_seq, hidden, eps)) goto fail;
+            if (cudaStreamSynchronize(s.stream_img) != cudaSuccess) goto fail;
+            if (cudaStreamSynchronize(s.stream_txt) != cudaSuccess) goto fail;
+
+            CUDA_SET_STREAM(s.stream_img);
+            if (!flux_cuda_linear_nobias_device(s.d_img_gate_ffn, s.d_img_norm, b->img_mlp_gate_weight,
+                                                img_seq, hidden, mlp_hidden)) goto fail;
+            if (!flux_cuda_linear_nobias_device(s.d_img_up_ffn, s.d_img_norm, b->img_mlp_up_weight,
+                                                img_seq, hidden, mlp_hidden)) goto fail;
+            CUDA_SET_STREAM(s.stream_txt);
+            if (!flux_cuda_linear_nobias_device(s.d_txt_gate_ffn, s.d_txt_norm, b->txt_mlp_gate_weight,
+                                                txt_seq, hidden, mlp_hidden)) goto fail;
+            if (!flux_cuda_linear_nobias_device(s.d_txt_up_ffn, s.d_txt_norm, b->txt_mlp_up_weight,
+                                                txt_seq, hidden, mlp_hidden)) goto fail;
+            if (cudaStreamSynchronize(s.stream_img) != cudaSuccess) goto fail;
+            if (cudaStreamSynchronize(s.stream_txt) != cudaSuccess) goto fail;
+
+            CUDA_SET_STREAM(s.stream_img);
+            if (!flux_cuda_silu_mul_device(s.d_img_gate_ffn, s.d_img_up_ffn, img_seq * mlp_hidden)) goto fail;
+            CUDA_SET_STREAM(s.stream_txt);
+            if (!flux_cuda_silu_mul_device(s.d_txt_gate_ffn, s.d_txt_up_ffn, txt_seq * mlp_hidden)) goto fail;
+            if (cudaStreamSynchronize(s.stream_img) != cudaSuccess) goto fail;
+            if (cudaStreamSynchronize(s.stream_txt) != cudaSuccess) goto fail;
+
+            CUDA_SET_STREAM(s.stream_img);
+            if (!flux_cuda_linear_nobias_device(s.d_img_down, s.d_img_gate_ffn, b->img_mlp_down_weight,
+                                                img_seq, mlp_hidden, hidden)) goto fail;
+            if (!flux_cuda_gated_add_device(s.d_img_hidden, s.d_img_gate2, s.d_img_down, img_seq, hidden)) goto fail;
+            CUDA_SET_STREAM(s.stream_txt);
+            if (!flux_cuda_linear_nobias_device(s.d_txt_down, s.d_txt_gate_ffn, b->txt_mlp_down_weight,
+                                                txt_seq, mlp_hidden, hidden)) goto fail;
+            if (!flux_cuda_gated_add_device(s.d_txt_hidden, s.d_txt_gate2, s.d_txt_down, txt_seq, hidden)) goto fail;
+            if (cudaStreamSynchronize(s.stream_img) != cudaSuccess) goto fail;
+            if (cudaStreamSynchronize(s.stream_txt) != cudaSuccess) goto fail;
+        } else {
+            CUDA_SET_STREAM(s.stream_main);
+            if (!flux_cuda_linear_nobias_device(s.d_img_proj, s.d_img_attn_out, b->img_proj_weight,
+                                                img_seq, hidden, hidden)) goto fail;
+            if (!flux_cuda_linear_nobias_device(s.d_txt_proj, s.d_txt_attn_out, b->txt_proj_weight,
+                                                txt_seq, hidden, hidden)) goto fail;
+            if (!flux_cuda_gated_add_device(s.d_img_hidden, s.d_img_gate1, s.d_img_proj, img_seq, hidden)) goto fail;
+            if (!flux_cuda_gated_add_device(s.d_txt_hidden, s.d_txt_gate1, s.d_txt_proj, txt_seq, hidden)) goto fail;
+
+            if (!flux_cuda_adaln_norm_device(s.d_img_norm, s.d_img_hidden, s.d_img_shift2, s.d_img_scale2,
+                                             img_seq, hidden, eps)) goto fail;
+            if (!flux_cuda_adaln_norm_device(s.d_txt_norm, s.d_txt_hidden, s.d_txt_shift2, s.d_txt_scale2,
+                                             txt_seq, hidden, eps)) goto fail;
+
+            if (!flux_cuda_linear_nobias_device(s.d_img_gate_ffn, s.d_img_norm, b->img_mlp_gate_weight,
+                                                img_seq, hidden, mlp_hidden)) goto fail;
+            if (!flux_cuda_linear_nobias_device(s.d_img_up_ffn, s.d_img_norm, b->img_mlp_up_weight,
+                                                img_seq, hidden, mlp_hidden)) goto fail;
+            if (!flux_cuda_linear_nobias_device(s.d_txt_gate_ffn, s.d_txt_norm, b->txt_mlp_gate_weight,
+                                                txt_seq, hidden, mlp_hidden)) goto fail;
+            if (!flux_cuda_linear_nobias_device(s.d_txt_up_ffn, s.d_txt_norm, b->txt_mlp_up_weight,
+                                                txt_seq, hidden, mlp_hidden)) goto fail;
+
+            if (!flux_cuda_silu_mul_device(s.d_img_gate_ffn, s.d_img_up_ffn, img_seq * mlp_hidden)) goto fail;
+            if (!flux_cuda_silu_mul_device(s.d_txt_gate_ffn, s.d_txt_up_ffn, txt_seq * mlp_hidden)) goto fail;
+
+            if (!flux_cuda_linear_nobias_device(s.d_img_down, s.d_img_gate_ffn, b->img_mlp_down_weight,
+                                                img_seq, mlp_hidden, hidden)) goto fail;
+            if (!flux_cuda_linear_nobias_device(s.d_txt_down, s.d_txt_gate_ffn, b->txt_mlp_down_weight,
+                                                txt_seq, mlp_hidden, hidden)) goto fail;
+
+            if (!flux_cuda_gated_add_device(s.d_img_hidden, s.d_img_gate2, s.d_img_down, img_seq, hidden)) goto fail;
+            if (!flux_cuda_gated_add_device(s.d_txt_hidden, s.d_txt_gate2, s.d_txt_down, txt_seq, hidden)) goto fail;
+        }
+
+        if (flux_substep_callback)
+            flux_substep_callback(FLUX_SUBSTEP_DOUBLE_BLOCK, i, tf->num_double_layers);
+    }
+
+    CUDA_SET_STREAM(s.stream_main);
+    if (cudaStreamSynchronize(s.stream_main) != cudaSuccess) goto fail;
+    CUDA_D2H(img_hidden, s.d_img_hidden, (size_t)img_seq * hidden);
+    CUDA_D2H(txt_hidden, s.d_txt_hidden, (size_t)txt_seq * hidden);
+    ok = 1;
+
+fail:
+    flux_cuda_linear_set_stream(NULL);
+    flux_cuda_ops_set_stream(NULL);
+    return ok;
+
+#undef CUDA_FREE_PTR
+#undef CUDA_ALLOC_PTR
+#undef CUDA_H2D
+#undef CUDA_D2H
+#undef CUDA_SET_STREAM
+}
+#endif /* USE_CUDA */
 
 /* ========================================================================
  * Single-Stream Block (Parallel DiT)
@@ -3176,7 +3368,7 @@ static float *flux_transformer_forward_bf16(flux_transformer_t *tf,
     /* Double-stream blocks */
     for (int i = 0; i < tf->num_double_layers; i++) {
         if (tf->use_mmap) {
-            load_double_block_weights(&tf->double_blocks[i], tf->sf_files, tf->num_sf_files, i,
+            load_double_block_weights(&tf->double_blocks[i], tf->sf, i,
                                       tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
         }
         if (!double_block_forward_bf16(img_hidden, txt_hidden,
@@ -3205,7 +3397,7 @@ static float *flux_transformer_forward_bf16(flux_transformer_t *tf,
     /* Single-stream blocks */
     for (int i = 0; i < tf->num_single_layers; i++) {
         if (tf->use_mmap) {
-            load_single_block_weights(&tf->single_blocks[i], tf->sf_files, tf->num_sf_files, i,
+            load_single_block_weights(&tf->single_blocks[i], tf->sf, i,
                                       tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
         }
 
@@ -3330,11 +3522,11 @@ cleanup:
 }
 #endif /* USE_METAL */
 
-static void single_block_forward(float *hidden, const single_block_t *block,
-                                 const float *t_emb, const float *adaln_weight,
-                                 const float *img_rope_cos, const float *img_rope_sin,
-                                 const float *txt_rope_cos, const float *txt_rope_sin,
-                                 int seq, int img_offset, flux_transformer_t *tf) {
+static void single_block_forward_precomputed(float *hidden, const single_block_t *block,
+                                             const float *shift, const float *scale, const float *gate,
+                                             const float *img_rope_cos, const float *img_rope_sin,
+                                             const float *txt_rope_cos, const float *txt_rope_sin,
+                                             int seq, int img_offset, flux_transformer_t *tf) {
     /* seq = total_seq (txt + img)
      * img_offset = txt_seq (where image starts in the [txt, img] concatenation)
      */
@@ -3346,34 +3538,9 @@ static void single_block_forward(float *hidden, const single_block_t *block,
     int img_seq = seq - img_offset;  /* Number of image tokens */
     float eps = 1e-6f;
 
-    /* Compute AdaLN parameters (3: shift, scale, gate)
-     * adaln_weight is [hidden*3, hidden], t_emb is [hidden]
-     * FLUX applies SiLU to t_emb before the modulation projection
-     */
-    int mod_size = h_size * 3;
-    double _t0 = prof_get_time();
-
-    /* Apply SiLU to t_emb for modulation - use pre-allocated buffer */
-    float *t_emb_silu = tf->t_emb_silu;
-    for (int i = 0; i < h_size; i++) {
-        float x = t_emb[i];
-        t_emb_silu[i] = x / (1.0f + expf(-x));
-    }
-
-    /* Use end of work2 for mod_params (3*hidden = 9216 floats)
-     * fused_out uses seq * fused_dim floats, place mod_params after */
-    float *mod_params = tf->work2 + seq * fused_dim;
-    flux_linear_nobias(mod_params, t_emb_silu, adaln_weight, 1, h_size, mod_size);
-
-    float *shift = mod_params;
-    float *scale = mod_params + h_size;
-    float *gate = mod_params + h_size * 2;
-
     /* Norm */
     float *norm = tf->work1;
     apply_adaln(norm, hidden, shift, scale, seq, h_size, eps);
-    double _t1 = prof_get_time();
-    prof_single_adaln += _t1 - _t0;
 
     /* Fused QKV + FFN input projection
      * Output: [seq, fused_dim] where fused_dim = [Q, K, V, gate, up]
@@ -3382,8 +3549,6 @@ static void single_block_forward(float *hidden, const single_block_t *block,
     float *fused_out = tf->work2;
     LINEAR_BF16_OR_F32(fused_out, norm, block->qkv_mlp_weight, block->qkv_mlp_weight_bf16,
                        seq, h_size, fused_dim);
-    double _t2 = prof_get_time();
-    prof_single_fused_matmul += _t2 - _t1;
 
     /* Split outputs: use pre-allocated buffers
      * Each position has [Q, K, V, gate, up] concatenated
@@ -3402,9 +3567,6 @@ static void single_block_forward(float *hidden, const single_block_t *block,
         memcpy(mlp_gate + s * mlp_hidden, row + h_size * 3, mlp_hidden * sizeof(float));
         memcpy(mlp_up + s * mlp_hidden, row + h_size * 3 + mlp_hidden, mlp_hidden * sizeof(float));
     }
-
-    double _t3 = prof_get_time();
-    prof_single_split += _t3 - _t2;
 
     /* Apply QK normalization */
     apply_qk_norm(q, k, block->norm_q_weight, block->norm_k_weight,
@@ -3427,20 +3589,13 @@ static void single_block_forward(float *hidden, const single_block_t *block,
     apply_rope_2d(img_q, img_rope_cos, img_rope_sin, img_seq, heads, head_dim, axis_dim);
     apply_rope_2d(img_k, img_rope_cos, img_rope_sin, img_seq, heads, head_dim, axis_dim);
 
-    double _t4 = prof_get_time();
-    prof_single_qknorm_rope += _t4 - _t3;
-
     /* Self-attention - use pre-allocated buffer */
     float *attn_out = tf->single_attn_out;
     mha_forward(attn_out, q, k, v, seq, heads, head_dim, tf);
-    double _t5 = prof_get_time();
-    prof_single_attention += _t5 - _t4;
 
-    /* SwiGLU: silu(gate) * up - fused for better performance */
-    flux_silu_mul(mlp_gate, mlp_up, seq * mlp_hidden);
-
-    double _t6 = prof_get_time();
-    prof_single_swiglu += _t6 - _t5;
+    /* SwiGLU: silu(gate) * up */
+    flux_silu(mlp_gate, seq * mlp_hidden);
+    flux_mul_inplace(mlp_gate, mlp_up, seq * mlp_hidden);
 
     /* Fused output projection: [attn_out, mlp_out] -> hidden
      * proj_mlp_weight: [hidden, hidden + mlp_hidden]
@@ -3458,15 +3613,366 @@ static void single_block_forward(float *hidden, const single_block_t *block,
     LINEAR_BF16_OR_F32(proj_out, concat, block->proj_mlp_weight, block->proj_mlp_weight_bf16,
                        seq, h_size + mlp_hidden, h_size);
 
-    double _t7 = prof_get_time();
-    prof_single_proj_matmul += _t7 - _t6;
-
     /* Apply gate and add residual - use vectorized helper */
     gated_add(hidden, gate, proj_out, seq, h_size);
-    double _t8 = prof_get_time();
-    prof_single_gated_add += _t8 - _t7;
 
     /* No free - using pre-allocated buffers */
+}
+
+#ifdef USE_CUDA
+/* CUDA-resident single-stream path:
+ * Keeps hidden activations on GPU across all single blocks and executes
+ * block internals with CUDA kernels + cuBLAS device GEMM.
+ * Optionally runs the final AdaLN + projection on GPU and returns output in
+ * [img_seq, latent_channels] (NLC) host layout.
+ */
+static int single_blocks_forward_cuda_resident(float *hidden,
+                                               flux_transformer_t *tf,
+                                               const float *shift, const float *scale, const float *gate,
+                                               const float *img_rope_cos, const float *img_rope_sin,
+                                               const float *txt_rope_cos, const float *txt_rope_sin,
+                                               int seq, int img_offset,
+                                               const float *final_shift, const float *final_scale,
+                                               const float *final_proj_weight, int latent_channels,
+                                               float *final_out_nlc) {
+    if (!hidden || !tf || !shift || !scale || !gate ||
+        !img_rope_cos || !img_rope_sin || !txt_rope_cos || !txt_rope_sin) {
+        return 0;
+    }
+    if (tf->use_mmap || tf->use_bf16) {
+        return 0;
+    }
+    if (final_out_nlc &&
+        (!final_shift || !final_scale || !final_proj_weight || latent_channels <= 0)) {
+        return 0;
+    }
+
+    int hidden_size = tf->hidden_size;
+    int heads = tf->num_heads;
+    int head_dim = tf->head_dim;
+    int mlp_hidden = tf->mlp_hidden;
+    int fused_dim = hidden_size * 3 + mlp_hidden * 2;
+    int img_seq = seq - img_offset;
+    float eps = 1e-6f;
+    float attn_scale = 1.0f / sqrtf((float)head_dim);
+
+    if (seq <= 0 || img_seq <= 0) return 0;
+
+    typedef struct {
+        const flux_transformer_t *tf;
+        int seq, img_offset, img_seq;
+        const float *host_txt_cos, *host_txt_sin;
+        const float *host_img_cos, *host_img_sin;
+        cudaStream_t stream_main;
+        float *d_hidden, *d_norm, *d_fused;
+        float *d_q, *d_k, *d_v;
+        float *d_gate_mlp, *d_up, *d_attn_out;
+        float *d_concat, *d_proj;
+        float *d_shift, *d_scale, *d_gate;
+        float *d_txt_cos, *d_txt_sin, *d_img_cos, *d_img_sin;
+        float *d_norm_q_all, *d_norm_k_all;
+        float *d_final_shift, *d_final_scale;
+        float *d_final_norm, *d_final_out;
+        cudaGraph_t graph;
+        cudaGraphExec_t graph_exec;
+        int graph_valid;
+        int graph_has_final;
+        int graph_seq;
+        int graph_img_offset;
+        int graph_latent_channels;
+    } cuda_single_ctx_t;
+
+    static cuda_single_ctx_t s = {0};
+    int ok = 0;
+    int use_graph = getenv("FLUX_CUDA_GRAPH_SINGLE") ? 1 : 0;
+    int has_final = final_out_nlc ? 1 : 0;
+
+#define CUDA_FREE_PTR(ptr) do { if (ptr) { cudaFree(ptr); ptr = NULL; } } while (0)
+#define CUDA_ALLOC_PTR(ptr, elems) \
+    do { \
+        if (cudaMalloc((void **)&(ptr), (size_t)(elems) * sizeof(float)) != cudaSuccess) goto fail; \
+    } while (0)
+#define CUDA_H2D(dst, src, elems) \
+    do { \
+        if (cudaMemcpy((dst), (src), (size_t)(elems) * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) goto fail; \
+    } while (0)
+#define CUDA_D2H(dst, src, elems) \
+    do { \
+        if (cudaMemcpy((dst), (src), (size_t)(elems) * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) goto fail; \
+    } while (0)
+#define CUDA_SET_STREAM(stream_) \
+    do { \
+        if (!flux_cuda_linear_set_stream((void *)(stream_))) goto fail; \
+        if (!flux_cuda_ops_set_stream((void *)(stream_))) goto fail; \
+    } while (0)
+
+#define RUN_SINGLE_LOOP(EMIT_CALLBACKS) \
+    do { \
+        for (int i = 0; i < tf->num_single_layers; i++) { \
+            const single_block_t *b = &tf->single_blocks[i]; \
+            const float *d_norm_q = s.d_norm_q_all + (size_t)i * head_dim; \
+            const float *d_norm_k = s.d_norm_k_all + (size_t)i * head_dim; \
+            if (!b->qkv_mlp_weight || !b->proj_mlp_weight) goto fail; \
+            if (!flux_cuda_adaln_norm_device(s.d_norm, s.d_hidden, s.d_shift, s.d_scale, seq, hidden_size, eps)) goto fail; \
+            if (!flux_cuda_linear_nobias_device(s.d_fused, s.d_norm, b->qkv_mlp_weight, \
+                                                seq, hidden_size, fused_dim)) goto fail; \
+            if (!flux_cuda_split_qkv_mlp_device(s.d_fused, s.d_q, s.d_k, s.d_v, s.d_gate_mlp, s.d_up, \
+                                                seq, hidden_size, mlp_hidden)) goto fail; \
+            if (!flux_cuda_qk_rms_norm_device(s.d_q, s.d_k, d_norm_q, d_norm_k, \
+                                              seq, heads, head_dim, eps)) goto fail; \
+            if (!flux_cuda_rope_unified_device(s.d_q, s.d_k, s.d_txt_cos, s.d_txt_sin, s.d_img_cos, s.d_img_sin, \
+                                               seq, img_offset, heads, head_dim)) goto fail; \
+            if (!flux_cuda_attention_batched_shd_device(s.d_attn_out, s.d_q, s.d_k, s.d_v, \
+                                                        heads, seq, seq, head_dim, \
+                                                        attn_scale, 0, NULL)) goto fail; \
+            if (!flux_cuda_silu_mul_device(s.d_gate_mlp, s.d_up, seq * mlp_hidden)) goto fail; \
+            if (!flux_cuda_concat_attn_mlp_device(s.d_attn_out, s.d_gate_mlp, s.d_concat, \
+                                                  seq, hidden_size, mlp_hidden)) goto fail; \
+            if (!flux_cuda_linear_nobias_device(s.d_proj, s.d_concat, b->proj_mlp_weight, \
+                                                seq, hidden_size + mlp_hidden, hidden_size)) goto fail; \
+            if (!flux_cuda_gated_add_device(s.d_hidden, s.d_gate, s.d_proj, seq, hidden_size)) goto fail; \
+            if ((EMIT_CALLBACKS) && flux_substep_callback) { \
+                flux_substep_callback(FLUX_SUBSTEP_SINGLE_BLOCK, i, tf->num_single_layers); \
+            } \
+        } \
+    } while (0)
+
+    int need_realloc = (!s.d_hidden ||
+                        s.tf != tf ||
+                        s.seq != seq ||
+                        s.img_offset != img_offset);
+    if (need_realloc) {
+        if (s.graph_exec) { cudaGraphExecDestroy(s.graph_exec); s.graph_exec = NULL; }
+        if (s.graph) { cudaGraphDestroy(s.graph); s.graph = NULL; }
+        s.graph_valid = 0;
+
+        CUDA_FREE_PTR(s.d_hidden);
+        CUDA_FREE_PTR(s.d_norm);
+        CUDA_FREE_PTR(s.d_fused);
+        CUDA_FREE_PTR(s.d_q);
+        CUDA_FREE_PTR(s.d_k);
+        CUDA_FREE_PTR(s.d_v);
+        CUDA_FREE_PTR(s.d_gate_mlp);
+        CUDA_FREE_PTR(s.d_up);
+        CUDA_FREE_PTR(s.d_attn_out);
+        CUDA_FREE_PTR(s.d_concat);
+        CUDA_FREE_PTR(s.d_proj);
+        CUDA_FREE_PTR(s.d_shift);
+        CUDA_FREE_PTR(s.d_scale);
+        CUDA_FREE_PTR(s.d_gate);
+        CUDA_FREE_PTR(s.d_txt_cos);
+        CUDA_FREE_PTR(s.d_txt_sin);
+        CUDA_FREE_PTR(s.d_img_cos);
+        CUDA_FREE_PTR(s.d_img_sin);
+        CUDA_FREE_PTR(s.d_norm_q_all);
+        CUDA_FREE_PTR(s.d_norm_k_all);
+        CUDA_FREE_PTR(s.d_final_shift);
+        CUDA_FREE_PTR(s.d_final_scale);
+        CUDA_FREE_PTR(s.d_final_norm);
+        CUDA_FREE_PTR(s.d_final_out);
+
+        CUDA_ALLOC_PTR(s.d_hidden, (size_t)seq * hidden_size);
+        CUDA_ALLOC_PTR(s.d_norm, (size_t)seq * hidden_size);
+        CUDA_ALLOC_PTR(s.d_fused, (size_t)seq * fused_dim);
+        CUDA_ALLOC_PTR(s.d_q, (size_t)seq * hidden_size);
+        CUDA_ALLOC_PTR(s.d_k, (size_t)seq * hidden_size);
+        CUDA_ALLOC_PTR(s.d_v, (size_t)seq * hidden_size);
+        CUDA_ALLOC_PTR(s.d_gate_mlp, (size_t)seq * mlp_hidden);
+        CUDA_ALLOC_PTR(s.d_up, (size_t)seq * mlp_hidden);
+        CUDA_ALLOC_PTR(s.d_attn_out, (size_t)seq * hidden_size);
+        CUDA_ALLOC_PTR(s.d_concat, (size_t)seq * (hidden_size + mlp_hidden));
+        CUDA_ALLOC_PTR(s.d_proj, (size_t)seq * hidden_size);
+        CUDA_ALLOC_PTR(s.d_shift, hidden_size);
+        CUDA_ALLOC_PTR(s.d_scale, hidden_size);
+        CUDA_ALLOC_PTR(s.d_gate, hidden_size);
+        CUDA_ALLOC_PTR(s.d_txt_cos, (size_t)img_offset * head_dim);
+        CUDA_ALLOC_PTR(s.d_txt_sin, (size_t)img_offset * head_dim);
+        CUDA_ALLOC_PTR(s.d_img_cos, (size_t)img_seq * head_dim);
+        CUDA_ALLOC_PTR(s.d_img_sin, (size_t)img_seq * head_dim);
+        CUDA_ALLOC_PTR(s.d_norm_q_all, (size_t)tf->num_single_layers * head_dim);
+        CUDA_ALLOC_PTR(s.d_norm_k_all, (size_t)tf->num_single_layers * head_dim);
+        CUDA_ALLOC_PTR(s.d_final_shift, hidden_size);
+        CUDA_ALLOC_PTR(s.d_final_scale, hidden_size);
+        CUDA_ALLOC_PTR(s.d_final_norm, (size_t)img_seq * hidden_size);
+        CUDA_ALLOC_PTR(s.d_final_out, (size_t)img_seq * tf->latent_channels);
+
+        for (int i = 0; i < tf->num_single_layers; i++) {
+            const single_block_t *b = &tf->single_blocks[i];
+            if (!b->norm_q_weight || !b->norm_k_weight) goto fail;
+            CUDA_H2D(s.d_norm_q_all + (size_t)i * head_dim, b->norm_q_weight, head_dim);
+            CUDA_H2D(s.d_norm_k_all + (size_t)i * head_dim, b->norm_k_weight, head_dim);
+        }
+
+        if (!s.stream_main) {
+            if (cudaStreamCreateWithFlags(&s.stream_main, cudaStreamNonBlocking) != cudaSuccess) goto fail;
+        }
+
+        s.tf = tf;
+        s.seq = seq;
+        s.img_offset = img_offset;
+        s.img_seq = img_seq;
+        s.host_txt_cos = NULL;
+        s.host_txt_sin = NULL;
+        s.host_img_cos = NULL;
+        s.host_img_sin = NULL;
+    }
+
+    if (latent_channels > tf->latent_channels) goto fail;
+
+    CUDA_H2D(s.d_hidden, hidden, (size_t)seq * hidden_size);
+    CUDA_H2D(s.d_shift, shift, hidden_size);
+    CUDA_H2D(s.d_scale, scale, hidden_size);
+    CUDA_H2D(s.d_gate, gate, hidden_size);
+    if (s.host_txt_cos != txt_rope_cos || s.host_txt_sin != txt_rope_sin) {
+        CUDA_H2D(s.d_txt_cos, txt_rope_cos, (size_t)img_offset * head_dim);
+        CUDA_H2D(s.d_txt_sin, txt_rope_sin, (size_t)img_offset * head_dim);
+        s.host_txt_cos = txt_rope_cos;
+        s.host_txt_sin = txt_rope_sin;
+    }
+    if (s.host_img_cos != img_rope_cos || s.host_img_sin != img_rope_sin) {
+        CUDA_H2D(s.d_img_cos, img_rope_cos, (size_t)img_seq * head_dim);
+        CUDA_H2D(s.d_img_sin, img_rope_sin, (size_t)img_seq * head_dim);
+        s.host_img_cos = img_rope_cos;
+        s.host_img_sin = img_rope_sin;
+    }
+    if (has_final) {
+        if (!final_shift || !final_scale || !final_proj_weight) goto fail;
+        CUDA_H2D(s.d_final_shift, final_shift, hidden_size);
+        CUDA_H2D(s.d_final_scale, final_scale, hidden_size);
+    }
+
+    CUDA_SET_STREAM(s.stream_main);
+
+    if (use_graph) {
+        int graph_match = s.graph_valid &&
+                          s.graph_has_final == has_final &&
+                          s.graph_seq == seq &&
+                          s.graph_img_offset == img_offset &&
+                          s.graph_latent_channels == latent_channels;
+        if (!graph_match) {
+            if (s.graph_exec) { cudaGraphExecDestroy(s.graph_exec); s.graph_exec = NULL; }
+            if (s.graph) { cudaGraphDestroy(s.graph); s.graph = NULL; }
+            s.graph_valid = 0;
+
+            if (!flux_cuda_attention_batched_shd_device(s.d_attn_out, s.d_q, s.d_k, s.d_v,
+                                                        heads, seq, seq, head_dim,
+                                                        attn_scale, 0, NULL)) {
+                use_graph = 0;
+            } else if (cudaStreamSynchronize(s.stream_main) != cudaSuccess) {
+                use_graph = 0;
+            } else if (cudaStreamBeginCapture(s.stream_main, cudaStreamCaptureModeRelaxed) == cudaSuccess) {
+                int cap_ok = 1;
+                for (int i = 0; i < tf->num_single_layers; i++) {
+                    const single_block_t *b = &tf->single_blocks[i];
+                    const float *d_norm_q = s.d_norm_q_all + (size_t)i * head_dim;
+                    const float *d_norm_k = s.d_norm_k_all + (size_t)i * head_dim;
+                    if (!b->qkv_mlp_weight || !b->proj_mlp_weight) { cap_ok = 0; break; }
+                    if (!flux_cuda_adaln_norm_device(s.d_norm, s.d_hidden, s.d_shift, s.d_scale, seq, hidden_size, eps)) { cap_ok = 0; break; }
+                    if (!flux_cuda_linear_nobias_device(s.d_fused, s.d_norm, b->qkv_mlp_weight,
+                                                        seq, hidden_size, fused_dim)) { cap_ok = 0; break; }
+                    if (!flux_cuda_split_qkv_mlp_device(s.d_fused, s.d_q, s.d_k, s.d_v, s.d_gate_mlp, s.d_up,
+                                                        seq, hidden_size, mlp_hidden)) { cap_ok = 0; break; }
+                    if (!flux_cuda_qk_rms_norm_device(s.d_q, s.d_k, d_norm_q, d_norm_k,
+                                                      seq, heads, head_dim, eps)) { cap_ok = 0; break; }
+                    if (!flux_cuda_rope_unified_device(s.d_q, s.d_k, s.d_txt_cos, s.d_txt_sin, s.d_img_cos, s.d_img_sin,
+                                                       seq, img_offset, heads, head_dim)) { cap_ok = 0; break; }
+                    if (!flux_cuda_attention_batched_shd_device(s.d_attn_out, s.d_q, s.d_k, s.d_v,
+                                                                heads, seq, seq, head_dim,
+                                                                attn_scale, 0, NULL)) { cap_ok = 0; break; }
+                    if (!flux_cuda_silu_mul_device(s.d_gate_mlp, s.d_up, seq * mlp_hidden)) { cap_ok = 0; break; }
+                    if (!flux_cuda_concat_attn_mlp_device(s.d_attn_out, s.d_gate_mlp, s.d_concat,
+                                                          seq, hidden_size, mlp_hidden)) { cap_ok = 0; break; }
+                    if (!flux_cuda_linear_nobias_device(s.d_proj, s.d_concat, b->proj_mlp_weight,
+                                                        seq, hidden_size + mlp_hidden, hidden_size)) { cap_ok = 0; break; }
+                    if (!flux_cuda_gated_add_device(s.d_hidden, s.d_gate, s.d_proj, seq, hidden_size)) { cap_ok = 0; break; }
+                }
+                if (cap_ok && has_final) {
+                    const float *d_img_hidden = s.d_hidden + (size_t)img_offset * hidden_size;
+                    if (!flux_cuda_adaln_norm_device(s.d_final_norm, d_img_hidden, s.d_final_shift, s.d_final_scale,
+                                                     img_seq, hidden_size, eps)) cap_ok = 0;
+                    if (cap_ok && !flux_cuda_linear_nobias_device(s.d_final_out, s.d_final_norm, final_proj_weight,
+                                                                   img_seq, hidden_size, latent_channels)) cap_ok = 0;
+                }
+
+                cudaGraph_t cap_graph = NULL;
+                if (cudaStreamEndCapture(s.stream_main, &cap_graph) != cudaSuccess || !cap_ok || !cap_graph) {
+                    if (cap_graph) cudaGraphDestroy(cap_graph);
+                    use_graph = 0;
+                } else if (cudaGraphInstantiate(&s.graph_exec, cap_graph, 0) != cudaSuccess) {
+                    cudaGraphDestroy(cap_graph);
+                    use_graph = 0;
+                } else {
+                    s.graph = cap_graph;
+                    s.graph_valid = 1;
+                    s.graph_has_final = has_final;
+                    s.graph_seq = seq;
+                    s.graph_img_offset = img_offset;
+                    s.graph_latent_channels = latent_channels;
+                }
+            } else {
+                use_graph = 0;
+            }
+        }
+
+        if (use_graph && s.graph_valid) {
+            if (cudaGraphLaunch(s.graph_exec, s.stream_main) != cudaSuccess) {
+                use_graph = 0;
+                s.graph_valid = 0;
+            }
+        }
+    }
+
+    if (!use_graph) {
+        RUN_SINGLE_LOOP(1);
+        if (has_final) {
+            const float *d_img_hidden = s.d_hidden + (size_t)img_offset * hidden_size;
+            if (!flux_cuda_adaln_norm_device(s.d_final_norm, d_img_hidden, s.d_final_shift, s.d_final_scale,
+                                             img_seq, hidden_size, eps)) goto fail;
+            if (!flux_cuda_linear_nobias_device(s.d_final_out, s.d_final_norm, final_proj_weight,
+                                                img_seq, hidden_size, latent_channels)) goto fail;
+        }
+    }
+
+    if (cudaStreamSynchronize(s.stream_main) != cudaSuccess) goto fail;
+    if (use_graph && flux_substep_callback) {
+        for (int i = 0; i < tf->num_single_layers; i++) {
+            flux_substep_callback(FLUX_SUBSTEP_SINGLE_BLOCK, i, tf->num_single_layers);
+        }
+    }
+
+    if (has_final) {
+        CUDA_D2H(final_out_nlc, s.d_final_out, (size_t)img_seq * latent_channels);
+    } else {
+        CUDA_D2H(hidden, s.d_hidden, (size_t)seq * hidden_size);
+    }
+    ok = 1;
+
+fail:
+    flux_cuda_linear_set_stream(NULL);
+    flux_cuda_ops_set_stream(NULL);
+    return ok;
+
+#undef CUDA_FREE_PTR
+#undef CUDA_ALLOC_PTR
+#undef CUDA_H2D
+#undef CUDA_D2H
+#undef CUDA_SET_STREAM
+#undef RUN_SINGLE_LOOP
+}
+#endif /* USE_CUDA */
+
+static void compute_single_mod_params(flux_transformer_t *tf,
+                                      const float *t_emb,
+                                      const float *adaln_weight) {
+    int hidden = tf->hidden_size;
+    int mod_size = hidden * 3;
+
+    for (int i = 0; i < hidden; i++) {
+        float x = t_emb[i];
+        tf->t_emb_silu[i] = x / (1.0f + expf(-x));
+    }
+    flux_linear_nobias(tf->single_mod_params, tf->t_emb_silu,
+                       adaln_weight, 1, hidden, mod_size);
 }
 
 /* ========================================================================
@@ -3581,6 +4087,7 @@ float *flux_transformer_forward(flux_transformer_t *tf,
 
     /* Double-stream blocks */
     double double_start = tf_get_time_ms();
+    int cuda_resident_double_ok = 0;
 
     /* Pre-compute AdaLN modulation ONCE for all 5 double blocks.
      * t_emb and adaln weights are the same for all blocks within a step. */
@@ -3594,38 +4101,54 @@ float *flux_transformer_forward(flux_transformer_t *tf,
     flux_linear_nobias(tf->double_mod_txt, tf->t_emb_silu, tf->adaln_double_txt_weight,
                        1, hidden, double_mod_size);
 
-    for (int i = 0; i < tf->num_double_layers; i++) {
-        /* In mmap mode, load block weights on-demand and free after use */
-        if (tf->use_mmap && tf->double_blocks[i].img_q_weight == NULL
-                         && tf->double_blocks[i].img_q_weight_bf16 == NULL) {
-            load_double_block_weights(&tf->double_blocks[i], tf->sf_files, tf->num_sf_files, i,
-                                      tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
-        }
-        double_block_forward(img_hidden, txt_hidden,
-                             &tf->double_blocks[i],
-                             tf->double_mod_img, tf->double_mod_txt,
-                             img_rope_cos, img_rope_sin,
-                             txt_rope_cos, txt_rope_sin,
-                             img_seq, txt_seq, tf);
-        if (tf->use_mmap) free_double_block_weights(&tf->double_blocks[i]);
-        if (flux_substep_callback)
-            flux_substep_callback(FLUX_SUBSTEP_DOUBLE_BLOCK, i, tf->num_double_layers);
-#ifdef DEBUG_TRANSFORMER
-        if (i == 0) {
-            fprintf(stderr, "\n[DEBUG] After double block 0:\n");
-            fprintf(stderr, "[DEBUG] img_hidden[0,0,:10]: ");
-            for (int d = 0; d < 10; d++) fprintf(stderr, "%.6f ", img_hidden[d]);
-            fprintf(stderr, "\n");
-            float sum = 0, sum_sq = 0;
-            for (int d = 0; d < img_seq * hidden; d++) {
-                sum += img_hidden[d];
-                sum_sq += img_hidden[d] * img_hidden[d];
-            }
-            float mean = sum / (img_seq * hidden);
-            float std = sqrtf(sum_sq / (img_seq * hidden) - mean * mean);
-            fprintf(stderr, "[DEBUG] img_hidden mean=%.6f, std=%.6f\n", mean, std);
-        }
+#ifdef USE_CUDA
+    if (!getenv("FLUX_CUDA_NO_RESIDENT_DOUBLE")) {
+        cuda_resident_double_ok = double_blocks_forward_cuda_resident(img_hidden, txt_hidden,
+                                                                      tf,
+                                                                      tf->double_mod_img, tf->double_mod_txt,
+                                                                      img_rope_cos, img_rope_sin,
+                                                                      txt_rope_cos, txt_rope_sin,
+                                                                      img_seq, txt_seq);
+    }
 #endif
+
+    if (!cuda_resident_double_ok) {
+        for (int i = 0; i < tf->num_double_layers; i++) {
+            /* In mmap mode, load block weights on-demand */
+            if (tf->use_mmap) {
+                load_double_block_weights(&tf->double_blocks[i], tf->sf, i,
+                                          tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
+            }
+            double_block_forward(img_hidden, txt_hidden,
+                                 &tf->double_blocks[i],
+                                 tf->double_mod_img, tf->double_mod_txt,
+                                 img_rope_cos, img_rope_sin,
+                                 txt_rope_cos, txt_rope_sin,
+                                 img_seq, txt_seq, tf);
+            /* In mmap mode, free block weights after use */
+            if (tf->use_mmap) {
+                free_double_block_weights(&tf->double_blocks[i]);
+                /* With direct mmap pointers for bf16, no need to clear caches. */
+            }
+            if (flux_substep_callback)
+                flux_substep_callback(FLUX_SUBSTEP_DOUBLE_BLOCK, i, tf->num_double_layers);
+#ifdef DEBUG_TRANSFORMER
+            if (i == 0) {
+                fprintf(stderr, "\n[DEBUG] After double block 0:\n");
+                fprintf(stderr, "[DEBUG] img_hidden[0,0,:10]: ");
+                for (int d = 0; d < 10; d++) fprintf(stderr, "%.6f ", img_hidden[d]);
+                fprintf(stderr, "\n");
+                float sum = 0, sum_sq = 0;
+                for (int d = 0; d < img_seq * hidden; d++) {
+                    sum += img_hidden[d];
+                    sum_sq += img_hidden[d] * img_hidden[d];
+                }
+                float mean = sum / (img_seq * hidden);
+                float std = sqrtf(sum_sq / (img_seq * hidden) - mean * mean);
+                fprintf(stderr, "[DEBUG] img_hidden mean=%.6f, std=%.6f\n", mean, std);
+            }
+#endif
+        }
     }
 
     double double_time = tf_get_time_ms() - double_start;
@@ -3640,6 +4163,42 @@ float *flux_transformer_forward(flux_transformer_t *tf,
 
     /* Single-stream blocks */
     double single_start = tf_get_time_ms();
+    int cuda_resident_ok = 0;
+    float *cuda_final_output_nlc = NULL;
+
+#ifdef USE_CUDA
+    if (!getenv("FLUX_CUDA_NO_RESIDENT_SINGLE")) {
+        compute_single_mod_params(tf, t_emb, tf->adaln_single_weight);
+
+        if (!getenv("FLUX_CUDA_NO_RESIDENT_FINAL")) {
+            /* Precompute final modulation for optional CUDA-resident final projection. */
+            for (int j = 0; j < hidden; j++) {
+                float x = t_emb[j];
+                tf->t_emb_silu[j] = x / (1.0f + expf(-x));
+            }
+            flux_linear_nobias(tf->double_mod_img, tf->t_emb_silu,
+                               tf->final_norm_weight, 1, hidden, hidden * 2);
+            cuda_final_output_nlc = (float *)malloc((size_t)img_seq * tf->latent_channels * sizeof(float));
+        }
+
+        cuda_resident_ok = single_blocks_forward_cuda_resident(concat_hidden, tf,
+                                                               tf->single_mod_params,
+                                                               tf->single_mod_params + hidden,
+                                                               tf->single_mod_params + hidden * 2,
+                                                               img_rope_cos, img_rope_sin,
+                                                               txt_rope_cos, txt_rope_sin,
+                                                               total_seq, txt_seq,
+                                                               cuda_final_output_nlc ? (tf->double_mod_img + hidden) : NULL,
+                                                               cuda_final_output_nlc ? tf->double_mod_img : NULL,
+                                                               cuda_final_output_nlc ? tf->final_proj_weight : NULL,
+                                                               cuda_final_output_nlc ? tf->latent_channels : 0,
+                                                               cuda_final_output_nlc);
+        if (!cuda_resident_ok && cuda_final_output_nlc) {
+            free(cuda_final_output_nlc);
+            cuda_final_output_nlc = NULL;
+        }
+    }
+#endif
 
 #ifdef USE_METAL
     /* Try BF16 native path first */
@@ -3652,7 +4211,7 @@ float *flux_transformer_forward(flux_transformer_t *tf,
      * MPS SGEMM with f16 weights. To achieve higher bf16 performance, we would need
      * highly optimized custom Metal matmul kernels.
      * The f32 path with f16 weights and pre-warmed caches is currently faster. */
-    if (0 && flux_metal_available() && flux_bf16_pipeline_available() && !tf->use_mmap && tf->use_bf16) {
+    if (!cuda_resident_ok && 0 && flux_metal_available() && flux_bf16_pipeline_available() && !tf->use_mmap && tf->use_bf16) {
         /* Create f32 GPU tensor first, then convert to bf16 */
         flux_gpu_tensor_t hidden_f32 = flux_gpu_tensor_create(concat_hidden, total_seq * hidden);
         if (hidden_f32) {
@@ -3748,7 +4307,7 @@ float *flux_transformer_forward(flux_transformer_t *tf,
     }
 
     /* Fall back to f32 GPU-chained path if bf16 path not used or failed */
-    if (!bf16_path_ok && flux_metal_available() && flux_metal_shaders_available() && !tf->use_mmap) {
+    if (!cuda_resident_ok && !bf16_path_ok && flux_metal_available() && flux_metal_shaders_available() && !tf->use_mmap) {
         /* Create persistent GPU tensor for hidden state */
         concat_hidden_gpu = flux_gpu_tensor_create(concat_hidden, total_seq * hidden);
         if (concat_hidden_gpu) {
@@ -3812,15 +4371,23 @@ float *flux_transformer_forward(flux_transformer_t *tf,
             concat_hidden_gpu = NULL;
         }
     }
-
-    /* Fall back to per-block GPU/CPU path if both bf16 and f32 chained paths failed */
-    if (!bf16_path_ok && !gpu_chained_ok) {
 #endif
+
+    /* Fall back to per-block GPU/CPU path if GPU-chained paths were not used */
+#ifdef USE_METAL
+    if (!cuda_resident_ok && !bf16_path_ok && !gpu_chained_ok) {
+#else
+    if (!cuda_resident_ok) {
+#endif
+        compute_single_mod_params(tf, t_emb, tf->adaln_single_weight);
+        float *single_shift = tf->single_mod_params;
+        float *single_scale = tf->single_mod_params + hidden;
+        float *single_gate = tf->single_mod_params + hidden * 2;
+
         for (int i = 0; i < tf->num_single_layers; i++) {
-            /* In mmap mode, load block weights on-demand and free after use */
-            if (tf->use_mmap && tf->single_blocks[i].qkv_mlp_weight == NULL
-                             && tf->single_blocks[i].qkv_mlp_weight_bf16 == NULL) {
-                load_single_block_weights(&tf->single_blocks[i], tf->sf_files, tf->num_sf_files, i,
+            /* In mmap mode, load block weights on-demand */
+            if (tf->use_mmap) {
+                load_single_block_weights(&tf->single_blocks[i], tf->sf, i,
                                           tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
             }
 #ifdef USE_METAL
@@ -3833,13 +4400,17 @@ float *flux_transformer_forward(flux_transformer_t *tf,
 #endif
             {
                 /* Fall back to CPU path */
-                single_block_forward(concat_hidden, &tf->single_blocks[i],
-                                     t_emb, tf->adaln_single_weight,
-                                     img_rope_cos, img_rope_sin,
-                                     txt_rope_cos, txt_rope_sin,
-                                     total_seq, txt_seq, tf);  /* txt_seq is the offset to image */
+                single_block_forward_precomputed(concat_hidden, &tf->single_blocks[i],
+                                                 single_shift, single_scale, single_gate,
+                                                 img_rope_cos, img_rope_sin,
+                                                 txt_rope_cos, txt_rope_sin,
+                                                 total_seq, txt_seq, tf);  /* txt_seq is the offset to image */
             }
-            if (tf->use_mmap) free_single_block_weights(&tf->single_blocks[i]);
+            /* In mmap mode, free block weights after use */
+            if (tf->use_mmap) {
+                free_single_block_weights(&tf->single_blocks[i]);
+                /* With direct mmap pointers for bf16, no need to clear caches. */
+            }
             if (flux_substep_callback)
                 flux_substep_callback(FLUX_SUBSTEP_SINGLE_BLOCK, i, tf->num_single_layers);
 
@@ -3853,59 +4424,81 @@ float *flux_transformer_forward(flux_transformer_t *tf,
             }
 #endif
         }
-#ifdef USE_METAL
     }
-#endif
 
     double single_time = tf_get_time_ms() - single_start;
+    double final_start = tf_get_time_ms();
+    float *output = NULL;
 
-    /* Extract image hidden states (image is after text) */
-    memcpy(img_hidden, concat_hidden + txt_seq * hidden, img_seq * hidden * sizeof(float));
-    free(concat_hidden);
+    if (cuda_resident_ok && cuda_final_output_nlc) {
+        /* Final projection already ran on CUDA in resident path.
+         * Convert NLC -> NCHW on CPU (small tensor). */
+        output = (float *)malloc((size_t)img_seq * tf->latent_channels * sizeof(float));
+        if (output) {
+            for (int pos = 0; pos < img_seq; pos++) {
+                for (int c = 0; c < channels; c++) {
+                    output[c * img_seq + pos] = cuda_final_output_nlc[pos * channels + c];
+                }
+            }
+        }
+        free(cuda_final_output_nlc);
+        free(concat_hidden);
+    } else {
+        if (cuda_final_output_nlc) {
+            free(cuda_final_output_nlc);
+            cuda_final_output_nlc = NULL;
+        }
+
+        /* Extract image hidden states (image is after text). */
+        memcpy(img_hidden, concat_hidden + txt_seq * hidden, img_seq * hidden * sizeof(float));
+        free(concat_hidden);
 
 #ifdef DEBUG_FINAL_LAYER
-    fprintf(stderr, "[FINAL] Before final layer img_hidden[0,0,:5]: ");
-    for (int d = 0; d < 5; d++) fprintf(stderr, "%.6f ", img_hidden[d]);
-    fprintf(stderr, "\n");
+        fprintf(stderr, "[FINAL] Before final layer img_hidden[0,0,:5]: ");
+        for (int d = 0; d < 5; d++) fprintf(stderr, "%.6f ", img_hidden[d]);
+        fprintf(stderr, "\n");
 #endif
 
-    /* Final layer: AdaLN modulation -> project to latent channels
-     * norm_out.linear.weight is [6144, 3072] = [shift, scale] projection
-     * Apply SiLU to t_emb before modulation projection (FLUX architecture)
-     */
-    double final_start = tf_get_time_ms();
-    /* Reuse pre-allocated t_emb_silu buffer */
-    for (int i = 0; i < hidden; i++) {
-        float x = t_emb[i];
-        tf->t_emb_silu[i] = x / (1.0f + expf(-x));
-    }
+        /* Final layer: AdaLN modulation -> project to latent channels
+         * norm_out.linear.weight is [6144, 3072] = [shift, scale] projection
+         * Apply SiLU to t_emb before modulation projection (FLUX architecture)
+         */
+        for (int i = 0; i < hidden; i++) {
+            float x = t_emb[i];
+            tf->t_emb_silu[i] = x / (1.0f + expf(-x));
+        }
 
-    /* Reuse double_mod_img buffer for final_mod (needs hidden*2, has hidden*6) */
-    float *final_mod = tf->double_mod_img;
-    flux_linear_nobias(final_mod, tf->t_emb_silu, tf->final_norm_weight, 1, hidden, hidden * 2);
+        /* Reuse double_mod_img buffer for final_mod (needs hidden*2, has hidden*6) */
+        float *final_mod = tf->double_mod_img;
+        flux_linear_nobias(final_mod, tf->t_emb_silu, tf->final_norm_weight, 1, hidden, hidden * 2);
 
-    /* Python: scale, shift = mod.chunk(2, dim=1) - scale is first half, shift is second half */
-    float *final_scale = final_mod;
-    float *final_shift = final_mod + hidden;
+        /* Python: scale, shift = mod.chunk(2, dim=1) - scale is first half, shift is second half */
+        float *final_scale = final_mod;
+        float *final_shift = final_mod + hidden;
 
-    float *final_norm = tf->work1;
-    apply_adaln(final_norm, img_hidden, final_shift, final_scale, img_seq, hidden, 1e-6f);
+        float *final_norm = tf->work1;
+        apply_adaln(final_norm, img_hidden, final_shift, final_scale, img_seq, hidden, 1e-6f);
 
-    float *output_nlc = (float *)malloc(img_seq * tf->latent_channels * sizeof(float));
-    LINEAR_BF16_OR_F32(output_nlc, final_norm, tf->final_proj_weight, tf->final_proj_weight_bf16,
-                       img_seq, hidden, tf->latent_channels);
+        float *output_nlc = (float *)malloc((size_t)img_seq * tf->latent_channels * sizeof(float));
+        if (output_nlc) {
+            LINEAR_BF16_OR_F32(output_nlc, final_norm, tf->final_proj_weight, tf->final_proj_weight_bf16,
+                               img_seq, hidden, tf->latent_channels);
 
-    /* Transpose output from NLC [seq, channels] to NCHW [channels, h, w] format
-     * Input: output_nlc[pos * channels + c]
-     * Output: output[c * img_seq + pos]
-     */
-    float *output = (float *)malloc(img_seq * tf->latent_channels * sizeof(float));
-    for (int pos = 0; pos < img_seq; pos++) {
-        for (int c = 0; c < channels; c++) {
-            output[c * img_seq + pos] = output_nlc[pos * channels + c];
+            /* Transpose output from NLC [seq, channels] to NCHW [channels, h, w] format
+             * Input: output_nlc[pos * channels + c]
+             * Output: output[c * img_seq + pos]
+             */
+            output = (float *)malloc((size_t)img_seq * tf->latent_channels * sizeof(float));
+            if (output) {
+                for (int pos = 0; pos < img_seq; pos++) {
+                    for (int c = 0; c < channels; c++) {
+                        output[c * img_seq + pos] = output_nlc[pos * channels + c];
+                    }
+                }
+            }
+            free(output_nlc);
         }
     }
-    free(output_nlc);
 
     free(t_emb);
     /* RoPE buffers are cached in the transformer and freed in flux_transformer_free(). */
@@ -4064,7 +4657,7 @@ float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
     /* Double blocks - process combined image with text */
     for (int i = 0; i < tf->num_double_layers; i++) {
         if (tf->use_mmap) {
-            load_double_block_weights(&tf->double_blocks[i], tf->sf_files, tf->num_sf_files, i,
+            load_double_block_weights(&tf->double_blocks[i], tf->sf, i,
                                       tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
         }
         double_block_forward(combined_hidden, txt_hidden,
@@ -4088,16 +4681,20 @@ float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
     free(combined_hidden);
 
     /* Single blocks */
+    compute_single_mod_params(tf, t_emb, tf->adaln_single_weight);
+    float *single_shift = tf->single_mod_params;
+    float *single_scale = tf->single_mod_params + hidden;
+    float *single_gate = tf->single_mod_params + hidden * 2;
     for (int i = 0; i < tf->num_single_layers; i++) {
         if (tf->use_mmap) {
-            load_single_block_weights(&tf->single_blocks[i], tf->sf_files, tf->num_sf_files, i,
+            load_single_block_weights(&tf->single_blocks[i], tf->sf, i,
                                       tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
         }
-        single_block_forward(concat_hidden, &tf->single_blocks[i],
-                             t_emb, tf->adaln_single_weight,
-                             combined_rope_cos, combined_rope_sin,
-                             txt_rope_cos, txt_rope_sin,
-                             total_seq, txt_seq, tf);
+        single_block_forward_precomputed(concat_hidden, &tf->single_blocks[i],
+                                         single_shift, single_scale, single_gate,
+                                         combined_rope_cos, combined_rope_sin,
+                                         txt_rope_cos, txt_rope_sin,
+                                         total_seq, txt_seq, tf);
         if (tf->use_mmap) {
             free_single_block_weights(&tf->single_blocks[i]);
             /* With direct mmap pointers for bf16, no need to clear caches. */
@@ -4308,7 +4905,7 @@ float *flux_transformer_forward_with_multi_refs(flux_transformer_t *tf,
     /* Double blocks */
     for (int i = 0; i < tf->num_double_layers; i++) {
         if (tf->use_mmap) {
-            load_double_block_weights(&tf->double_blocks[i], tf->sf_files, tf->num_sf_files, i,
+            load_double_block_weights(&tf->double_blocks[i], tf->sf, i,
                                       tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
         }
         double_block_forward(combined_hidden, txt_hidden,
@@ -4331,16 +4928,20 @@ float *flux_transformer_forward_with_multi_refs(flux_transformer_t *tf,
     free(combined_hidden);
 
     /* Single blocks */
+    compute_single_mod_params(tf, t_emb, tf->adaln_single_weight);
+    float *single_shift = tf->single_mod_params;
+    float *single_scale = tf->single_mod_params + hidden;
+    float *single_gate = tf->single_mod_params + hidden * 2;
     for (int i = 0; i < tf->num_single_layers; i++) {
         if (tf->use_mmap) {
-            load_single_block_weights(&tf->single_blocks[i], tf->sf_files, tf->num_sf_files, i,
+            load_single_block_weights(&tf->single_blocks[i], tf->sf, i,
                                       tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
         }
-        single_block_forward(concat_hidden, &tf->single_blocks[i],
-                             t_emb, tf->adaln_single_weight,
-                             combined_rope_cos, combined_rope_sin,
-                             txt_rope_cos, txt_rope_sin,
-                             total_seq, txt_seq, tf);
+        single_block_forward_precomputed(concat_hidden, &tf->single_blocks[i],
+                                         single_shift, single_scale, single_gate,
+                                         combined_rope_cos, combined_rope_sin,
+                                         txt_rope_cos, txt_rope_sin,
+                                         total_seq, txt_seq, tf);
         if (tf->use_mmap) {
             free_single_block_weights(&tf->single_blocks[i]);
         }
@@ -4529,8 +5130,9 @@ flux_transformer_t *flux_transformer_load(FILE *f) {
     tf->t_emb_silu = (float *)malloc(hidden * sizeof(float));
     tf->double_mod_img = (float *)malloc(hidden * 6 * sizeof(float));
     tf->double_mod_txt = (float *)malloc(hidden * 6 * sizeof(float));
+    tf->single_mod_params = (float *)malloc(hidden * 3 * sizeof(float));
 
-    if (!tf->t_emb_silu || !tf->double_mod_img || !tf->double_mod_txt) {
+    if (!tf->t_emb_silu || !tf->double_mod_img || !tf->double_mod_txt || !tf->single_mod_params) {
         goto error;
     }
 
@@ -4543,13 +5145,6 @@ error:
 
 void flux_transformer_free(flux_transformer_t *tf) {
     if (!tf) return;
-
-    /* In mmap mode, bf16 pointers point into the mmap'd file region and must
-     * NOT be freed. Clean up any cached block weights first, then only NULL
-     * the bf16 pointers (don't free them). */
-    if (tf->use_mmap) {
-        flux_transformer_free_mmap_cache(tf);
-    }
 
     free(tf->img_in_weight);
     free(tf->txt_in_weight);
@@ -4566,35 +5161,33 @@ void flux_transformer_free(flux_transformer_t *tf) {
             free(b->img_q_weight);
             free(b->img_k_weight);
             free(b->img_v_weight);
+            free(b->img_q_weight_bf16);
+            free(b->img_k_weight_bf16);
+            free(b->img_v_weight_bf16);
             free(b->img_proj_weight);
+            free(b->img_proj_weight_bf16);
             free(b->img_mlp_gate_weight);
             free(b->img_mlp_up_weight);
             free(b->img_mlp_down_weight);
+            free(b->img_mlp_gate_weight_bf16);
+            free(b->img_mlp_up_weight_bf16);
+            free(b->img_mlp_down_weight_bf16);
             free(b->txt_norm_q_weight);
             free(b->txt_norm_k_weight);
             free(b->txt_q_weight);
             free(b->txt_k_weight);
             free(b->txt_v_weight);
+            free(b->txt_q_weight_bf16);
+            free(b->txt_k_weight_bf16);
+            free(b->txt_v_weight_bf16);
             free(b->txt_proj_weight);
+            free(b->txt_proj_weight_bf16);
             free(b->txt_mlp_gate_weight);
             free(b->txt_mlp_up_weight);
             free(b->txt_mlp_down_weight);
-            if (!tf->use_mmap) {
-                free(b->img_q_weight_bf16);
-                free(b->img_k_weight_bf16);
-                free(b->img_v_weight_bf16);
-                free(b->img_proj_weight_bf16);
-                free(b->img_mlp_gate_weight_bf16);
-                free(b->img_mlp_up_weight_bf16);
-                free(b->img_mlp_down_weight_bf16);
-                free(b->txt_q_weight_bf16);
-                free(b->txt_k_weight_bf16);
-                free(b->txt_v_weight_bf16);
-                free(b->txt_proj_weight_bf16);
-                free(b->txt_mlp_gate_weight_bf16);
-                free(b->txt_mlp_up_weight_bf16);
-                free(b->txt_mlp_down_weight_bf16);
-            }
+            free(b->txt_mlp_gate_weight_bf16);
+            free(b->txt_mlp_up_weight_bf16);
+            free(b->txt_mlp_down_weight_bf16);
         }
         free(tf->double_blocks);
     }
@@ -4605,11 +5198,9 @@ void flux_transformer_free(flux_transformer_t *tf) {
             free(b->norm_q_weight);
             free(b->norm_k_weight);
             free(b->qkv_mlp_weight);
+            free(b->qkv_mlp_weight_bf16);
             free(b->proj_mlp_weight);
-            if (!tf->use_mmap) {
-                free(b->qkv_mlp_weight_bf16);
-                free(b->proj_mlp_weight_bf16);
-            }
+            free(b->proj_mlp_weight_bf16);
         }
         free(tf->single_blocks);
     }
@@ -4655,6 +5246,7 @@ void flux_transformer_free(flux_transformer_t *tf) {
     free(tf->t_emb_silu);
     free(tf->double_mod_img);
     free(tf->double_mod_txt);
+    free(tf->single_mod_params);
     free(tf->double_img_attn_out);
     free(tf->double_txt_attn_out);
 
@@ -4668,12 +5260,10 @@ void flux_transformer_free(flux_transformer_t *tf) {
     free(tf->cached_combined_rope_cos);
     free(tf->cached_combined_rope_sin);
 
-    /* Close safetensors files if in mmap mode */
-    if (tf->use_mmap) {
-        for (int i = 0; i < tf->num_sf_files; i++) {
-            if (tf->sf_files[i]) safetensors_close(tf->sf_files[i]);
-        }
-        tf->num_sf_files = 0;
+    /* Close safetensors file if in mmap mode */
+    if (tf->use_mmap && tf->sf) {
+        safetensors_close(tf->sf);
+        tf->sf = NULL;
     }
 
     free(tf);
@@ -4683,25 +5273,25 @@ void flux_transformer_free(flux_transformer_t *tf) {
  * Safetensors Loading
  * ======================================================================== */
 
-static float *get_sf_tensor_tf(safetensors_file_t **files, int num_files, const char *name) {
-    for (int f = 0; f < num_files; f++) {
-        const safetensor_t *t = safetensors_find(files[f], name);
-        if (t) return safetensors_get_f32(files[f], t);
+static float *get_sf_tensor_tf(safetensors_file_t *sf, const char *name) {
+    const safetensor_t *t = safetensors_find(sf, name);
+    if (!t) {
+        fprintf(stderr, "Error: required tensor %s not found\n", name);
+        return NULL;
     }
-    fprintf(stderr, "Error: required tensor %s not found\n", name);
-    return NULL;
+    return safetensors_get_f32(sf, t);
 }
 
 /* Get tensor as bf16 (for GPU acceleration) */
-static uint16_t *get_sf_tensor_bf16(safetensors_file_t **files, int num_files, const char *name) {
-    for (int f = 0; f < num_files; f++) {
-        const safetensor_t *t = safetensors_find(files[f], name);
-        if (t) {
-            if (!safetensor_is_bf16(t)) return NULL;
-            return safetensors_get_bf16(files[f], t);
-        }
+static uint16_t *get_sf_tensor_bf16(safetensors_file_t *sf, const char *name) {
+    const safetensor_t *t = safetensors_find(sf, name);
+    if (!t) {
+        return NULL;  /* Not an error - bf16 is optional */
     }
-    return NULL;  /* Not found - bf16 is optional */
+    if (!safetensor_is_bf16(t)) {
+        return NULL;  /* Not bf16, will use f32 version */
+    }
+    return safetensors_get_bf16(sf, t);
 }
 
 #ifdef USE_METAL
@@ -4776,43 +5366,42 @@ static void warmup_bf16_weights(flux_transformer_t *tf) {
 }
 #endif /* USE_METAL */
 
-flux_transformer_t *flux_transformer_load_safetensors(const char *model_dir) {
+flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf) {
     flux_transformer_t *tf = calloc(1, sizeof(flux_transformer_t));
     if (!tf) return NULL;
 
     char name[256];
 
-    /* Parse config from transformer/config.json, fall back to 4B defaults */
-    if (parse_transformer_config(model_dir, tf) != 0) {
-        tf->hidden_size = 3072;
-        tf->num_heads = 24;
-        tf->head_dim = 128;
-        tf->mlp_hidden = 9216;
-        tf->num_double_layers = 5;
-        tf->num_single_layers = 20;
-        tf->text_dim = 7680;
-        tf->latent_channels = 128;
-        tf->rope_theta = 2000.0f;
-        tf->rope_dim = 128;
-        tf->axis_dim = 32;
-    }
+    /* Set config based on FLUX.2-klein-4B */
+    tf->hidden_size = 3072;
+    tf->num_heads = 24;
+    tf->head_dim = 128;
+    tf->mlp_hidden = 9216;
+    tf->num_double_layers = 5;
+    tf->num_single_layers = 20;
+    tf->text_dim = 7680;
+    tf->latent_channels = 128;
+    /* Max sequence length must accommodate image + text tokens combined.
+     * At 1024x1024: img_seq = (1024/8)^2 = 16384, txt_seq = 512, total = 16896
+     * At 1792x1792: img_seq = (1792/8)^2 = 50176, txt_seq = 512, total = 50688
+     * We set 52000 to support up to 1792x1792 with margin.
+     */
     tf->max_seq_len = 52000;
+    tf->rope_dim = 128;
+    tf->rope_theta = 2000.0f;
+    tf->axis_dim = 32;  /* RoPE axis dimension (head_dim = 128 = 4 * axis_dim) */
 
-    /* Open safetensors shards */
-    safetensors_file_t *files[MAX_TF_SHARDS];
-    int num_files = open_transformer_shards(model_dir, files, MAX_TF_SHARDS);
-    if (num_files == 0) {
-        fprintf(stderr, "flux_transformer_load: failed to open safetensors files\n");
-        free(tf);
-        return NULL;
-    }
-
-    /* Enable bf16 mode if Metal GPU is available */
+    /* Enable bf16 mode on GPU backends when available. */
 #ifdef USE_METAL
     tf->use_bf16 = flux_metal_available();
     if (tf->use_bf16) {
         if (flux_verbose)
             fprintf(stderr, "Using bf16 weights for GPU acceleration\n");
+    }
+#elif defined(USE_CUDA)
+    tf->use_bf16 = (!getenv("FLUX_CUDA_NO_BF16") && flux_cuda_bf16_linear_available()) ? 1 : 0;
+    if (tf->use_bf16 && flux_verbose) {
+        fprintf(stderr, "Using bf16 weights for CUDA tensor-core projections\n");
     }
 #else
     tf->use_bf16 = 0;
@@ -4823,26 +5412,29 @@ flux_transformer_t *flux_transformer_load_safetensors(const char *model_dir) {
 
     /* Input projections */
     if (tf->use_bf16) {
-        tf->img_in_weight_bf16 = get_sf_tensor_bf16(files, num_files, "x_embedder.weight");
-        tf->txt_in_weight_bf16 = get_sf_tensor_bf16(files, num_files, "context_embedder.weight");
+        tf->img_in_weight_bf16 = get_sf_tensor_bf16(sf, "x_embedder.weight");
+        tf->txt_in_weight_bf16 = get_sf_tensor_bf16(sf, "context_embedder.weight");
     } else {
-        tf->img_in_weight = get_sf_tensor_tf(files, num_files, "x_embedder.weight");
-        tf->txt_in_weight = get_sf_tensor_tf(files, num_files, "context_embedder.weight");
+        tf->img_in_weight = get_sf_tensor_tf(sf, "x_embedder.weight");
+        tf->txt_in_weight = get_sf_tensor_tf(sf, "context_embedder.weight");
     }
 
-    /* Time embedding */
+    /* Time embedding
+     * FLUX.2-klein uses 256-dim sinusoidal embedding (128 frequencies)
+     * linear_1: [3072, 256], linear_2: [3072, 3072]
+     */
     tf->time_embed.sincos_dim = 256;
-    tf->time_embed.fc1_weight = get_sf_tensor_tf(files, num_files,
+    tf->time_embed.fc1_weight = get_sf_tensor_tf(sf,
         "time_guidance_embed.timestep_embedder.linear_1.weight");
-    tf->time_embed.fc2_weight = get_sf_tensor_tf(files, num_files,
+    tf->time_embed.fc2_weight = get_sf_tensor_tf(sf,
         "time_guidance_embed.timestep_embedder.linear_2.weight");
 
     /* Modulation weights - these are always needed in f32 for CPU modulation computation */
-    tf->adaln_double_img_weight = get_sf_tensor_tf(files, num_files,
+    tf->adaln_double_img_weight = get_sf_tensor_tf(sf,
         "double_stream_modulation_img.linear.weight");
-    tf->adaln_double_txt_weight = get_sf_tensor_tf(files, num_files,
+    tf->adaln_double_txt_weight = get_sf_tensor_tf(sf,
         "double_stream_modulation_txt.linear.weight");
-    tf->adaln_single_weight = get_sf_tensor_tf(files, num_files,
+    tf->adaln_single_weight = get_sf_tensor_tf(sf,
         "single_stream_modulation.linear.weight");
 
     /* Double blocks */
@@ -4852,29 +5444,29 @@ flux_transformer_t *flux_transformer_load_safetensors(const char *model_dir) {
 
         /* Image attention - QK norm weights (always f32) */
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.norm_q.weight", i);
-        b->img_norm_q_weight = get_sf_tensor_tf(files, num_files, name);
+        b->img_norm_q_weight = get_sf_tensor_tf(sf, name);
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.norm_k.weight", i);
-        b->img_norm_k_weight = get_sf_tensor_tf(files, num_files, name);
+        b->img_norm_k_weight = get_sf_tensor_tf(sf, name);
 
         /* Image Q, K, V projections (separate) */
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_q.weight", i);
-        if (tf->use_bf16) b->img_q_weight_bf16 = get_sf_tensor_bf16(files, num_files, name);
-        else b->img_q_weight = get_sf_tensor_tf(files, num_files, name);
+        if (tf->use_bf16) b->img_q_weight_bf16 = get_sf_tensor_bf16(sf, name);
+        else b->img_q_weight = get_sf_tensor_tf(sf, name);
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_k.weight", i);
-        if (tf->use_bf16) b->img_k_weight_bf16 = get_sf_tensor_bf16(files, num_files, name);
-        else b->img_k_weight = get_sf_tensor_tf(files, num_files, name);
+        if (tf->use_bf16) b->img_k_weight_bf16 = get_sf_tensor_bf16(sf, name);
+        else b->img_k_weight = get_sf_tensor_tf(sf, name);
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_v.weight", i);
-        if (tf->use_bf16) b->img_v_weight_bf16 = get_sf_tensor_bf16(files, num_files, name);
-        else b->img_v_weight = get_sf_tensor_tf(files, num_files, name);
+        if (tf->use_bf16) b->img_v_weight_bf16 = get_sf_tensor_bf16(sf, name);
+        else b->img_v_weight = get_sf_tensor_tf(sf, name);
 
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_out.0.weight", i);
-        if (tf->use_bf16) b->img_proj_weight_bf16 = get_sf_tensor_bf16(files, num_files, name);
-        else b->img_proj_weight = get_sf_tensor_tf(files, num_files, name);
+        if (tf->use_bf16) b->img_proj_weight_bf16 = get_sf_tensor_bf16(sf, name);
+        else b->img_proj_weight = get_sf_tensor_tf(sf, name);
 
-        /* Image FFN - linear_in contains gate and up fused */
+        /* Image FFN - linear_in contains gate and up fused (18432 = 2*9216) */
         snprintf(name, sizeof(name), "transformer_blocks.%d.ff.linear_in.weight", i);
         if (tf->use_bf16) {
-            uint16_t *ff_in_bf16 = get_sf_tensor_bf16(files, num_files, name);
+            uint16_t *ff_in_bf16 = get_sf_tensor_bf16(sf, name);
             if (ff_in_bf16) {
                 b->img_mlp_gate_weight_bf16 = malloc(mlp * h * sizeof(uint16_t));
                 b->img_mlp_up_weight_bf16 = malloc(mlp * h * sizeof(uint16_t));
@@ -4883,7 +5475,7 @@ flux_transformer_t *flux_transformer_load_safetensors(const char *model_dir) {
                 free(ff_in_bf16);
             }
         } else {
-            float *ff_in = get_sf_tensor_tf(files, num_files, name);
+            float *ff_in = get_sf_tensor_tf(sf, name);
             if (ff_in) {
                 b->img_mlp_gate_weight = malloc(mlp * h * sizeof(float));
                 b->img_mlp_up_weight = malloc(mlp * h * sizeof(float));
@@ -4894,33 +5486,33 @@ flux_transformer_t *flux_transformer_load_safetensors(const char *model_dir) {
         }
 
         snprintf(name, sizeof(name), "transformer_blocks.%d.ff.linear_out.weight", i);
-        if (tf->use_bf16) b->img_mlp_down_weight_bf16 = get_sf_tensor_bf16(files, num_files, name);
-        else b->img_mlp_down_weight = get_sf_tensor_tf(files, num_files, name);
+        if (tf->use_bf16) b->img_mlp_down_weight_bf16 = get_sf_tensor_bf16(sf, name);
+        else b->img_mlp_down_weight = get_sf_tensor_tf(sf, name);
 
         /* Text stream - QK norm weights (always f32) */
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.norm_added_q.weight", i);
-        b->txt_norm_q_weight = get_sf_tensor_tf(files, num_files, name);
+        b->txt_norm_q_weight = get_sf_tensor_tf(sf, name);
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.norm_added_k.weight", i);
-        b->txt_norm_k_weight = get_sf_tensor_tf(files, num_files, name);
+        b->txt_norm_k_weight = get_sf_tensor_tf(sf, name);
 
         /* Text Q, K, V projections (separate) */
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.add_q_proj.weight", i);
-        if (tf->use_bf16) b->txt_q_weight_bf16 = get_sf_tensor_bf16(files, num_files, name);
-        else b->txt_q_weight = get_sf_tensor_tf(files, num_files, name);
+        if (tf->use_bf16) b->txt_q_weight_bf16 = get_sf_tensor_bf16(sf, name);
+        else b->txt_q_weight = get_sf_tensor_tf(sf, name);
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.add_k_proj.weight", i);
-        if (tf->use_bf16) b->txt_k_weight_bf16 = get_sf_tensor_bf16(files, num_files, name);
-        else b->txt_k_weight = get_sf_tensor_tf(files, num_files, name);
+        if (tf->use_bf16) b->txt_k_weight_bf16 = get_sf_tensor_bf16(sf, name);
+        else b->txt_k_weight = get_sf_tensor_tf(sf, name);
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.add_v_proj.weight", i);
-        if (tf->use_bf16) b->txt_v_weight_bf16 = get_sf_tensor_bf16(files, num_files, name);
-        else b->txt_v_weight = get_sf_tensor_tf(files, num_files, name);
+        if (tf->use_bf16) b->txt_v_weight_bf16 = get_sf_tensor_bf16(sf, name);
+        else b->txt_v_weight = get_sf_tensor_tf(sf, name);
 
         snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_add_out.weight", i);
-        if (tf->use_bf16) b->txt_proj_weight_bf16 = get_sf_tensor_bf16(files, num_files, name);
-        else b->txt_proj_weight = get_sf_tensor_tf(files, num_files, name);
+        if (tf->use_bf16) b->txt_proj_weight_bf16 = get_sf_tensor_bf16(sf, name);
+        else b->txt_proj_weight = get_sf_tensor_tf(sf, name);
 
         snprintf(name, sizeof(name), "transformer_blocks.%d.ff_context.linear_in.weight", i);
         if (tf->use_bf16) {
-            uint16_t *txt_ff_in_bf16 = get_sf_tensor_bf16(files, num_files, name);
+            uint16_t *txt_ff_in_bf16 = get_sf_tensor_bf16(sf, name);
             if (txt_ff_in_bf16) {
                 b->txt_mlp_gate_weight_bf16 = malloc(mlp * h * sizeof(uint16_t));
                 b->txt_mlp_up_weight_bf16 = malloc(mlp * h * sizeof(uint16_t));
@@ -4929,7 +5521,7 @@ flux_transformer_t *flux_transformer_load_safetensors(const char *model_dir) {
                 free(txt_ff_in_bf16);
             }
         } else {
-            float *txt_ff_in = get_sf_tensor_tf(files, num_files, name);
+            float *txt_ff_in = get_sf_tensor_tf(sf, name);
             if (txt_ff_in) {
                 b->txt_mlp_gate_weight = malloc(mlp * h * sizeof(float));
                 b->txt_mlp_up_weight = malloc(mlp * h * sizeof(float));
@@ -4940,8 +5532,8 @@ flux_transformer_t *flux_transformer_load_safetensors(const char *model_dir) {
         }
 
         snprintf(name, sizeof(name), "transformer_blocks.%d.ff_context.linear_out.weight", i);
-        if (tf->use_bf16) b->txt_mlp_down_weight_bf16 = get_sf_tensor_bf16(files, num_files, name);
-        else b->txt_mlp_down_weight = get_sf_tensor_tf(files, num_files, name);
+        if (tf->use_bf16) b->txt_mlp_down_weight_bf16 = get_sf_tensor_bf16(sf, name);
+        else b->txt_mlp_down_weight = get_sf_tensor_tf(sf, name);
     }
 
     /* Single blocks */
@@ -4951,30 +5543,27 @@ flux_transformer_t *flux_transformer_load_safetensors(const char *model_dir) {
 
         /* QK norm weights (always f32, small) */
         snprintf(name, sizeof(name), "single_transformer_blocks.%d.attn.norm_q.weight", i);
-        b->norm_q_weight = get_sf_tensor_tf(files, num_files, name);
+        b->norm_q_weight = get_sf_tensor_tf(sf, name);
         snprintf(name, sizeof(name), "single_transformer_blocks.%d.attn.norm_k.weight", i);
-        b->norm_k_weight = get_sf_tensor_tf(files, num_files, name);
+        b->norm_k_weight = get_sf_tensor_tf(sf, name);
 
         /* Major linear weights - load bf16 or f32 based on mode */
         snprintf(name, sizeof(name), "single_transformer_blocks.%d.attn.to_qkv_mlp_proj.weight", i);
-        if (tf->use_bf16) b->qkv_mlp_weight_bf16 = get_sf_tensor_bf16(files, num_files, name);
-        else b->qkv_mlp_weight = get_sf_tensor_tf(files, num_files, name);
+        if (tf->use_bf16) b->qkv_mlp_weight_bf16 = get_sf_tensor_bf16(sf, name);
+        else b->qkv_mlp_weight = get_sf_tensor_tf(sf, name);
 
         snprintf(name, sizeof(name), "single_transformer_blocks.%d.attn.to_out.weight", i);
-        if (tf->use_bf16) b->proj_mlp_weight_bf16 = get_sf_tensor_bf16(files, num_files, name);
-        else b->proj_mlp_weight = get_sf_tensor_tf(files, num_files, name);
+        if (tf->use_bf16) b->proj_mlp_weight_bf16 = get_sf_tensor_bf16(sf, name);
+        else b->proj_mlp_weight = get_sf_tensor_tf(sf, name);
     }
 
     /* Final layer */
-    tf->final_norm_weight = get_sf_tensor_tf(files, num_files, "norm_out.linear.weight");
+    tf->final_norm_weight = get_sf_tensor_tf(sf, "norm_out.linear.weight");
     if (tf->use_bf16) {
-        tf->final_proj_weight_bf16 = get_sf_tensor_bf16(files, num_files, "proj_out.weight");
+        tf->final_proj_weight_bf16 = get_sf_tensor_bf16(sf, "proj_out.weight");
     } else {
-        tf->final_proj_weight = get_sf_tensor_tf(files, num_files, "proj_out.weight");
+        tf->final_proj_weight = get_sf_tensor_tf(sf, "proj_out.weight");
     }
-
-    /* Close safetensors files (non-mmap: data already copied) */
-    for (int i = 0; i < num_files; i++) safetensors_close(files[i]);
 
     /* Precompute RoPE frequencies */
     tf->rope_freqs = malloc(tf->max_seq_len * tf->head_dim * sizeof(float));
@@ -5015,8 +5604,9 @@ flux_transformer_t *flux_transformer_load_safetensors(const char *model_dir) {
     tf->t_emb_silu = malloc(hidden * sizeof(float));
     tf->double_mod_img = malloc(hidden * 6 * sizeof(float));
     tf->double_mod_txt = malloc(hidden * 6 * sizeof(float));
+    tf->single_mod_params = malloc(hidden * 3 * sizeof(float));
 
-    if (!tf->t_emb_silu || !tf->double_mod_img || !tf->double_mod_txt) {
+    if (!tf->t_emb_silu || !tf->double_mod_img || !tf->double_mod_txt || !tf->single_mod_params) {
         flux_transformer_free(tf);
         return NULL;
     }
@@ -5029,78 +5619,73 @@ flux_transformer_t *flux_transformer_load_safetensors(const char *model_dir) {
     return tf;
 }
 
-/* Load transformer in mmap mode - only load small weights, keep files open for block loading */
-flux_transformer_t *flux_transformer_load_safetensors_mmap(const char *model_dir) {
+/* Load transformer in mmap mode - only load small weights, keep sf open for block loading */
+flux_transformer_t *flux_transformer_load_safetensors_mmap(safetensors_file_t *sf) {
     flux_transformer_t *tf = calloc(1, sizeof(flux_transformer_t));
     if (!tf) return NULL;
 
-    /* Parse config from transformer/config.json, fall back to 4B defaults */
-    if (parse_transformer_config(model_dir, tf) != 0) {
-        tf->hidden_size = 3072;
-        tf->num_heads = 24;
-        tf->head_dim = 128;
-        tf->mlp_hidden = 9216;
-        tf->num_double_layers = 5;
-        tf->num_single_layers = 20;
-        tf->text_dim = 7680;
-        tf->latent_channels = 128;
-        tf->rope_theta = 2000.0f;
-        tf->rope_dim = 128;
-        tf->axis_dim = 32;
-    }
+    /* Set config based on FLUX.2-klein-4B */
+    tf->hidden_size = 3072;
+    tf->num_heads = 24;
+    tf->head_dim = 128;
+    tf->mlp_hidden = 9216;
+    tf->num_double_layers = 5;
+    tf->num_single_layers = 20;
+    tf->text_dim = 7680;
+    tf->latent_channels = 128;
     tf->max_seq_len = 52000;  /* Support up to 1792x1792 */
+    tf->rope_dim = 128;
+    tf->rope_theta = 2000.0f;
+    tf->axis_dim = 32;  /* RoPE axis dimension (head_dim = 128 = 4 * axis_dim) */
 
-    /* Open safetensors shards and keep them open for on-demand loading */
+    /* Enable mmap mode - keep sf open, don't load block weights yet */
     tf->use_mmap = 1;
-    tf->num_sf_files = open_transformer_shards(model_dir, tf->sf_files, MAX_TF_SHARDS);
-    if (tf->num_sf_files == 0) {
-        fprintf(stderr, "flux_transformer_load_mmap: failed to open safetensors files\n");
-        free(tf);
-        return NULL;
-    }
+    tf->sf = sf;
 
-    /* Enable bf16 mode if Metal GPU is available */
+    /* Enable bf16 mode on GPU backends when available. */
 #ifdef USE_METAL
     tf->use_bf16 = flux_metal_available();
     if (tf->use_bf16) {
         if (flux_verbose)
             fprintf(stderr, "Using bf16 weights for GPU acceleration (mmap mode)\n");
     }
+#elif defined(USE_CUDA)
+    tf->use_bf16 = (!getenv("FLUX_CUDA_NO_BF16") && flux_cuda_bf16_linear_available()) ? 1 : 0;
+    if (tf->use_bf16 && flux_verbose) {
+        fprintf(stderr, "Using bf16 weights for CUDA tensor-core projections (mmap mode)\n");
+    }
 #else
     tf->use_bf16 = 0;
 #endif
 
-    safetensors_file_t **files = tf->sf_files;
-    int num_files = tf->num_sf_files;
-
     /* Input projections - always load (small) */
-    tf->img_in_weight = get_sf_tensor_tf(files, num_files, "x_embedder.weight");
-    tf->txt_in_weight = get_sf_tensor_tf(files, num_files, "context_embedder.weight");
+    tf->img_in_weight = get_sf_tensor_tf(sf, "x_embedder.weight");
+    tf->txt_in_weight = get_sf_tensor_tf(sf, "context_embedder.weight");
     if (tf->use_bf16) {
-        tf->img_in_weight_bf16 = get_sf_tensor_bf16(files, num_files, "x_embedder.weight");
-        tf->txt_in_weight_bf16 = get_sf_tensor_bf16(files, num_files, "context_embedder.weight");
+        tf->img_in_weight_bf16 = get_sf_tensor_bf16(sf, "x_embedder.weight");
+        tf->txt_in_weight_bf16 = get_sf_tensor_bf16(sf, "context_embedder.weight");
     }
 
     /* Time embedding - always load (small) */
     tf->time_embed.sincos_dim = 256;
-    tf->time_embed.fc1_weight = get_sf_tensor_tf(files, num_files,
+    tf->time_embed.fc1_weight = get_sf_tensor_tf(sf,
         "time_guidance_embed.timestep_embedder.linear_1.weight");
-    tf->time_embed.fc2_weight = get_sf_tensor_tf(files, num_files,
+    tf->time_embed.fc2_weight = get_sf_tensor_tf(sf,
         "time_guidance_embed.timestep_embedder.linear_2.weight");
 
     /* Modulation weights - always load */
-    tf->adaln_double_img_weight = get_sf_tensor_tf(files, num_files,
+    tf->adaln_double_img_weight = get_sf_tensor_tf(sf,
         "double_stream_modulation_img.linear.weight");
-    tf->adaln_double_txt_weight = get_sf_tensor_tf(files, num_files,
+    tf->adaln_double_txt_weight = get_sf_tensor_tf(sf,
         "double_stream_modulation_txt.linear.weight");
-    tf->adaln_single_weight = get_sf_tensor_tf(files, num_files,
+    tf->adaln_single_weight = get_sf_tensor_tf(sf,
         "single_stream_modulation.linear.weight");
     if (tf->use_bf16) {
-        tf->adaln_double_img_weight_bf16 = get_sf_tensor_bf16(files, num_files,
+        tf->adaln_double_img_weight_bf16 = get_sf_tensor_bf16(sf,
             "double_stream_modulation_img.linear.weight");
-        tf->adaln_double_txt_weight_bf16 = get_sf_tensor_bf16(files, num_files,
+        tf->adaln_double_txt_weight_bf16 = get_sf_tensor_bf16(sf,
             "double_stream_modulation_txt.linear.weight");
-        tf->adaln_single_weight_bf16 = get_sf_tensor_bf16(files, num_files,
+        tf->adaln_single_weight_bf16 = get_sf_tensor_bf16(sf,
             "single_stream_modulation.linear.weight");
     }
 
@@ -5109,10 +5694,10 @@ flux_transformer_t *flux_transformer_load_safetensors_mmap(const char *model_dir
     tf->single_blocks = calloc(tf->num_single_layers, sizeof(single_block_t));
 
     /* Final layer - always load (small) */
-    tf->final_norm_weight = get_sf_tensor_tf(files, num_files, "norm_out.linear.weight");
-    tf->final_proj_weight = get_sf_tensor_tf(files, num_files, "proj_out.weight");
+    tf->final_norm_weight = get_sf_tensor_tf(sf, "norm_out.linear.weight");
+    tf->final_proj_weight = get_sf_tensor_tf(sf, "proj_out.weight");
     if (tf->use_bf16) {
-        tf->final_proj_weight_bf16 = get_sf_tensor_bf16(files, num_files, "proj_out.weight");
+        tf->final_proj_weight_bf16 = get_sf_tensor_bf16(sf, "proj_out.weight");
     }
 
     /* Precompute RoPE frequencies */
@@ -5153,8 +5738,9 @@ flux_transformer_t *flux_transformer_load_safetensors_mmap(const char *model_dir
     tf->t_emb_silu = malloc(hidden * sizeof(float));
     tf->double_mod_img = malloc(hidden * 6 * sizeof(float));
     tf->double_mod_txt = malloc(hidden * 6 * sizeof(float));
+    tf->single_mod_params = malloc(hidden * 3 * sizeof(float));
 
-    if (!tf->t_emb_silu || !tf->double_mod_img || !tf->double_mod_txt) {
+    if (!tf->t_emb_silu || !tf->double_mod_img || !tf->double_mod_txt || !tf->single_mod_params) {
         flux_transformer_free(tf);
         return NULL;
     }
@@ -5167,4 +5753,10 @@ flux_transformer_t *flux_transformer_load_safetensors_mmap(const char *model_dir
 #endif
 
     return tf;
+}
+
+/* Compatibility hook used by sampler in branches that cache mmap weights
+ * across denoising steps. This implementation has no persistent mmap cache. */
+void flux_transformer_free_mmap_cache(flux_transformer_t *tf) {
+    (void)tf;
 }

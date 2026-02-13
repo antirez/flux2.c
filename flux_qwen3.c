@@ -30,6 +30,9 @@
 #ifdef USE_METAL
 #include "flux_metal.h"
 #endif
+#ifdef USE_CUDA
+#include "flux_cuda.h"
+#endif
 
 /* Minimum matrix size for GPU acceleration.
  * Using 10M threshold keeps text encoder on CPU (Accelerate BLAS), which is
@@ -126,6 +129,11 @@ struct qwen3_model {
     float *attn_q_head;       /* [seq_len, head_dim] */
     float *attn_v_head;       /* [seq_len, head_dim] */
     float *attn_out_head;     /* [seq_len, head_dim] */
+    /* CUDA batched attention staging buffers [num_heads, seq_len, head_dim] */
+    float *attn_q_hsd;
+    float *attn_k_hsd;
+    float *attn_v_hsd;
+    float *attn_out_hsd;
 
     /* Mmap mode: keep safetensors files open, load layer weights on-demand */
     int use_mmap;
@@ -169,11 +177,9 @@ static void qwen3_linear(float *y, const float *x, const float *W,
     }
 #endif
 
-#ifdef USE_BLAS
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                seq_len, out_dim, in_dim,
-                1.0f, x, in_dim, W, in_dim,
-                0.0f, y, out_dim);
+#if defined(USE_BLAS) || defined(USE_CUDA)
+    /* Route through shared GEMM so CUDA builds can use GPU linear kernels. */
+    flux_matmul_t(y, x, W, seq_len, in_dim, out_dim);
 #else
     for (int s = 0; s < seq_len; s++) {
         for (int o = 0; o < out_dim; o++) {
@@ -366,6 +372,46 @@ static void qwen3_attention_forward(qwen3_model_t *model, qwen3_layer_t *layer,
     {
         int heads_per_kv = num_heads / num_kv_heads;
 
+#ifdef USE_CUDA
+        /* CUDA batched GQA path: one attention launch for all query heads.
+         * Pack Q/K/V from [seq, hidden] strided layout to [heads, seq, head_dim]. */
+        if (model->attn_q_hsd && model->attn_k_hsd && model->attn_v_hsd && model->attn_out_hsd) {
+            float *q_hsd = model->attn_q_hsd;
+            float *k_hsd = model->attn_k_hsd;
+            float *v_hsd = model->attn_v_hsd;
+            float *out_hsd = model->attn_out_hsd;
+
+            for (int h = 0; h < num_heads; h++) {
+                int kv_h = h / heads_per_kv;
+                float *q_h = q_hsd + (size_t)h * seq_len * head_dim;
+                float *k_h = k_hsd + (size_t)h * seq_len * head_dim;
+                float *v_h = v_hsd + (size_t)h * seq_len * head_dim;
+                for (int s = 0; s < seq_len; s++) {
+                    const float *q_src = model->q_buf + s * q_dim + h * head_dim;
+                    const float *k_src = model->k_buf + s * kv_dim + kv_h * head_dim;
+                    const float *v_src = model->v_buf + s * kv_dim + kv_h * head_dim;
+                    memcpy(q_h + s * head_dim, q_src, head_dim * sizeof(float));
+                    memcpy(k_h + s * head_dim, k_src, head_dim * sizeof(float));
+                    memcpy(v_h + s * head_dim, v_src, head_dim * sizeof(float));
+                }
+            }
+
+            if (flux_cuda_attention_batched(out_hsd, q_hsd, k_hsd, v_hsd,
+                                            num_heads, seq_len, seq_len, head_dim,
+                                            scale, 1, attention_mask)) {
+                /* Unpack back to [seq, heads * head_dim]. */
+                for (int h = 0; h < num_heads; h++) {
+                    const float *out_h = out_hsd + (size_t)h * seq_len * head_dim;
+                    for (int s = 0; s < seq_len; s++) {
+                        float *dst = model->attn_out + s * q_dim + h * head_dim;
+                        memcpy(dst, out_h + s * head_dim, head_dim * sizeof(float));
+                    }
+                }
+                goto output_proj;
+            }
+        }
+#endif
+
         for (int h = 0; h < num_heads; h++) {
             int kv_h = h / heads_per_kv;  /* Which KV head to use */
             float *scores = model->attn_scores + h * seq_len * seq_len;
@@ -441,7 +487,7 @@ static void qwen3_attention_forward(qwen3_model_t *model, qwen3_layer_t *layer,
 
     /* Work buffers are pre-allocated in model, no free needed */
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
 output_proj:
 #endif
     /* Output projection */
@@ -1502,6 +1548,10 @@ static void qwen3_alloc_work_buffers(qwen3_model_t *model) {
     model->attn_q_head = malloc(seq_len * head_dim * sizeof(float));
     model->attn_v_head = malloc(seq_len * head_dim * sizeof(float));
     model->attn_out_head = malloc(seq_len * head_dim * sizeof(float));
+    model->attn_q_hsd = malloc(seq_len * num_heads * head_dim * sizeof(float));
+    model->attn_k_hsd = malloc(seq_len * num_heads * head_dim * sizeof(float));
+    model->attn_v_hsd = malloc(seq_len * num_heads * head_dim * sizeof(float));
+    model->attn_out_hsd = malloc(seq_len * num_heads * head_dim * sizeof(float));
 
     for (int i = 0; i < 3; i++) {
         model->layer_outputs[i] = malloc(seq_len * hidden * sizeof(float));
@@ -1691,6 +1741,10 @@ void qwen3_model_free(qwen3_model_t *model) {
     free(model->attn_q_head);
     free(model->attn_v_head);
     free(model->attn_out_head);
+    free(model->attn_q_hsd);
+    free(model->attn_k_hsd);
+    free(model->attn_v_hsd);
+    free(model->attn_out_hsd);
 
     for (int i = 0; i < 3; i++) {
         free(model->layer_outputs[i]);

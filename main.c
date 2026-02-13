@@ -30,23 +30,9 @@
 #include <getopt.h>
 #include <time.h>
 #include <sys/time.h>
-#include <unistd.h>
 
 #ifdef USE_METAL
 #include "flux_metal.h"
-#endif
-
-#ifdef USE_BLAS
-#ifdef __APPLE__
-#include <sys/sysctl.h>
-#else
-/* OpenBLAS introspection functions */
-extern int openblas_get_num_threads(void);
-extern int openblas_get_num_procs(void);
-extern char *openblas_get_corename(void);
-extern char *openblas_get_config(void);
-extern void openblas_set_num_threads(int num_threads);
-#endif
 #endif
 
 /* ========================================================================
@@ -216,7 +202,7 @@ static double timer_end(void) {
 #define MAX_INPUT_IMAGES 16
 
 static void print_usage(const char *prog) {
-    fprintf(stderr, "FLUX.2 klein - Pure C Image Generation\n\n");
+    fprintf(stderr, "FLUX.2 klein 4B - Pure C Image Generation\n\n");
     fprintf(stderr, "Usage: %s [options]\n\n", prog);
     fprintf(stderr, "Required:\n");
     fprintf(stderr, "  -d, --dir PATH        Path to model directory\n");
@@ -239,20 +225,113 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "Output options:\n");
     fprintf(stderr, "  -q, --quiet           Silent mode, no output\n");
     fprintf(stderr, "  -v, --verbose         Detailed output\n");
-    fprintf(stderr, "      --show            Display image in terminal (auto-detects Kitty/Ghostty/iTerm2/WezTerm/Konsole)\n");
+    fprintf(stderr, "      --show            Display image in terminal (auto-detects Kitty/Ghostty/iTerm2/Konsole)\n");
     fprintf(stderr, "      --show-steps      Display each denoising step (slower)\n");
     fprintf(stderr, "      --zoom N          Terminal image zoom factor (default: 2 for Retina)\n\n");
     fprintf(stderr, "Other options:\n");
     fprintf(stderr, "  -e, --embeddings PATH Load pre-computed text embeddings\n");
     fprintf(stderr, "  -m, --mmap            Use memory-mapped weights (default, fastest on MPS)\n");
     fprintf(stderr, "      --no-mmap         Disable mmap, load all weights upfront\n");
-    fprintf(stderr, "      --no-license-info Suppress non-commercial license warning\n");
-    fprintf(stderr, "      --blas-threads N  Set number of BLAS threads (OpenBLAS only)\n");
+    fprintf(stderr, "  -R, --server          Persistent stdin server mode (one prompt per line)\n");
+    fprintf(stderr, "      --overlap-preload Overlap transformer load with text encode (optional)\n");
     fprintf(stderr, "  -h, --help            Show this help\n\n");
     fprintf(stderr, "Examples:\n");
     fprintf(stderr, "  %s -d model/ -p \"a cat on a rainbow\" -o cat.png\n", prog);
     fprintf(stderr, "  %s -d model/ -p \"oil painting\" -i photo.png -o art.png\n", prog);
     fprintf(stderr, "  %s -d model/ -p \"combine them\" -i car.png -i beach.png -o result.png\n", prog);
+}
+
+static void server_output_path(char *dst, size_t dst_size,
+                               const char *pattern, int index) {
+    if (!pattern || !pattern[0]) {
+        snprintf(dst, dst_size, "server-%04d.png", index);
+        return;
+    }
+    if (strstr(pattern, "%d")) {
+        snprintf(dst, dst_size, pattern, index);
+        return;
+    }
+
+    const char *dot = strrchr(pattern, '.');
+    if (dot && dot != pattern) {
+        int base_len = (int)(dot - pattern);
+        snprintf(dst, dst_size, "%.*s-%04d%s", base_len, pattern, index, dot);
+    } else {
+        snprintf(dst, dst_size, "%s-%04d.png", pattern, index);
+    }
+}
+
+static int run_server_mode(flux_ctx *ctx,
+                           const flux_params *base_params,
+                           const char *output_pattern,
+                           int show_image,
+                           term_graphics_proto graphics_proto) {
+    char *line = NULL;
+    size_t line_cap = 0;
+    int req_id = 0;
+
+    if (output_level >= OUTPUT_NORMAL) {
+        fprintf(stderr, "Server mode ready. Enter one prompt per line.\n");
+        fprintf(stderr, "Use TAB to specify output path: prompt<TAB>/tmp/out.png\n");
+        fprintf(stderr, "Type /quit to exit.\n");
+    }
+
+    while (getline(&line, &line_cap, stdin) != -1) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+            line[--len] = '\0';
+        }
+        if (len == 0) continue;
+        if (strcmp(line, "/quit") == 0 || strcmp(line, "quit") == 0 || strcmp(line, "exit") == 0) {
+            break;
+        }
+
+        req_id++;
+        char *tab = strchr(line, '\t');
+        char *prompt = line;
+        char out_path[4096];
+        if (tab) {
+            *tab = '\0';
+            if (strstr(tab + 1, "%d")) {
+                snprintf(out_path, sizeof(out_path), tab + 1, req_id);
+            } else {
+                snprintf(out_path, sizeof(out_path), "%s", tab + 1);
+            }
+        } else {
+            server_output_path(out_path, sizeof(out_path), output_pattern, req_id);
+        }
+
+        flux_params p = *base_params;
+        if (p.seed >= 0) p.seed += req_id - 1;
+
+        struct timeval t0, t1;
+        gettimeofday(&t0, NULL);
+        flux_image *img = flux_generate(ctx, prompt, &p);
+        gettimeofday(&t1, NULL);
+        double elapsed = (t1.tv_sec - t0.tv_sec) + (t1.tv_usec - t0.tv_usec) / 1000000.0;
+
+        if (!img) {
+            fprintf(stdout, "ERR %d %s\n", req_id, flux_get_error());
+            fflush(stdout);
+            continue;
+        }
+
+        int64_t out_seed = (p.seed >= 0) ? p.seed : (int64_t)time(NULL);
+        if (flux_image_save_with_seed(img, out_path, out_seed) != 0) {
+            fprintf(stdout, "ERR %d save_failed\n", req_id);
+            fflush(stdout);
+            flux_image_free(img);
+            continue;
+        }
+
+        if (show_image) terminal_display_png(out_path, graphics_proto);
+        fprintf(stdout, "OK %d %s %.3f\n", req_id, out_path, elapsed);
+        fflush(stdout);
+        flux_image_free(img);
+    }
+
+    free(line);
+    return 0;
 }
 
 /* ========================================================================
@@ -262,6 +341,12 @@ static void print_usage(const char *prog) {
 int main(int argc, char *argv[]) {
 #ifdef USE_METAL
     flux_metal_init();
+#elif defined(USE_CUDA)
+    fprintf(stderr, "CUDA: cuBLAS GPU acceleration enabled\n");
+#elif defined(USE_BLAS)
+    fprintf(stderr, "BLAS: CPU acceleration enabled (Accelerate/OpenBLAS)\n");
+#else
+    fprintf(stderr, "Generic: Pure C backend (no acceleration)\n");
 #endif
 
     /* Command line options */
@@ -290,9 +375,9 @@ int main(int argc, char *argv[]) {
         {"linear",     no_argument,       0, 'L'},
         {"power",      no_argument,       0, 256},
         {"power-alpha",required_argument, 0, 257},
+        {"overlap-preload", no_argument,  0, 258},
+        {"server",     no_argument,       0, 'R'},
         {"debug-py",   no_argument,       0, 'D'},
-        {"no-license-info", no_argument, 0, 258},
-        {"blas-threads",required_argument, 0, 259},
         {0, 0, 0, 0}
     };
 
@@ -320,12 +405,12 @@ int main(int argc, char *argv[]) {
     int show_steps = 0;
     int debug_py = 0;
     int force_base = 0;
-    int no_license_info = 0;
-    int blas_threads = 0; (void)blas_threads;
+    int server_mode = 0;
+    int overlap_preload = 0;
     term_graphics_proto graphics_proto = detect_terminal_graphics();
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "d:p:o:W:H:s:g:S:i:t:e:n:qvhVmMD",
+    while ((opt = getopt_long(argc, argv, "d:p:o:W:H:s:g:S:i:t:e:n:qvhVmMDR",
                               long_options, NULL)) != -1) {
         switch (opt) {
             case 'd': model_dir = optarg; break;
@@ -349,7 +434,7 @@ int main(int argc, char *argv[]) {
             case 'v': output_level = OUTPUT_VERBOSE; flux_verbose = 1; break;
             case 'h': print_usage(argv[0]); return 0;
             case 'V':
-                fprintf(stderr, "FLUX.2 klein v1.0.0\n");
+                fprintf(stderr, "FLUX.2 klein 4B v1.0.0\n");
                 return 0;
             case 'm': use_mmap = 1; break;
             case 'M': use_mmap = 0; break;
@@ -360,51 +445,13 @@ int main(int argc, char *argv[]) {
             case 'L': params.linear_schedule = 1; break;
             case 256: params.power_schedule = 1; break;
             case 257: params.power_alpha = atof(optarg); params.power_schedule = 1; break;
-            case 258: no_license_info = 1; break;
+            case 258: overlap_preload = 1; break;
+            case 'R': server_mode = 1; break;
             case 'D': debug_py = 1; break;
-            case 259: blas_threads = atoi(optarg); break;
             default:
                 print_usage(argv[0]);
                 return 1;
         }
-    }
-
-    /* BLAS: apply thread setting regardless of quiet mode */
-#if defined(USE_BLAS) && !defined(USE_METAL) && !defined(__APPLE__)
-    if (blas_threads > 0) openblas_set_num_threads(blas_threads);
-#endif
-
-    /* Backend banner (suppressed by --quiet) */
-    if (output_level != OUTPUT_QUIET) {
-#ifdef USE_METAL
-        if (flux_metal_available()) {
-            long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
-            char cpu_brand[128] = "Apple Silicon";
-            size_t len = sizeof(cpu_brand);
-            sysctlbyname("machdep.cpu.brand_string", cpu_brand, &len, NULL, 0);
-            fprintf(stderr, "MPS: Metal GPU | %s | %ld cores\n", cpu_brand, ncpu);
-        }
-#elif defined(USE_BLAS)
-#ifdef __APPLE__
-        {
-            char cpu_brand[128] = "Apple Silicon";
-            size_t len = sizeof(cpu_brand);
-            sysctlbyname("machdep.cpu.brand_string", cpu_brand, &len, NULL, 0);
-            long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
-            fprintf(stderr, "BLAS: Accelerate | %s | %ld cores\n", cpu_brand, ncpu);
-            if (blas_threads > 0)
-                fprintf(stderr, "Warning: --blas-threads ignored (Accelerate manages threading automatically)\n");
-        }
-#else
-        fprintf(stderr, "BLAS: OpenBLAS | %s | %d threads / %d procs\n",
-                openblas_get_corename(),
-                openblas_get_num_threads(),
-                openblas_get_num_procs());
-        fprintf(stderr, "      %s\n", openblas_get_config());
-#endif
-#else
-        fprintf(stderr, "Generic: Pure C backend (no acceleration)\n");
-#endif
     }
 
     /* Validate required arguments */
@@ -414,10 +461,10 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Interactive mode: -d provided but no -p, -e, -o, or --debug-py */
-    int interactive_mode = (!prompt && !embeddings_path && !output_path && !debug_py);
+    /* Interactive mode: -d provided but no request options and not server mode. */
+    int interactive_mode = (!server_mode && !prompt && !embeddings_path && !output_path && !debug_py);
 
-    if (!interactive_mode) {
+    if (!interactive_mode && !server_mode) {
         if (!prompt && !embeddings_path && !debug_py) {
             fprintf(stderr, "Error: Prompt (-p) or embeddings file (-e) is required\n\n");
             print_usage(argv[0]);
@@ -428,6 +475,10 @@ int main(int argc, char *argv[]) {
             print_usage(argv[0]);
             return 1;
         }
+    }
+
+    if (overlap_preload) {
+        setenv("FLUX_OVERLAP_PRELOAD", "1", 1);
     }
 
     /* Validate parameters */
@@ -455,11 +506,12 @@ int main(int argc, char *argv[]) {
     LOG_NORMAL("Seed: %lld\n", (long long)actual_seed);
 
     /* Verbose header */
-    LOG_VERBOSE("FLUX.2 klein Image Generator\n");
+    LOG_VERBOSE("FLUX.2 klein 4B Image Generator\n");
     LOG_VERBOSE("================================\n");
     LOG_VERBOSE("Model: %s\n", model_dir);
     if (prompt) LOG_VERBOSE("Prompt: %s\n", prompt);
-    LOG_VERBOSE("Output: %s\n", output_path);
+    if (output_path) LOG_VERBOSE("Output: %s\n", output_path);
+    else if (server_mode) LOG_VERBOSE("Output: server pattern (auto)\n");
     LOG_VERBOSE("Size: %dx%d\n", params.width, params.height);
     LOG_VERBOSE("Steps: %d\n", params.num_steps);
     if (num_inputs > 0) {
@@ -492,6 +544,12 @@ int main(int argc, char *argv[]) {
         flux_set_base_mode(ctx);
     }
 
+    /* In persistent stdin server mode, keep text encoder resident so
+     * per-request latency does not include encoder reload. */
+    if (server_mode) {
+        flux_set_keep_text_encoder(ctx, 1);
+    }
+
     /* Resolve auto-parameters now that we know the model type */
     if (!steps_set || params.num_steps <= 0) {
         params.num_steps = flux_is_distilled(ctx) ? 4 : 50;
@@ -503,17 +561,6 @@ int main(int argc, char *argv[]) {
     double load_time = timer_end();
     LOG_NORMAL(" done (%.1fs)\n", load_time);
     LOG_NORMAL("Model: %s\n", flux_model_info(ctx));
-
-    /* Non-commercial license warning for 9B model */
-    if (flux_is_non_commercial(ctx) && !no_license_info
-        && output_level != OUTPUT_QUIET) {
-        fprintf(stderr,
-            "\nNOTE: This model is released under a NON COMMERCIAL LICENSE.\n"
-            "The output can only be used under the terms of the\n"
-            "FLUX non-commercial license:\n"
-            "https://huggingface.co/black-forest-labs/FLUX.2-klein-9B/blob/main/LICENSE.md\n"
-            "(use --no-license-info to suppress this message)\n\n");
-    }
 
     /* Interactive mode: start REPL */
     if (interactive_mode) {
@@ -530,11 +577,23 @@ int main(int argc, char *argv[]) {
     /* Set up step image callback if requested */
     if (show_steps) {
         if (graphics_proto == TERM_PROTO_NONE) {
-            fprintf(stderr, "Warning: --show-steps requires a supported terminal (Kitty, Ghostty, iTerm2, WezTerm, or Konsole)\n");
+            fprintf(stderr, "Warning: --show-steps requires a supported terminal (Kitty, Ghostty, iTerm2, or Konsole)\n");
         } else {
             cli_graphics_proto = graphics_proto;
             flux_set_step_image_callback(ctx, cli_step_image_callback);
         }
+    }
+
+    /* Persistent stdin server mode */
+    if (server_mode) {
+        int rc = run_server_mode(ctx, &params, output_path, show_image, graphics_proto);
+        cli_finish_progress();
+        if (show_steps) flux_set_step_image_callback(ctx, NULL);
+        flux_free(ctx);
+#ifdef USE_METAL
+        flux_metal_cleanup();
+#endif
+        return rc;
     }
 
     /* Generate image */
