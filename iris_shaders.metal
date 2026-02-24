@@ -2134,3 +2134,32 @@ kernel void upsample_nearest_2x_f32(
 
     out[c * out_spatial + oy * out_w + ox] = x[c * in_h * in_w + iy * in_w + ix];
 }
+
+/* Convert bf16 to f16 for MPS compatibility.
+ * bf16: sign(1) + exp(8) + mant(7)
+ * f16:  sign(1) + exp(5) + mant(10)
+ * Converts in parallel on GPU — much faster than a CPU loop for large
+ * weight tensors (e.g. 3072*27648 = 84M elements for a single block). */
+inline ushort bf16_to_f16_val(ushort bf16) {
+    uint sign = (bf16 >> 15) & 0x1;
+    int exp = (bf16 >> 7) & 0xFF;   /* bf16 exponent (bias 127) */
+    uint mant = bf16 & 0x7F;        /* bf16 mantissa (7 bits) */
+
+    if (exp == 0)    return ushort(sign << 15);          /* zero/denormal → zero */
+    if (exp == 0xFF) return ushort((sign << 15) | 0x7C00 | (mant != 0 ? 0x200 : 0));  /* inf/NaN */
+
+    int new_exp = exp - 127 + 15;   /* rebias: bf16 bias=127, f16 bias=15 */
+    if (new_exp <= 0)  return ushort(sign << 15);        /* underflow → zero */
+    if (new_exp >= 31) return ushort((sign << 15) | 0x7C00); /* overflow → inf */
+
+    return ushort((sign << 15) | (uint(new_exp) << 10) | (mant << 3)); /* expand 7→10 mantissa bits */
+}
+
+kernel void bf16_to_f16_convert(
+    device const ushort *input  [[buffer(0)]],
+    device       ushort *output [[buffer(1)]],
+    constant        int &n      [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid < uint(n)) output[gid] = bf16_to_f16_val(input[gid]);
+}
