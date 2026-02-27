@@ -4693,6 +4693,54 @@ void iris_transformer_free_flux(iris_transformer_flux_t *tf) {
     free(tf);
 }
 
+/* Release transformer work buffers between generations.
+ * Frees all dynamically-sized work buffers and resets allocation tracking
+ * so ensure_work_buffers() will re-allocate at the correct size for the
+ * next generation. This prevents large img2img buffers (e.g. 8-10 GB for
+ * a 1792x1792 reference) from persisting when subsequent generations need
+ * much less memory. */
+void iris_transformer_release_work_memory_flux(iris_transformer_flux_t *tf) {
+    if (!tf || tf->work_seq_alloc == 0) return;
+
+    /* Main hidden state buffers */
+    free(tf->img_hidden);   tf->img_hidden = NULL;
+    free(tf->txt_hidden);   tf->txt_hidden = NULL;
+    free(tf->work1);        tf->work1 = NULL;
+    free(tf->work2);        tf->work2 = NULL;
+    tf->work_size = 0;
+
+    /* Attention workspace buffers */
+    free(tf->attn_q_t);     tf->attn_q_t = NULL;
+    free(tf->attn_k_t);     tf->attn_k_t = NULL;
+    free(tf->attn_v_t);     tf->attn_v_t = NULL;
+    free(tf->attn_out_t);   tf->attn_out_t = NULL;
+    free(tf->attn_cat_k);   tf->attn_cat_k = NULL;
+    free(tf->attn_cat_v);   tf->attn_cat_v = NULL;
+
+    /* Attention scores */
+    free(tf->attn_scores);  tf->attn_scores = NULL;
+    tf->attn_scores_alloc = 0;
+
+    /* Single-block work buffers */
+    free(tf->single_q);          tf->single_q = NULL;
+    free(tf->single_k);          tf->single_k = NULL;
+    free(tf->single_v);          tf->single_v = NULL;
+    free(tf->single_mlp_gate);   tf->single_mlp_gate = NULL;
+    free(tf->single_mlp_up);     tf->single_mlp_up = NULL;
+    free(tf->single_attn_out);   tf->single_attn_out = NULL;
+    free(tf->single_concat);     tf->single_concat = NULL;
+
+    /* FFN work buffers */
+    free(tf->ffn_gate);          tf->ffn_gate = NULL;
+    free(tf->ffn_up);            tf->ffn_up = NULL;
+
+    /* Double-block work buffers */
+    free(tf->double_img_attn_out); tf->double_img_attn_out = NULL;
+    free(tf->double_txt_attn_out); tf->double_txt_attn_out = NULL;
+
+    tf->work_seq_alloc = 0;
+}
+
 /* ========================================================================
  * Safetensors Loading
  * ======================================================================== */

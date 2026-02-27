@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <sys/mman.h>
 
 /* ========================================================================
  * VAE Data Structures
@@ -122,6 +123,7 @@ typedef struct iris_vae {
 
 /* Forward declarations */
 void iris_vae_free(iris_vae_t *vae);
+void iris_vae_release_work_memory(iris_vae_t *vae);
 
 /* ========================================================================
  * Helper Functions
@@ -464,6 +466,16 @@ float *iris_vae_encode(iris_vae_t *vae, const float *img,
     *out_h = patch_h;
     *out_w = patch_w;
     return latent;
+}
+
+void iris_vae_release_work_memory(iris_vae_t *vae) {
+    if (!vae) return;
+    /* Mark work buffer pages as reusable. The OS can reclaim these pages
+     * immediately without swapping. On next access (e.g. during decode),
+     * the pages are lazily zero-filled — safe for work buffers. */
+    if (vae->work1) madvise(vae->work1, vae->work_size, MADV_FREE);
+    if (vae->work2) madvise(vae->work2, vae->work_size, MADV_FREE);
+    if (vae->work3) madvise(vae->work3, vae->work_size, MADV_FREE);
 }
 
 /* ========================================================================

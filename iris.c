@@ -40,6 +40,7 @@ extern iris_vae_t *iris_vae_load_safetensors_ex(safetensors_file_t *sf,
                                                   float scaling_factor,
                                                   float shift_factor);
 extern void iris_vae_free(iris_vae_t *vae);
+extern void iris_vae_release_work_memory(iris_vae_t *vae);
 extern float *iris_vae_encode(iris_vae_t *vae, const float *img,
                               int batch, int H, int W, int *out_h, int *out_w);
 extern iris_image *iris_vae_decode(iris_vae_t *vae, const float *latent,
@@ -50,6 +51,7 @@ extern iris_transformer_flux_t *iris_transformer_load_flux(FILE *f);
 extern iris_transformer_flux_t *iris_transformer_load_safetensors_flux(const char *model_dir);
 extern iris_transformer_flux_t *iris_transformer_load_safetensors_mmap_flux(const char *model_dir);
 extern void iris_transformer_free_flux(iris_transformer_flux_t *tf);
+extern void iris_transformer_release_work_memory_flux(iris_transformer_flux_t *tf);
 extern float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
                                         const float *img_latent, int img_h, int img_w,
                                         const float *txt_emb, int txt_seq,
@@ -876,6 +878,9 @@ iris_image *iris_generate(iris_ctx *ctx, const char *prompt,
         );
     }
 
+    /* Release work buffers after sampling */
+    iris_transformer_release_work_memory_flux(ctx->transformer);
+
     free(z);
     free(schedule);
     free(text_emb);
@@ -1097,6 +1102,29 @@ iris_image *iris_generate_with_embeddings_and_noise(iris_ctx *ctx,
 }
 
 /* ========================================================================
+ * Reference Image Scaling
+ * ======================================================================== */
+
+/* Scale reference dimensions to fit within a pixel budget, preserving aspect ratio.
+ * Dimensions are rounded down to multiples of 16, clamped to [16, IRIS_VAE_MAX_DIM].
+ * FLUX models are trained at ~1MP buckets (1024x1024, 768x1344, etc.), so references
+ * beyond that extrapolate RoPE positions and degrade quality. */
+static void fit_ref_to_pixel_budget(int *ref_h, int *ref_w, int max_pixels) {
+    int h = *ref_h, w = *ref_w;
+    if ((long)h * w > max_pixels) {
+        float scale = sqrtf((float)max_pixels / ((float)h * w));
+        h = (int)(h * scale) / 16 * 16;
+        w = (int)(w * scale) / 16 * 16;
+    }
+    if (h > IRIS_VAE_MAX_DIM) h = IRIS_VAE_MAX_DIM;
+    if (w > IRIS_VAE_MAX_DIM) w = IRIS_VAE_MAX_DIM;
+    if (h < 16) h = 16;
+    if (w < 16) w = 16;
+    *ref_h = h;
+    *ref_w = w;
+}
+
+/* ========================================================================
  * Attention Memory Budget
  * ======================================================================== */
 
@@ -1207,15 +1235,22 @@ iris_image *iris_img2img(iris_ctx *ctx, const char *prompt,
     p.width = (p.width / 16) * 16;
     p.height = (p.height / 16) * 16;
 
+    /* Scale reference to ~1MP pixel budget (matches training resolution),
+     * preserving aspect ratio. This replaces the old per-axis clamping that
+     * would squash a 3984x5312 image to 1792x1792 (losing aspect ratio and
+     * extrapolating far beyond trained RoPE positions). */
+    int ref_h = (input->height / 16) * 16;
+    int ref_w = (input->width / 16) * 16;
+    fit_ref_to_pixel_budget(&ref_h, &ref_w, IRIS_REF_MAX_PIXELS);
+
     /* Check attention memory budget — shrink reference if needed. */
-    int ref_w = p.width, ref_h = p.height;
     {
-        int ref_dims[2] = { p.height, p.width };
+        int ref_dims[2] = { ref_h, ref_w };
         if (fit_refs_for_attention(ctx->num_heads, p.height, p.width,
                                     ref_dims, 1, IRIS_MAX_SEQ_LEN)) {
             fprintf(stderr, "Note: reference image resized from %dx%d to %dx%d "
                     "(GPU attention memory limit)\n",
-                    p.width, p.height, ref_dims[1], ref_dims[0]);
+                    ref_w, ref_h, ref_dims[1], ref_dims[0]);
             ref_h = ref_dims[0];
             ref_w = ref_dims[1];
         }
@@ -1288,6 +1323,8 @@ iris_image *iris_img2img(iris_ctx *ctx, const char *prompt,
     }
 
     free(img_tensor);
+    /* Release VAE work buffer pages — encoding is done, decode will lazy-refault */
+    iris_vae_release_work_memory(ctx->vae);
     if (iris_phase_callback) iris_phase_callback("encoding reference image", 1);
 
     if (!img_latent) {
@@ -1348,6 +1385,9 @@ iris_image *iris_img2img(iris_ctx *ctx, const char *prompt,
             NULL
         );
     }
+
+    /* Release work buffers after sampling */
+    iris_transformer_release_work_memory_flux(ctx->transformer);
 
     free(z);
     free(img_latent);
@@ -1456,15 +1496,12 @@ iris_image *iris_multiref(iris_ctx *ctx, const char *prompt,
         return NULL;
     }
 
-    /* Build reference pixel dimensions, clamped and rounded to 16. */
+    /* Build reference pixel dimensions, scaled to ~1MP budget and rounded to 16. */
     int *ref_pixel_dims = (int *)malloc(num_refs * 2 * sizeof(int));
     for (int i = 0; i < num_refs; i++) {
         int rh = (refs[i]->height / 16) * 16;
         int rw = (refs[i]->width / 16) * 16;
-        if (rh > IRIS_VAE_MAX_DIM) rh = IRIS_VAE_MAX_DIM;
-        if (rw > IRIS_VAE_MAX_DIM) rw = IRIS_VAE_MAX_DIM;
-        if (rh < 16) rh = 16;
-        if (rw < 16) rw = 16;
+        fit_ref_to_pixel_budget(&rh, &rw, IRIS_REF_MAX_PIXELS);
         ref_pixel_dims[i*2]   = rh;
         ref_pixel_dims[i*2+1] = rw;
     }
@@ -1546,6 +1583,9 @@ iris_image *iris_multiref(iris_ctx *ctx, const char *prompt,
     free(resized_imgs);
     free(ref_pixel_dims);
 
+    /* Release VAE work buffer pages — encoding is done, decode will lazy-refault */
+    iris_vae_release_work_memory(ctx->vae);
+
     int latent_h = p.height / 16;
     int latent_w = p.width / 16;
     int image_seq_len = latent_h * latent_w;
@@ -1577,6 +1617,9 @@ iris_image *iris_multiref(iris_ctx *ctx, const char *prompt,
             NULL
         );
     }
+
+    /* Release work buffers after sampling */
+    iris_transformer_release_work_memory_flux(ctx->transformer);
 
     /* Cleanup */
     free(z);

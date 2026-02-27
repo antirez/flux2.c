@@ -42,6 +42,7 @@ extern "C" {
 #define IRIS_VAE_NUM_RES        2
 #define IRIS_VAE_GROUPS         32
 #define IRIS_VAE_MAX_DIM        1792  /* Max image dimension for VAE */
+#define IRIS_REF_MAX_PIXELS     1048576  /* ~1MP reference pixel budget (matches training) */
 
 /* Tokenizer */
 #define IRIS_MAX_SEQ_LEN        512
