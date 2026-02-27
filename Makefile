@@ -11,7 +11,7 @@ UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 
 # Source files
-SRCS = iris.c iris_kernels.c iris_tokenizer.c iris_vae.c iris_transformer_flux.c iris_transformer_zimage.c iris_sample.c iris_image.c jpeg.c iris_safetensors.c iris_qwen3.c iris_qwen3_tokenizer.c terminals.c
+SRCS = iris.c iris_kernels.c iris_tokenizer.c iris_vae.c iris_transformer_flux.c iris_transformer_zimage.c iris_sample.c iris_image.c jpeg.c iris_safetensors.c iris_qwen3.c iris_qwen3_tokenizer.c iris_mistral.c iris_mistral_tokenizer.c terminals.c
 OBJS = $(SRCS:.c=.o)
 CLI_SRCS = iris_cli.c linenoise.c embcache.c
 CLI_OBJS = $(CLI_SRCS:.c=.o)
@@ -176,7 +176,7 @@ endif
 # =============================================================================
 # Dependencies
 # =============================================================================
-iris.o: iris.c iris.h iris_kernels.h iris_safetensors.h iris_qwen3.h
+iris.o: iris.c iris.h iris_kernels.h iris_safetensors.h iris_qwen3.h iris_mistral.h
 iris_kernels.o: iris_kernels.c iris_kernels.h
 iris_tokenizer.o: iris_tokenizer.c iris.h
 iris_vae.o: iris_vae.c iris.h iris_kernels.h
@@ -187,6 +187,8 @@ iris_image.o: iris_image.c iris.h
 iris_safetensors.o: iris_safetensors.c iris_safetensors.h
 iris_qwen3.o: iris_qwen3.c iris_qwen3.h iris_safetensors.h
 iris_qwen3_tokenizer.o: iris_qwen3_tokenizer.c iris_qwen3.h
+iris_mistral.o: iris_mistral.c iris_mistral.h iris_safetensors.h iris_kernels.h
+iris_mistral_tokenizer.o: iris_mistral_tokenizer.c iris_mistral.h
 terminals.o: terminals.c terminals.h iris.h
 iris_cli.o: iris_cli.c iris_cli.h iris.h iris_qwen3.h embcache.h linenoise.h terminals.h
 linenoise.o: linenoise.c linenoise.h

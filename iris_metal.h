@@ -447,6 +447,10 @@ void iris_gpu_add_bf16(iris_gpu_tensor_t out, iris_gpu_tensor_t a, iris_gpu_tens
 /* BF16 buffer copy (GPU blit): dst = src */
 void iris_gpu_copy_bf16(iris_gpu_tensor_t dst, iris_gpu_tensor_t src, size_t n);
 
+/* BF16 region copy (GPU blit): copy n elements from src[src_offset..] to dst[dst_offset..] */
+void iris_gpu_copy_region_bf16(iris_gpu_tensor_t dst, iris_gpu_tensor_t src,
+                                size_t n, size_t dst_offset, size_t src_offset);
+
 /* BF16 SiLU multiply: gate = silu(gate) * up */
 void iris_gpu_silu_mul_bf16(iris_gpu_tensor_t gate, iris_gpu_tensor_t up, int n);
 
@@ -746,6 +750,12 @@ void iris_metal_warmup_bf16_buffer(const uint16_t *bf16_weights, size_t num_elem
  * Check if bf16 pipeline is available (all required shaders loaded).
  */
 int iris_bf16_pipeline_available(void);
+
+/*
+ * Check if hardware has native BF16 ALUs (M3+ / Apple9 family).
+ * On M1/M2, BF16 shaders compile but run emulated via F32 conversion.
+ */
+int iris_metal_has_native_bf16(void);
 
 #ifdef __OBJC__
 #import <Metal/Metal.h>

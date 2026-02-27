@@ -13,6 +13,16 @@
 #import <Metal/Metal.h>
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 #import <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
+
+/* Forward-declare SDPA method for macOS < 15 compatibility.
+ * At runtime, respondsToSelector: gates usage (line ~4578). */
+@interface MPSGraph (SDPA)
+- (MPSGraphTensor *)scaledDotProductAttentionWithQueryTensor:(MPSGraphTensor *)query
+                                                   keyTensor:(MPSGraphTensor *)key
+                                                 valueTensor:(MPSGraphTensor *)value
+                                                       scale:(float)scale
+                                                        name:(NSString *)name;
+@end
 #include "iris_metal.h"
 #include "iris_kernels.h"
 #include "iris_shaders_source.h"
@@ -40,6 +50,7 @@ static int bf16_linear_use_graph(int seq_len, int in_dim, int out_dim) {
 static id<MTLDevice> g_device = nil;
 static id<MTLCommandQueue> g_queue = nil;
 static int g_initialized = 0;
+static int g_has_native_bf16 = 0;  /* M3+ (Apple9) has native BF16 ALUs */
 
 /* Cache for MPSGraph-based SDPA graphs (bf16) */
 #define MAX_SDPA_GRAPH_CACHE 8
@@ -449,6 +460,11 @@ int iris_metal_init(void) {
                 g_device = nil;
                 return 0;
             }
+        }
+
+        /* Detect native BF16 hardware support (M3+ = Apple9 family) */
+        if (@available(macOS 14.0, *)) {
+            g_has_native_bf16 = [g_device supportsFamily:MTLGPUFamilyApple9];
         }
 
         /* Create command queue */
@@ -1114,8 +1130,20 @@ void iris_metal_sgemm_bf16(int transpose_a, int transpose_b,
         size_t numB = (size_t)rowsB * ldb;  /* Number of bf16 elements */
         size_t sizeC = (size_t)M * ldc * sizeof(float);
 
-        /* Get cached f16 weight buffer (bf16 converted to f16) */
-        id<MTLBuffer> bufferB = get_cached_bf16_as_f16_buffer(B_bf16, numB);
+        /* When BF16 compute shaders are available, reuse the BF16 cache from
+         * warmup and tell MPS the data is BFloat16.  This works on M1/M2 too
+         * because Metal transparently emulates BF16 via F32 conversion.
+         * Must use the same check as warmup to avoid creating dual caches. */
+        int use_native_bf16 = iris_bf16_pipeline_available();
+        id<MTLBuffer> bufferB;
+        MPSDataType bDataType;
+        if (use_native_bf16) {
+            bufferB = get_cached_bf16_buffer(B_bf16, numB);
+            bDataType = MPSDataTypeBFloat16;
+        } else {
+            bufferB = get_cached_bf16_as_f16_buffer(B_bf16, numB);
+            bDataType = MPSDataTypeFloat16;
+        }
 
         /* Use cached input buffer if in batch mode, otherwise allocate fresh */
         id<MTLBuffer> bufferA = nil;
@@ -1143,7 +1171,7 @@ void iris_metal_sgemm_bf16(int transpose_a, int transpose_b,
             memcpy([bufferC contents], C, sizeC);
         }
 
-        /* Create matrix descriptors - B uses Float16 (converted from bf16) */
+        /* Create matrix descriptors */
         MPSMatrixDescriptor *descA = [MPSMatrixDescriptor
             matrixDescriptorWithRows:rowsA columns:colsA
                             rowBytes:lda * sizeof(float)
@@ -1152,7 +1180,7 @@ void iris_metal_sgemm_bf16(int transpose_a, int transpose_b,
         MPSMatrixDescriptor *descB = [MPSMatrixDescriptor
             matrixDescriptorWithRows:rowsB columns:colsB
                             rowBytes:ldb * sizeof(uint16_t)
-                            dataType:MPSDataTypeFloat16];
+                            dataType:bDataType];
 
         MPSMatrixDescriptor *descC = [MPSMatrixDescriptor
             matrixDescriptorWithRows:M columns:N
@@ -2026,6 +2054,10 @@ int iris_bf16_pipeline_available(void) {
     }
 
     return ok;
+}
+
+int iris_metal_has_native_bf16(void) {
+    return g_has_native_bf16;
 }
 
 /* Convert f32 tensor to bf16 on GPU */
@@ -5102,6 +5134,32 @@ void iris_gpu_copy_bf16(iris_gpu_tensor_t dst, iris_gpu_tensor_t src, size_t n) 
         size_t bytes = n * sizeof(uint16_t);
         [blit copyFromBuffer:src->buffer sourceOffset:0
                     toBuffer:dst->buffer destinationOffset:0
+                        size:bytes];
+        [blit endEncoding];
+
+        dst->has_pending_work = 1;
+        src->has_pending_work = 1;
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            dst->has_pending_work = 0;
+            src->has_pending_work = 0;
+        }
+    }
+}
+
+/* BF16 region copy: copy n elements from src[src_offset..] to dst[dst_offset..] */
+void iris_gpu_copy_region_bf16(iris_gpu_tensor_t dst, iris_gpu_tensor_t src,
+                                size_t n, size_t dst_offset, size_t src_offset) {
+    if (!g_initialized || !dst || !src || n == 0) return;
+    if (!dst->is_f16 || !src->is_f16) return;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLBlitCommandEncoder> blit = [cmdBuffer blitCommandEncoder];
+        size_t bytes = n * sizeof(uint16_t);
+        [blit copyFromBuffer:src->buffer sourceOffset:src_offset * sizeof(uint16_t)
+                    toBuffer:dst->buffer destinationOffset:dst_offset * sizeof(uint16_t)
                         size:bytes];
         [blit endEncoding];
 

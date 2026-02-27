@@ -234,6 +234,15 @@ typedef struct iris_transformer_flux {
     time_embed_t time_embed;
     float *time_freq;       /* [hidden/2] - precomputed sinusoidal frequencies */
 
+    /* FLUX.2-dev additional conditioning embeddings */
+    time_embed_t guidance_embed;    /* guidance_embedder MLP (256 -> hidden) */
+    time_embed_t text_proj_embed;   /* text_embedder MLP (pooled_dim -> hidden) */
+    int has_guidance;               /* 1 if guidance_embedder weights loaded */
+    int has_text_proj;              /* 1 if text_embedder weights loaded */
+    int pooled_dim;                 /* pooled embedding input dim (768 for dev, 0 for klein) */
+    const float *pooled_emb;       /* [pooled_dim] set before forward, NULL for klein */
+    float guidance_val;             /* guidance scale, set before forward */
+
     /* Shared AdaLN modulation (f32 and bf16) */
     float *adaln_double_img_weight;  /* [hidden * 6, hidden] for double block img stream */
     float *adaln_double_txt_weight;  /* [hidden * 6, hidden] for double block txt stream */
@@ -319,6 +328,10 @@ typedef struct iris_transformer_flux {
     int cached_combined_ref_h;
     int cached_combined_ref_w;
     int cached_combined_t_offset;
+    /* Multiref combined RoPE cache (target + N references) */
+    float *cached_multiref_rope_cos;
+    float *cached_multiref_rope_sin;
+    int cached_multiref_combined_seq;  /* total combined_img_seq for cache validation */
 
     /* Mmap mode: keep safetensors file open, load block weights on-demand */
     int use_mmap;
@@ -349,7 +362,7 @@ static int parse_transformer_config(const char *model_dir, iris_transformer_flux
      * Look for "key": value patterns. */
     char *p;
     int num_heads = 0, head_dim = 0, num_layers = 0, num_single = 0;
-    int joint_attention_dim = 0, in_channels = 0;
+    int joint_attention_dim = 0, in_channels = 0, pooled_projection_dim = 0;
     float mlp_ratio = 0, rope_theta = 0;
 
     if ((p = strstr(buf, "\"num_attention_heads\""))) {
@@ -376,6 +389,9 @@ static int parse_transformer_config(const char *model_dir, iris_transformer_flux
     if ((p = strstr(buf, "\"rope_theta\""))) {
         if ((p = strchr(p, ':'))) rope_theta = atof(p + 1);
     }
+    if ((p = strstr(buf, "\"pooled_projection_dim\""))) {
+        if ((p = strchr(p, ':'))) pooled_projection_dim = atoi(p + 1);
+    }
 
     /* Validate: we need at least heads and head_dim */
     if (num_heads <= 0 || head_dim <= 0) return -1;
@@ -391,6 +407,7 @@ static int parse_transformer_config(const char *model_dir, iris_transformer_flux
     tf->rope_theta = rope_theta > 0 ? rope_theta : 2000.0f;
     tf->rope_dim = head_dim;
     tf->axis_dim = head_dim / 4;  /* 4 RoPE axes */
+    tf->pooled_dim = pooled_projection_dim;  /* 768 for FLUX.2-dev, 0 for Klein */
 
     return 0;
 }
@@ -725,51 +742,48 @@ static void warmup_mmap_bf16_buffers(iris_transformer_flux_t *tf) {
     int h = tf->hidden_size, mlp = tf->mlp_hidden;
     int fused = h * 3 + mlp * 2;
 
+    /* Choose the correct warmup based on which GPU pipeline will actually be used.
+     * iris_bf16_pipeline_available() returns true when BF16 compute shaders compiled
+     * successfully — this works on M1/M2 too (Metal emulates BF16 via F32 internally).
+     * The warmup and the BF16 pipeline MUST use the same check to avoid dual caches. */
+    int native_bf16 = iris_bf16_pipeline_available();
+    if (iris_verbose)
+        fprintf(stderr, "Warmup: native_bf16=%d, using %s cache\n",
+                native_bf16, native_bf16 ? "BF16" : "F16");
+
+    /* Warmup macro: dispatch to the correct cache */
+    #define MMAP_WARMUP(ptr, n) do { \
+        if (ptr) { \
+            if (native_bf16) iris_metal_warmup_bf16_buffer(ptr, n); \
+            else             iris_metal_warmup_bf16(ptr, n); \
+        } \
+    } while(0)
+
     /* Input/output projections (already loaded) */
-    if (tf->img_in_weight_bf16)
-        iris_metal_warmup_bf16_buffer(tf->img_in_weight_bf16,
-                                       (size_t)tf->latent_channels * h);
-    if (tf->txt_in_weight_bf16)
-        iris_metal_warmup_bf16_buffer(tf->txt_in_weight_bf16,
-                                       (size_t)tf->text_dim * h);
-    if (tf->final_proj_weight_bf16)
-        iris_metal_warmup_bf16_buffer(tf->final_proj_weight_bf16,
-                                       (size_t)tf->latent_channels * h);
+    MMAP_WARMUP(tf->img_in_weight_bf16, (size_t)tf->latent_channels * h);
+    MMAP_WARMUP(tf->txt_in_weight_bf16, (size_t)tf->text_dim * h);
+    MMAP_WARMUP(tf->final_proj_weight_bf16, (size_t)tf->latent_channels * h);
 
     /* Double blocks */
     for (int i = 0; i < tf->num_double_layers; i++) {
         load_double_block_weights(&tf->double_blocks[i], tf->sf_files, tf->num_sf_files, i, h, mlp, 1);
         double_block_t *b = &tf->double_blocks[i];
 
-        if (b->img_q_weight_bf16)
-            iris_metal_warmup_bf16_buffer(b->img_q_weight_bf16, (size_t)h*h);
-        if (b->img_k_weight_bf16)
-            iris_metal_warmup_bf16_buffer(b->img_k_weight_bf16, (size_t)h*h);
-        if (b->img_v_weight_bf16)
-            iris_metal_warmup_bf16_buffer(b->img_v_weight_bf16, (size_t)h*h);
-        if (b->img_proj_weight_bf16)
-            iris_metal_warmup_bf16_buffer(b->img_proj_weight_bf16, (size_t)h*h);
-        if (b->img_mlp_gate_weight_bf16)
-            iris_metal_warmup_bf16_buffer(b->img_mlp_gate_weight_bf16, (size_t)mlp*h);
-        if (b->img_mlp_up_weight_bf16)
-            iris_metal_warmup_bf16_buffer(b->img_mlp_up_weight_bf16, (size_t)mlp*h);
-        if (b->img_mlp_down_weight_bf16)
-            iris_metal_warmup_bf16_buffer(b->img_mlp_down_weight_bf16, (size_t)h*mlp);
+        MMAP_WARMUP(b->img_q_weight_bf16, (size_t)h*h);
+        MMAP_WARMUP(b->img_k_weight_bf16, (size_t)h*h);
+        MMAP_WARMUP(b->img_v_weight_bf16, (size_t)h*h);
+        MMAP_WARMUP(b->img_proj_weight_bf16, (size_t)h*h);
+        MMAP_WARMUP(b->img_mlp_gate_weight_bf16, (size_t)mlp*h);
+        MMAP_WARMUP(b->img_mlp_up_weight_bf16, (size_t)mlp*h);
+        MMAP_WARMUP(b->img_mlp_down_weight_bf16, (size_t)h*mlp);
 
-        if (b->txt_q_weight_bf16)
-            iris_metal_warmup_bf16_buffer(b->txt_q_weight_bf16, (size_t)h*h);
-        if (b->txt_k_weight_bf16)
-            iris_metal_warmup_bf16_buffer(b->txt_k_weight_bf16, (size_t)h*h);
-        if (b->txt_v_weight_bf16)
-            iris_metal_warmup_bf16_buffer(b->txt_v_weight_bf16, (size_t)h*h);
-        if (b->txt_proj_weight_bf16)
-            iris_metal_warmup_bf16_buffer(b->txt_proj_weight_bf16, (size_t)h*h);
-        if (b->txt_mlp_gate_weight_bf16)
-            iris_metal_warmup_bf16_buffer(b->txt_mlp_gate_weight_bf16, (size_t)mlp*h);
-        if (b->txt_mlp_up_weight_bf16)
-            iris_metal_warmup_bf16_buffer(b->txt_mlp_up_weight_bf16, (size_t)mlp*h);
-        if (b->txt_mlp_down_weight_bf16)
-            iris_metal_warmup_bf16_buffer(b->txt_mlp_down_weight_bf16, (size_t)h*mlp);
+        MMAP_WARMUP(b->txt_q_weight_bf16, (size_t)h*h);
+        MMAP_WARMUP(b->txt_k_weight_bf16, (size_t)h*h);
+        MMAP_WARMUP(b->txt_v_weight_bf16, (size_t)h*h);
+        MMAP_WARMUP(b->txt_proj_weight_bf16, (size_t)h*h);
+        MMAP_WARMUP(b->txt_mlp_gate_weight_bf16, (size_t)mlp*h);
+        MMAP_WARMUP(b->txt_mlp_up_weight_bf16, (size_t)mlp*h);
+        MMAP_WARMUP(b->txt_mlp_down_weight_bf16, (size_t)h*mlp);
 
         free_double_block_weights(&tf->double_blocks[i]);
     }
@@ -779,13 +793,13 @@ static void warmup_mmap_bf16_buffers(iris_transformer_flux_t *tf) {
         load_single_block_weights(&tf->single_blocks[i], tf->sf_files, tf->num_sf_files, i, h, mlp, 1);
         single_block_t *b = &tf->single_blocks[i];
 
-        if (b->qkv_mlp_weight_bf16)
-            iris_metal_warmup_bf16_buffer(b->qkv_mlp_weight_bf16, (size_t)fused*h);
-        if (b->proj_mlp_weight_bf16)
-            iris_metal_warmup_bf16_buffer(b->proj_mlp_weight_bf16, (size_t)h*(h+mlp));
+        MMAP_WARMUP(b->qkv_mlp_weight_bf16, (size_t)fused*h);
+        MMAP_WARMUP(b->proj_mlp_weight_bf16, (size_t)h*(h+mlp));
 
         free_single_block_weights(&tf->single_blocks[i]);
     }
+
+    #undef MMAP_WARMUP
 }
 #endif
 
@@ -1196,6 +1210,28 @@ static void time_embed_forward(float *out, const float *t_sincos,
     iris_linear_nobias(out, work, te->fc2_weight, 1, hidden, hidden);
 }
 
+/* Add FLUX.2-dev conditioning embeddings (guidance + pooled text) to t_emb.
+ * For Klein models, has_guidance and has_text_proj are both 0, making this a no-op. */
+static void add_dev_conditioning(float *t_emb, iris_transformer_flux_t *tf) {
+    int hidden = tf->hidden_size;
+
+    if (tf->has_guidance) {
+        float guid_sincos[256];
+        get_timestep_embedding(guid_sincos, tf->guidance_val * 1000.0f, 256, 10000.0f);
+        float *guid_emb = (float *)malloc(hidden * sizeof(float));
+        time_embed_forward(guid_emb, guid_sincos, &tf->guidance_embed, hidden, tf->t_emb_silu);
+        for (int i = 0; i < hidden; i++) t_emb[i] += guid_emb[i];
+        free(guid_emb);
+    }
+
+    if (tf->has_text_proj && tf->pooled_emb) {
+        float *text_proj = (float *)malloc(hidden * sizeof(float));
+        time_embed_forward(text_proj, tf->pooled_emb, &tf->text_proj_embed, hidden, tf->t_emb_silu);
+        for (int i = 0; i < hidden; i++) t_emb[i] += text_proj[i];
+        free(text_proj);
+    }
+}
+
 /* ========================================================================
  * AdaLN-Zero Modulation
  * ======================================================================== */
@@ -1368,6 +1404,13 @@ static void transpose_hsd_to_shd(float *out, const float *in,
 }
 #endif /* USE_METAL */
 
+/* Chunked attention: split Q into blocks to keep the score matrix small.
+ * With chunk_size=1024, score matrix is [heads, 1024, seq_k] instead of
+ * [heads, seq_q, seq_k], reducing memory from ~4 GB to ~0.6 GB for typical
+ * 1024x1024 + reference image scenarios on macOS 14 (no native SDPA). */
+#define ATTN_CHUNK_SIZE       1024
+#define ATTN_CHUNK_THRESHOLD  4096
+
 /* Ensure attn_scores buffer is large enough for current sequence lengths.
  * Only needed for BLAS/Metal paths - flash attention doesn't use this buffer.
  * Returns 0 on success, -1 on allocation failure.
@@ -1375,9 +1418,16 @@ static void transpose_hsd_to_shd(float *out, const float *in,
 static int ensure_attn_scores(iris_transformer_flux_t *tf, int img_seq, int txt_seq) {
 #if defined(USE_METAL) || defined(USE_BLAS)
     int total_seq = img_seq + txt_seq;
-    /* Need space for num_heads * max_seq * max_seq where max_seq = total_seq
-     * This covers both self-attention and joint attention needs */
-    size_t needed = (size_t)tf->num_heads * total_seq * total_seq * sizeof(float);
+    /* When Metal is available and sequences are long, use chunked allocation:
+     * only need [heads, chunk_size, total_seq] instead of [heads, total_seq, total_seq].
+     * BLAS path still gets the full allocation since it's only reached without Metal. */
+    int score_q = total_seq;
+#ifdef USE_METAL
+    if (iris_metal_available() && total_seq > ATTN_CHUNK_THRESHOLD) {
+        score_q = ATTN_CHUNK_SIZE;
+    }
+#endif
+    size_t needed = (size_t)tf->num_heads * score_q * total_seq * sizeof(float);
 
     if (tf->attn_scores_alloc < needed) {
         free(tf->attn_scores);
@@ -1572,6 +1622,55 @@ static int get_attn_num_threads(int heads) {
 }
 #endif /* USE_BLAS */
 
+#ifdef USE_METAL
+/* Chunked attention for F32 Metal batched path.
+ * Processes Q in blocks of ATTN_CHUNK_SIZE to keep the score matrix small.
+ * Q/K/V/out are in [heads, seq, head_dim] layout.
+ * scores buffer must be at least [heads, ATTN_CHUNK_SIZE, seq_k] floats. */
+static void iris_metal_attention_chunked(float *out, const float *q, const float *k, const float *v,
+                                          float *scores, int heads, int seq_q, int seq_k, int head_dim,
+                                          float scale) {
+    int chunk = ATTN_CHUNK_SIZE;
+    size_t head_stride_q = (size_t)seq_q * head_dim;
+
+    /* Temp buffers for one chunk across all heads */
+    size_t chunk_elems = (size_t)heads * chunk * head_dim;
+    float *q_chunk = (float *)malloc(chunk_elems * sizeof(float));
+    float *out_chunk = (float *)malloc(chunk_elems * sizeof(float));
+    if (!q_chunk || !out_chunk) {
+        free(q_chunk);
+        free(out_chunk);
+        /* Last resort: try unchunked (will likely hit the same OOM) */
+        iris_metal_attention(out, q, k, v, scores, heads, seq_q, seq_k, head_dim, scale);
+        return;
+    }
+
+    for (int offset = 0; offset < seq_q; offset += chunk) {
+        int clen = (offset + chunk <= seq_q) ? chunk : (seq_q - offset);
+
+        /* Gather Q rows for this chunk from each head */
+        for (int h = 0; h < heads; h++) {
+            memcpy(q_chunk + (size_t)h * clen * head_dim,
+                   q + (size_t)h * head_stride_q + (size_t)offset * head_dim,
+                   (size_t)clen * head_dim * sizeof(float));
+        }
+
+        iris_metal_attention(out_chunk, q_chunk, k, v, scores,
+                             heads, clen, seq_k, head_dim, scale);
+
+        /* Scatter output rows back to each head */
+        for (int h = 0; h < heads; h++) {
+            memcpy(out + (size_t)h * head_stride_q + (size_t)offset * head_dim,
+                   out_chunk + (size_t)h * clen * head_dim,
+                   (size_t)clen * head_dim * sizeof(float));
+        }
+    }
+
+    free(q_chunk);
+    free(out_chunk);
+}
+#endif /* USE_METAL */
+
 /* Multi-head attention with BLAS optimization
  * Uses pre-allocated workspace buffers from transformer struct
  */
@@ -1601,8 +1700,13 @@ static void mha_forward(float *out, const float *q, const float *k, const float 
         transpose_shd_to_hsd(k_t, k, seq, tf->num_heads, head_dim);
         transpose_shd_to_hsd(v_t, v, seq, tf->num_heads, head_dim);
 
-        iris_metal_attention(out_t, q_t, k_t, v_t, scores,
-                             tf->num_heads, seq, seq, head_dim, scale);
+        if (seq > ATTN_CHUNK_SIZE && seq > ATTN_CHUNK_THRESHOLD) {
+            iris_metal_attention_chunked(out_t, q_t, k_t, v_t, scores,
+                                         tf->num_heads, seq, seq, head_dim, scale);
+        } else {
+            iris_metal_attention(out_t, q_t, k_t, v_t, scores,
+                                 tf->num_heads, seq, seq, head_dim, scale);
+        }
 
         /* Transpose output back to [seq, heads, head_dim] */
         transpose_hsd_to_shd(out, out_t, seq, tf->num_heads, head_dim);
@@ -1721,11 +1825,21 @@ static void joint_attention(float *img_out, float *txt_out,
         transpose_shd_to_hsd(cat_v_t, cat_v, total_seq, heads, head_dim);
 
         /* Image attention: img_Q @ cat_K^T, softmax, @ cat_V */
-        iris_metal_attention(img_out_t, img_q_t, cat_k_t, cat_v_t, scores,
-                             heads, img_seq, total_seq, head_dim, scale);
+        if (img_seq > ATTN_CHUNK_SIZE && total_seq > ATTN_CHUNK_THRESHOLD) {
+            iris_metal_attention_chunked(img_out_t, img_q_t, cat_k_t, cat_v_t, scores,
+                                         heads, img_seq, total_seq, head_dim, scale);
+        } else {
+            iris_metal_attention(img_out_t, img_q_t, cat_k_t, cat_v_t, scores,
+                                 heads, img_seq, total_seq, head_dim, scale);
+        }
         /* Text attention: txt_Q @ cat_K^T, softmax, @ cat_V */
-        iris_metal_attention(txt_out_t, txt_q_t, cat_k_t, cat_v_t, scores,
-                             heads, txt_seq, total_seq, head_dim, scale);
+        if (txt_seq > ATTN_CHUNK_SIZE && total_seq > ATTN_CHUNK_THRESHOLD) {
+            iris_metal_attention_chunked(txt_out_t, txt_q_t, cat_k_t, cat_v_t, scores,
+                                         heads, txt_seq, total_seq, head_dim, scale);
+        } else {
+            iris_metal_attention(txt_out_t, txt_q_t, cat_k_t, cat_v_t, scores,
+                                 heads, txt_seq, total_seq, head_dim, scale);
+        }
 
         /* Transpose outputs back */
         transpose_hsd_to_shd(img_out, img_out_t, img_seq, heads, head_dim);
@@ -1822,6 +1936,44 @@ static iris_gpu_tensor_t bf16_tensor_from_f32(const float *data, int n) {
     return bf16;
 }
 
+/* Chunked BF16 attention: splits Q into chunks to reduce MPSGraph score matrix memory.
+ * Works on GPU tensors in [seq, hidden] layout. */
+static int attention_chunked_bf16(iris_gpu_tensor_t out,
+                                   iris_gpu_tensor_t q, iris_gpu_tensor_t k, iris_gpu_tensor_t v,
+                                   int seq_q, int seq_k, int heads, int head_dim, float scale) {
+    int hidden = heads * head_dim;
+    int chunk = ATTN_CHUNK_SIZE;
+
+    for (int offset = 0; offset < seq_q; offset += chunk) {
+        int clen = (offset + chunk <= seq_q) ? chunk : (seq_q - offset);
+
+        iris_gpu_tensor_t q_chunk = iris_gpu_tensor_alloc_f16((size_t)clen * hidden);
+        iris_gpu_tensor_t out_chunk = iris_gpu_tensor_alloc_f16((size_t)clen * hidden);
+        if (!q_chunk || !out_chunk) {
+            if (q_chunk) iris_gpu_tensor_free(q_chunk);
+            if (out_chunk) iris_gpu_tensor_free(out_chunk);
+            return 0;
+        }
+
+        iris_gpu_slice_seq_bf16(q_chunk, q, clen, hidden, offset);
+
+        if (!iris_gpu_attention_fused_bf16(out_chunk, q_chunk, k, v,
+                                            clen, seq_k, heads, head_dim, scale)) {
+            iris_gpu_tensor_free(q_chunk);
+            iris_gpu_tensor_free(out_chunk);
+            return 0;
+        }
+
+        iris_gpu_copy_region_bf16(out, out_chunk,
+                                   (size_t)clen * hidden,
+                                   (size_t)offset * hidden, 0);
+
+        iris_gpu_tensor_free(q_chunk);
+        iris_gpu_tensor_free(out_chunk);
+    }
+    return 1;
+}
+
 /* Joint attention on bf16 GPU tensors (img and txt attend to concatenated K/V) */
 static int joint_attention_bf16(iris_gpu_tensor_t img_out, iris_gpu_tensor_t txt_out,
                                 iris_gpu_tensor_t img_q, iris_gpu_tensor_t img_k, iris_gpu_tensor_t img_v,
@@ -1848,12 +2000,23 @@ static int joint_attention_bf16(iris_gpu_tensor_t img_out, iris_gpu_tensor_t txt
     iris_gpu_concat_seq_bf16(cat_v, txt_v, img_v, txt_seq, img_seq, hidden);
 
     int ok = 1;
-    if (!iris_gpu_attention_fused_bf16(img_out, img_q, cat_k, cat_v,
-                                       img_seq, total_seq, heads, head_dim, scale)) {
-        ok = 0;
-    } else if (!iris_gpu_attention_fused_bf16(txt_out, txt_q, cat_k, cat_v,
-                                              txt_seq, total_seq, heads, head_dim, scale)) {
-        ok = 0;
+    if (total_seq > ATTN_CHUNK_THRESHOLD) {
+        /* Chunked attention to avoid materializing huge score matrix */
+        if (!attention_chunked_bf16(img_out, img_q, cat_k, cat_v,
+                                     img_seq, total_seq, heads, head_dim, scale)) {
+            ok = 0;
+        } else if (!attention_chunked_bf16(txt_out, txt_q, cat_k, cat_v,
+                                            txt_seq, total_seq, heads, head_dim, scale)) {
+            ok = 0;
+        }
+    } else {
+        if (!iris_gpu_attention_fused_bf16(img_out, img_q, cat_k, cat_v,
+                                           img_seq, total_seq, heads, head_dim, scale)) {
+            ok = 0;
+        } else if (!iris_gpu_attention_fused_bf16(txt_out, txt_q, cat_k, cat_v,
+                                                  txt_seq, total_seq, heads, head_dim, scale)) {
+            ok = 0;
+        }
     }
 
     iris_gpu_tensor_free(cat_k);
@@ -2964,9 +3127,16 @@ static int single_block_forward_bf16(iris_gpu_tensor_t hidden_gpu,
 
     /* === Phase 6: Self-attention (native bf16 fused SDPA) === */
     float attn_scale = 1.0f / sqrtf((float)head_dim);
-    if (!iris_gpu_attention_fused_bf16(attn_out_gpu, q_gpu, k_gpu, v_gpu,
-                                       seq, seq, heads, head_dim, attn_scale)) {
-        goto cleanup;
+    if (seq > ATTN_CHUNK_THRESHOLD) {
+        if (!attention_chunked_bf16(attn_out_gpu, q_gpu, k_gpu, v_gpu,
+                                     seq, seq, heads, head_dim, attn_scale)) {
+            goto cleanup;
+        }
+    } else {
+        if (!iris_gpu_attention_fused_bf16(attn_out_gpu, q_gpu, k_gpu, v_gpu,
+                                           seq, seq, heads, head_dim, attn_scale)) {
+            goto cleanup;
+        }
     }
 
     /* === Phase 7: SwiGLU (bf16) === */
@@ -3514,6 +3684,7 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
     float t_sincos[256];  /* sincos_dim is always 256 */
     get_timestep_embedding(t_sincos, timestep * 1000.0f, sincos_dim, 10000.0f);
     time_embed_forward(t_emb, t_sincos, &tf->time_embed, hidden, tf->t_emb_silu);
+    add_dev_conditioning(t_emb, tf);
 
     /* Get cached 2D RoPE frequencies for image tokens */
     float *img_rope_cos, *img_rope_sin;
@@ -4006,6 +4177,7 @@ float *iris_transformer_forward_refs_flux(iris_transformer_flux_t *tf,
     float t_sincos[256];
     get_timestep_embedding(t_sincos, timestep * 1000.0f, sincos_dim, 10000.0f);
     time_embed_forward(t_emb, t_sincos, &tf->time_embed, hidden, tf->t_emb_silu);
+    add_dev_conditioning(t_emb, tf);
 
     /* Get cached combined RoPE for img2img (target + reference) */
     float *combined_rope_cos, *combined_rope_sin;
@@ -4048,7 +4220,9 @@ float *iris_transformer_forward_refs_flux(iris_transformer_flux_t *tf,
             /* RoPE buffers are cached in transformer struct - don't free */
             return bf16_output;
         } else {
-            BF16_DEBUG("[BF16] bf16 pipeline failed for refs, falling back\n");
+            if (iris_verbose)
+                fprintf(stderr, "BF16 pipeline failed for img2img (seq=%d+%d), using BLAS fallback\n",
+                        combined_img_seq, txt_seq);
         }
     }
 #endif
@@ -4230,23 +4404,41 @@ float *iris_transformer_forward_multirefs_flux(iris_transformer_flux_t *tf,
     float t_sincos[256];
     get_timestep_embedding(t_sincos, timestep * 1000.0f, sincos_dim, 10000.0f);
     time_embed_forward(t_emb, t_sincos, &tf->time_embed, hidden, tf->t_emb_silu);
+    add_dev_conditioning(t_emb, tf);
 
-    /* Allocate combined RoPE arrays */
-    float *combined_rope_cos = (float *)malloc(combined_img_seq * axis_dim * 4 * sizeof(float));
-    float *combined_rope_sin = (float *)malloc(combined_img_seq * axis_dim * 4 * sizeof(float));
+    /* Get cached multiref combined RoPE arrays */
+    float *combined_rope_cos, *combined_rope_sin;
+    if (tf->cached_multiref_combined_seq == combined_img_seq &&
+        tf->cached_multiref_rope_cos && tf->cached_multiref_rope_sin) {
+        /* Cache hit - reuse from previous step */
+        combined_rope_cos = tf->cached_multiref_rope_cos;
+        combined_rope_sin = tf->cached_multiref_rope_sin;
+    } else {
+        /* Cache miss - compute and store */
+        size_t rope_size = (size_t)combined_img_seq * axis_dim * 4 * sizeof(float);
+        if (tf->cached_multiref_rope_cos) free(tf->cached_multiref_rope_cos);
+        if (tf->cached_multiref_rope_sin) free(tf->cached_multiref_rope_sin);
+        tf->cached_multiref_rope_cos = (float *)malloc(rope_size);
+        tf->cached_multiref_rope_sin = (float *)malloc(rope_size);
+        tf->cached_multiref_combined_seq = combined_img_seq;
 
-    /* Compute RoPE for target image (T=0) */
-    compute_rope_2d(combined_rope_cos, combined_rope_sin, img_h, img_w, axis_dim, tf->rope_theta);
+        /* Compute RoPE for target image (T=0) */
+        compute_rope_2d(tf->cached_multiref_rope_cos, tf->cached_multiref_rope_sin,
+                        img_h, img_w, axis_dim, tf->rope_theta);
 
-    /* Compute RoPE for each reference and append */
-    int rope_offset = img_seq * axis_dim * 4;
-    for (int r = 0; r < num_refs; r++) {
-        int ref_seq = refs[r].h * refs[r].w;
-        compute_rope_2d_with_t_offset(combined_rope_cos + rope_offset,
-                                      combined_rope_sin + rope_offset,
-                                      refs[r].h, refs[r].w,
-                                      axis_dim, tf->rope_theta, refs[r].t_offset);
-        rope_offset += ref_seq * axis_dim * 4;
+        /* Compute RoPE for each reference and append */
+        int rope_offset = img_seq * axis_dim * 4;
+        for (int r = 0; r < num_refs; r++) {
+            int ref_seq = refs[r].h * refs[r].w;
+            compute_rope_2d_with_t_offset(tf->cached_multiref_rope_cos + rope_offset,
+                                          tf->cached_multiref_rope_sin + rope_offset,
+                                          refs[r].h, refs[r].w,
+                                          axis_dim, tf->rope_theta, refs[r].t_offset);
+            rope_offset += ref_seq * axis_dim * 4;
+        }
+
+        combined_rope_cos = tf->cached_multiref_rope_cos;
+        combined_rope_sin = tf->cached_multiref_rope_sin;
     }
 
     /* Get cached text RoPE */
@@ -4287,9 +4479,7 @@ float *iris_transformer_forward_multirefs_flux(iris_transformer_flux_t *tf,
         if (bf16_output) {
             free(combined_transposed);
             free(t_emb);
-            free(combined_rope_cos);
-            free(combined_rope_sin);
-            /* txt_rope is cached - don't free */
+            /* combined_rope and txt_rope are cached - don't free */
             return bf16_output;
         } else {
             BF16_DEBUG("[BF16] bf16 pipeline failed for multi-refs, falling back\n");
@@ -4397,8 +4587,7 @@ float *iris_transformer_forward_multirefs_flux(iris_transformer_flux_t *tf,
     free(output_nlc);
 
     free(t_emb);
-    free(combined_rope_cos);
-    free(combined_rope_sin);
+    /* combined_rope_cos/sin are cached in tf->cached_multiref_rope_* */
     /* Text RoPE buffers are cached in the transformer and freed in iris_transformer_free_flux(). */
 
     if (iris_substep_callback)
@@ -4555,6 +4744,22 @@ error:
     return NULL;
 }
 
+/* Set FLUX.2-dev conditioning on transformer (pooled text embedding + guidance scale).
+ * Called from iris.c before sampling. Klein callers should not call this. */
+void iris_transformer_set_conditioning_flux(iris_transformer_flux_t *tf,
+                                             const float *pooled_emb, float guidance) {
+    if (!tf) return;
+    tf->pooled_emb = pooled_emb;
+    tf->guidance_val = guidance;
+}
+
+/* Clear FLUX.2-dev conditioning after sampling. */
+void iris_transformer_clear_conditioning_flux(iris_transformer_flux_t *tf) {
+    if (!tf) return;
+    tf->pooled_emb = NULL;
+    tf->guidance_val = 0.0f;
+}
+
 void iris_transformer_free_flux(iris_transformer_flux_t *tf) {
     if (!tf) return;
 
@@ -4571,6 +4776,10 @@ void iris_transformer_free_flux(iris_transformer_flux_t *tf) {
     free(tf->txt_in_weight_bf16);
     free(tf->time_embed.fc1_weight);
     free(tf->time_embed.fc2_weight);
+    free(tf->guidance_embed.fc1_weight);
+    free(tf->guidance_embed.fc2_weight);
+    free(tf->text_proj_embed.fc1_weight);
+    free(tf->text_proj_embed.fc2_weight);
 
     if (tf->double_blocks) {
         for (int i = 0; i < tf->num_double_layers; i++) {
@@ -4681,6 +4890,8 @@ void iris_transformer_free_flux(iris_transformer_flux_t *tf) {
     free(tf->cached_txt_rope_sin);
     free(tf->cached_combined_rope_cos);
     free(tf->cached_combined_rope_sin);
+    free(tf->cached_multiref_rope_cos);
+    free(tf->cached_multiref_rope_sin);
 
     /* Close safetensors files if in mmap mode */
     if (tf->use_mmap) {
@@ -4706,6 +4917,15 @@ static float *get_sf_tensor_tf(safetensors_file_t **files, int num_files, const 
     return NULL;
 }
 
+/* Silent variant for optional tensors (guidance/text embedder, naming fallbacks) */
+static float *get_sf_tensor_tf_opt(safetensors_file_t **files, int num_files, const char *name) {
+    for (int f = 0; f < num_files; f++) {
+        const safetensor_t *t = safetensors_find(files[f], name);
+        if (t) return safetensors_get_f32(files[f], t);
+    }
+    return NULL;
+}
+
 /* Get tensor as bf16 (for GPU acceleration) */
 static uint16_t *get_sf_tensor_bf16(safetensors_file_t **files, int num_files, const char *name) {
     for (int f = 0; f < num_files; f++) {
@@ -4719,11 +4939,9 @@ static uint16_t *get_sf_tensor_bf16(safetensors_file_t **files, int num_files, c
 }
 
 #ifdef USE_METAL
-/* Warm up bf16→f16 cache for all weight tensors.
- * This converts bf16 weights to f16 during model loading so it doesn't happen
- * during the first inference step. This shifts ~5s of warmup from first step
- * to model loading, resulting in consistent per-step timing.
- */
+/* Warm up weight GPU cache for all weight tensors.
+ * Uses BF16 cache on M3+ (native bf16 pipeline) or F16 cache on M1/M2.
+ * This shifts ~5s of warmup from first inference step to model loading. */
 static void warmup_bf16_weights(iris_transformer_flux_t *tf) {
     if (!tf->use_bf16) return;
     if (!iris_metal_available()) return;
@@ -4732,57 +4950,47 @@ static void warmup_bf16_weights(iris_transformer_flux_t *tf) {
     int mlp = tf->mlp_hidden;
     int text_dim = tf->text_dim;
     int latent_ch = tf->latent_channels;
+    int native_bf16 = iris_bf16_pipeline_available();
+
+    #define WARMUP(ptr, n) do { \
+        if (ptr) { \
+            if (native_bf16) iris_metal_warmup_bf16_buffer(ptr, n); \
+            else             iris_metal_warmup_bf16(ptr, n); \
+        } \
+    } while(0)
 
     /* Input projections */
-    if (tf->img_in_weight_bf16)
-        iris_metal_warmup_bf16(tf->img_in_weight_bf16, (size_t)h * latent_ch);
-    if (tf->txt_in_weight_bf16)
-        iris_metal_warmup_bf16(tf->txt_in_weight_bf16, (size_t)h * text_dim);
+    WARMUP(tf->img_in_weight_bf16, (size_t)h * latent_ch);
+    WARMUP(tf->txt_in_weight_bf16, (size_t)h * text_dim);
 
     /* Double blocks */
     for (int i = 0; i < tf->num_double_layers; i++) {
         double_block_t *b = &tf->double_blocks[i];
-        /* Image stream */
-        if (b->img_q_weight_bf16)
-            iris_metal_warmup_bf16(b->img_q_weight_bf16, (size_t)h * h);
-        if (b->img_k_weight_bf16)
-            iris_metal_warmup_bf16(b->img_k_weight_bf16, (size_t)h * h);
-        if (b->img_v_weight_bf16)
-            iris_metal_warmup_bf16(b->img_v_weight_bf16, (size_t)h * h);
-        if (b->img_proj_weight_bf16)
-            iris_metal_warmup_bf16(b->img_proj_weight_bf16, (size_t)h * h);
-        if (b->img_mlp_gate_weight_bf16)
-            iris_metal_warmup_bf16(b->img_mlp_gate_weight_bf16, (size_t)mlp * h);
-        if (b->img_mlp_up_weight_bf16)
-            iris_metal_warmup_bf16(b->img_mlp_up_weight_bf16, (size_t)mlp * h);
-        if (b->img_mlp_down_weight_bf16)
-            iris_metal_warmup_bf16(b->img_mlp_down_weight_bf16, (size_t)h * mlp);
-        /* Text stream */
-        if (b->txt_q_weight_bf16)
-            iris_metal_warmup_bf16(b->txt_q_weight_bf16, (size_t)h * h);
-        if (b->txt_k_weight_bf16)
-            iris_metal_warmup_bf16(b->txt_k_weight_bf16, (size_t)h * h);
-        if (b->txt_v_weight_bf16)
-            iris_metal_warmup_bf16(b->txt_v_weight_bf16, (size_t)h * h);
-        if (b->txt_proj_weight_bf16)
-            iris_metal_warmup_bf16(b->txt_proj_weight_bf16, (size_t)h * h);
-        if (b->txt_mlp_gate_weight_bf16)
-            iris_metal_warmup_bf16(b->txt_mlp_gate_weight_bf16, (size_t)mlp * h);
-        if (b->txt_mlp_up_weight_bf16)
-            iris_metal_warmup_bf16(b->txt_mlp_up_weight_bf16, (size_t)mlp * h);
-        if (b->txt_mlp_down_weight_bf16)
-            iris_metal_warmup_bf16(b->txt_mlp_down_weight_bf16, (size_t)h * mlp);
+        WARMUP(b->img_q_weight_bf16, (size_t)h * h);
+        WARMUP(b->img_k_weight_bf16, (size_t)h * h);
+        WARMUP(b->img_v_weight_bf16, (size_t)h * h);
+        WARMUP(b->img_proj_weight_bf16, (size_t)h * h);
+        WARMUP(b->img_mlp_gate_weight_bf16, (size_t)mlp * h);
+        WARMUP(b->img_mlp_up_weight_bf16, (size_t)mlp * h);
+        WARMUP(b->img_mlp_down_weight_bf16, (size_t)h * mlp);
+        WARMUP(b->txt_q_weight_bf16, (size_t)h * h);
+        WARMUP(b->txt_k_weight_bf16, (size_t)h * h);
+        WARMUP(b->txt_v_weight_bf16, (size_t)h * h);
+        WARMUP(b->txt_proj_weight_bf16, (size_t)h * h);
+        WARMUP(b->txt_mlp_gate_weight_bf16, (size_t)mlp * h);
+        WARMUP(b->txt_mlp_up_weight_bf16, (size_t)mlp * h);
+        WARMUP(b->txt_mlp_down_weight_bf16, (size_t)h * mlp);
     }
 
     /* Single blocks */
-    int fused_dim = h * 3 + mlp * 2;  /* Q, K, V, gate, up */
+    int fused_dim = h * 3 + mlp * 2;
     for (int i = 0; i < tf->num_single_layers; i++) {
         single_block_t *b = &tf->single_blocks[i];
-        if (b->qkv_mlp_weight_bf16)
-            iris_metal_warmup_bf16(b->qkv_mlp_weight_bf16, (size_t)fused_dim * h);
-        if (b->proj_mlp_weight_bf16)
-            iris_metal_warmup_bf16(b->proj_mlp_weight_bf16, (size_t)h * (h + mlp));
+        WARMUP(b->qkv_mlp_weight_bf16, (size_t)fused_dim * h);
+        WARMUP(b->proj_mlp_weight_bf16, (size_t)h * (h + mlp));
     }
+
+    #undef WARMUP
 
     /* Final projection */
     if (tf->final_proj_weight_bf16)
@@ -4844,12 +5052,40 @@ iris_transformer_flux_t *iris_transformer_load_safetensors_flux(const char *mode
         tf->txt_in_weight = get_sf_tensor_tf(files, num_files, "context_embedder.weight");
     }
 
-    /* Time embedding */
+    /* Time embedding — try FLUX.2-dev naming first, fall back to Klein */
     tf->time_embed.sincos_dim = 256;
-    tf->time_embed.fc1_weight = get_sf_tensor_tf(files, num_files,
-        "time_guidance_embed.timestep_embedder.linear_1.weight");
-    tf->time_embed.fc2_weight = get_sf_tensor_tf(files, num_files,
-        "time_guidance_embed.timestep_embedder.linear_2.weight");
+    tf->time_embed.fc1_weight = get_sf_tensor_tf_opt(files, num_files,
+        "time_text_embed.timestep_embedder.linear_1.weight");
+    if (!tf->time_embed.fc1_weight)
+        tf->time_embed.fc1_weight = get_sf_tensor_tf(files, num_files,
+            "time_guidance_embed.timestep_embedder.linear_1.weight");
+    tf->time_embed.fc2_weight = get_sf_tensor_tf_opt(files, num_files,
+        "time_text_embed.timestep_embedder.linear_2.weight");
+    if (!tf->time_embed.fc2_weight)
+        tf->time_embed.fc2_weight = get_sf_tensor_tf(files, num_files,
+            "time_guidance_embed.timestep_embedder.linear_2.weight");
+
+    /* FLUX.2-dev guidance embedder (embeds guidance scale as conditioning) */
+    tf->guidance_embed.sincos_dim = 256;
+    tf->guidance_embed.fc1_weight = get_sf_tensor_tf_opt(files, num_files,
+        "time_text_embed.guidance_embedder.linear_1.weight");
+    tf->guidance_embed.fc2_weight = get_sf_tensor_tf_opt(files, num_files,
+        "time_text_embed.guidance_embedder.linear_2.weight");
+    tf->has_guidance = (tf->guidance_embed.fc1_weight != NULL);
+
+    /* FLUX.2-dev text embedder (projects pooled text embedding) */
+    tf->text_proj_embed.sincos_dim = tf->pooled_dim > 0 ? tf->pooled_dim : 768;
+    tf->text_proj_embed.fc1_weight = get_sf_tensor_tf_opt(files, num_files,
+        "time_text_embed.text_embedder.linear_1.weight");
+    tf->text_proj_embed.fc2_weight = get_sf_tensor_tf_opt(files, num_files,
+        "time_text_embed.text_embedder.linear_2.weight");
+    tf->has_text_proj = (tf->text_proj_embed.fc1_weight != NULL);
+
+    if (tf->has_guidance || tf->has_text_proj) {
+        if (iris_verbose)
+            fprintf(stderr, "FLUX.2-dev mode: guidance_embed=%d text_proj=%d pooled_dim=%d\n",
+                    tf->has_guidance, tf->has_text_proj, tf->pooled_dim);
+    }
 
     /* Modulation weights - these are always needed in f32 for CPU modulation computation */
     tf->adaln_double_img_weight = get_sf_tensor_tf(files, num_files,
@@ -5095,12 +5331,40 @@ iris_transformer_flux_t *iris_transformer_load_safetensors_mmap_flux(const char 
         tf->txt_in_weight_bf16 = get_sf_tensor_bf16(files, num_files, "context_embedder.weight");
     }
 
-    /* Time embedding - always load (small) */
+    /* Time embedding — try FLUX.2-dev naming first, fall back to Klein */
     tf->time_embed.sincos_dim = 256;
-    tf->time_embed.fc1_weight = get_sf_tensor_tf(files, num_files,
-        "time_guidance_embed.timestep_embedder.linear_1.weight");
-    tf->time_embed.fc2_weight = get_sf_tensor_tf(files, num_files,
-        "time_guidance_embed.timestep_embedder.linear_2.weight");
+    tf->time_embed.fc1_weight = get_sf_tensor_tf_opt(files, num_files,
+        "time_text_embed.timestep_embedder.linear_1.weight");
+    if (!tf->time_embed.fc1_weight)
+        tf->time_embed.fc1_weight = get_sf_tensor_tf(files, num_files,
+            "time_guidance_embed.timestep_embedder.linear_1.weight");
+    tf->time_embed.fc2_weight = get_sf_tensor_tf_opt(files, num_files,
+        "time_text_embed.timestep_embedder.linear_2.weight");
+    if (!tf->time_embed.fc2_weight)
+        tf->time_embed.fc2_weight = get_sf_tensor_tf(files, num_files,
+            "time_guidance_embed.timestep_embedder.linear_2.weight");
+
+    /* FLUX.2-dev guidance embedder */
+    tf->guidance_embed.sincos_dim = 256;
+    tf->guidance_embed.fc1_weight = get_sf_tensor_tf_opt(files, num_files,
+        "time_text_embed.guidance_embedder.linear_1.weight");
+    tf->guidance_embed.fc2_weight = get_sf_tensor_tf_opt(files, num_files,
+        "time_text_embed.guidance_embedder.linear_2.weight");
+    tf->has_guidance = (tf->guidance_embed.fc1_weight != NULL);
+
+    /* FLUX.2-dev text embedder (pooled projection) */
+    tf->text_proj_embed.sincos_dim = tf->pooled_dim > 0 ? tf->pooled_dim : 768;
+    tf->text_proj_embed.fc1_weight = get_sf_tensor_tf_opt(files, num_files,
+        "time_text_embed.text_embedder.linear_1.weight");
+    tf->text_proj_embed.fc2_weight = get_sf_tensor_tf_opt(files, num_files,
+        "time_text_embed.text_embedder.linear_2.weight");
+    tf->has_text_proj = (tf->text_proj_embed.fc1_weight != NULL);
+
+    if (tf->has_guidance || tf->has_text_proj) {
+        if (iris_verbose)
+            fprintf(stderr, "FLUX.2-dev mode: guidance_embed=%d text_proj=%d pooled_dim=%d\n",
+                    tf->has_guidance, tf->has_text_proj, tf->pooled_dim);
+    }
 
     /* Modulation weights - always load */
     tf->adaln_double_img_weight = get_sf_tensor_tf(files, num_files,

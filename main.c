@@ -158,6 +158,17 @@ static void cli_step_image_callback(int step, int total, const iris_image *img) 
     terminal_display_image(img, cli_graphics_proto);
 }
 
+/* Step image callback - save to files for external consumers (e.g. Fluxer) */
+static char cli_step_dir[4096] = {0};
+
+static void cli_step_file_callback(int step, int total, const iris_image *img) {
+    (void)total;
+    char path[4160];
+    snprintf(path, sizeof(path), "%s/step_%d.png", cli_step_dir, step);
+    iris_image_save(img, path);
+    fprintf(stderr, "[Preview] %s\n", path);
+}
+
 static void cli_setup_progress(void) {
     cli_current_step = 0;
     cli_legend_printed = 0;
@@ -228,6 +239,7 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  -s, --steps N         Sampling steps (default: auto, 4 distilled / 50 base / 9 zimage)\n");
     fprintf(stderr, "  -g, --guidance N      CFG guidance scale (default: auto, 1.0 distilled / 4.0 base / 0.0 zimage)\n");
     fprintf(stderr, "  -S, --seed N          Random seed (-1 for random)\n");
+    fprintf(stderr, "  -N, --batch N         Generate N images with different seeds (default: 1)\n");
     fprintf(stderr, "      --linear          Use linear timestep schedule\n");
     fprintf(stderr, "      --power           Use power curve timestep schedule (default alpha: 2.0)\n");
     fprintf(stderr, "      --power-alpha N   Set power schedule exponent (default: 2.0)\n");
@@ -243,6 +255,7 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  -v, --verbose         Detailed output\n");
     fprintf(stderr, "      --show            Display image in terminal (auto-detects Kitty/Ghostty/iTerm2/WezTerm/Konsole)\n");
     fprintf(stderr, "      --show-steps      Display each denoising step (slower)\n");
+    fprintf(stderr, "      --step-dir PATH   Save step images as PNGs to directory\n");
     fprintf(stderr, "      --zoom N          Terminal image zoom factor (default: 2 for Retina)\n\n");
     fprintf(stderr, "Other options:\n");
     fprintf(stderr, "  -e, --embeddings PATH Load pre-computed text embeddings\n");
@@ -297,6 +310,8 @@ int main(int argc, char *argv[]) {
         {"debug-py",   no_argument,       0, 'D'},
         {"no-license-info", no_argument, 0, 258},
         {"blas-threads",required_argument, 0, 259},
+        {"batch",      required_argument, 0, 'N'},
+        {"step-dir",   required_argument, 0, 262},
         {0, 0, 0, 0}
     };
 
@@ -326,10 +341,12 @@ int main(int argc, char *argv[]) {
     int force_base = 0;
     int no_license_info = 0;
     int blas_threads = 0; (void)blas_threads;
+    int batch_count = 1;
+    char *step_dir = NULL;
     term_graphics_proto graphics_proto = detect_terminal_graphics();
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "d:p:o:W:H:s:g:S:i:t:e:n:qvhVmMD",
+    while ((opt = getopt_long(argc, argv, "d:p:o:W:H:s:g:S:i:t:e:n:N:qvhVmMD",
                               long_options, NULL)) != -1) {
         switch (opt) {
             case 'd': model_dir = optarg; break;
@@ -369,6 +386,8 @@ int main(int argc, char *argv[]) {
             case 258: no_license_info = 1; break;
             case 'D': debug_py = 1; break;
             case 259: blas_threads = atoi(optarg); break;
+            case 'N': batch_count = atoi(optarg); break;
+            case 262: step_dir = optarg; break;
             default:
                 print_usage(argv[0]);
                 return 1;
@@ -447,6 +466,10 @@ int main(int argc, char *argv[]) {
     }
     if (steps_set && (params.num_steps < 1 || params.num_steps > IRIS_MAX_STEPS)) {
         fprintf(stderr, "Error: Steps must be between 1 and %d\n", IRIS_MAX_STEPS);
+        return 1;
+    }
+    if (batch_count < 1 || batch_count > 64) {
+        fprintf(stderr, "Error: Batch count must be between 1 and 64\n");
         return 1;
     }
 
@@ -540,7 +563,10 @@ int main(int argc, char *argv[]) {
     }
 
     /* Set up step image callback if requested */
-    if (show_steps) {
+    if (step_dir) {
+        strncpy(cli_step_dir, step_dir, sizeof(cli_step_dir) - 1);
+        iris_set_step_image_callback(ctx, cli_step_file_callback);
+    } else if (show_steps) {
         if (graphics_proto == TERM_PROTO_NONE) {
             fprintf(stderr, "Warning: --show-steps requires a supported terminal (Kitty, Ghostty, iTerm2, WezTerm, or Konsole)\n");
         } else {
@@ -668,6 +694,105 @@ int main(int argc, char *argv[]) {
         }
         free(text_emb);
 
+    } else if (batch_count > 1) {
+        /* ============== Batch text-to-image mode ============== */
+        /* Encode text once, then generate N images with different seeds */
+        LOG_NORMAL("Batch: generating %d images\n", batch_count);
+
+        /* Encode text once */
+        int text_seq = 0;
+        float *text_emb = iris_encode_text(ctx, prompt, &text_seq);
+        if (!text_emb) {
+            fprintf(stderr, "Error: Text encoding failed: %s\n", iris_get_error());
+            cli_finish_progress();
+            iris_free(ctx);
+            return 1;
+        }
+
+        /* Release text encoder to free memory for transformer */
+        iris_release_text_encoder(ctx);
+
+        /* Split output path into base and extension */
+        char out_base[4096], out_ext[64];
+        const char *dot = strrchr(output_path, '.');
+        if (dot) {
+            size_t base_len = dot - output_path;
+            if (base_len >= sizeof(out_base)) base_len = sizeof(out_base) - 1;
+            memcpy(out_base, output_path, base_len);
+            out_base[base_len] = '\0';
+            strncpy(out_ext, dot, sizeof(out_ext) - 1);
+            out_ext[sizeof(out_ext) - 1] = '\0';
+        } else {
+            strncpy(out_base, output_path, sizeof(out_base) - 1);
+            out_base[sizeof(out_base) - 1] = '\0';
+            strcpy(out_ext, ".png");
+        }
+
+        int batch_failed = 0;
+        for (int bi = 0; bi < batch_count; bi++) {
+            int64_t img_seed = actual_seed + bi;
+            params.seed = img_seed;
+            iris_set_seed(img_seed);
+
+            LOG_NORMAL("\n[Image %d/%d] seed: %lld\n", bi + 1, batch_count, (long long)img_seed);
+            cli_legend_printed = 0;
+            cli_current_step = 0;
+
+            output = iris_generate_with_embeddings(ctx, text_emb, text_seq, &params);
+
+            cli_finish_progress();
+            if (output_level >= OUTPUT_NORMAL) {
+                cli_setup_progress();
+            }
+
+            if (!output) {
+                fprintf(stderr, "Error: Generation %d/%d failed: %s\n",
+                        bi + 1, batch_count, iris_get_error());
+                batch_failed++;
+                continue;
+            }
+
+            /* Build numbered output path */
+            char numbered_path[4160];
+            snprintf(numbered_path, sizeof(numbered_path), "%s_%d%s", out_base, bi + 1, out_ext);
+
+            if (iris_image_save_with_seed(output, numbered_path, img_seed) != 0) {
+                fprintf(stderr, "Error: Failed to save image: %s\n", numbered_path);
+                batch_failed++;
+            } else {
+                LOG_NORMAL("Saved %s %dx%d (seed: %lld)\n",
+                           numbered_path, output->width, output->height, (long long)img_seed);
+            }
+
+            if (show_image) {
+                terminal_display_png(numbered_path, graphics_proto);
+            }
+
+            iris_image_free(output);
+            output = NULL;
+        }
+
+        free(text_emb);
+        cli_finish_progress();
+
+        if (show_steps || step_dir) {
+            iris_set_step_image_callback(ctx, NULL);
+        }
+
+        struct timeval final_tv;
+        gettimeofday(&final_tv, NULL);
+        double total_time_final = (final_tv.tv_sec - total_start_tv.tv_sec) +
+                                  (final_tv.tv_usec - total_start_tv.tv_usec) / 1000000.0;
+        LOG_NORMAL("\nBatch complete: %d/%d images (%.1f seconds)\n",
+                   batch_count - batch_failed, batch_count, load_time + total_time_final);
+
+        iris_free(ctx);
+
+#ifdef USE_METAL
+        iris_metal_cleanup();
+#endif
+        return batch_failed > 0 ? 1 : 0;
+
     } else {
         /* ============== Text-to-image mode ============== */
         /* Note: iris_generate handles text encoding internally.
@@ -680,7 +805,7 @@ int main(int argc, char *argv[]) {
     cli_finish_progress();
 
     /* Clear step image callback if it was set */
-    if (show_steps) {
+    if (show_steps || step_dir) {
         iris_set_step_image_callback(ctx, NULL);
     }
 

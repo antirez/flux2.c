@@ -9,6 +9,7 @@
 #include "iris_kernels.h"
 #include "iris_safetensors.h"
 #include "iris_qwen3.h"
+#include "iris_mistral.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -54,6 +55,9 @@ extern float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
                                         const float *img_latent, int img_h, int img_w,
                                         const float *txt_emb, int txt_seq,
                                         float timestep);
+extern void iris_transformer_set_conditioning_flux(iris_transformer_flux_t *tf,
+                                                    const float *pooled_emb, float guidance);
+extern void iris_transformer_clear_conditioning_flux(iris_transformer_flux_t *tf);
 
 extern float *iris_sample_euler_flux(void *transformer, void *text_encoder,
                                 float *z, int batch, int channels, int h, int w,
@@ -166,6 +170,7 @@ struct iris_ctx {
     /* Components */
     iris_tokenizer *tokenizer;
     qwen3_encoder_t *qwen3_encoder;
+    mistral_encoder_t *mistral_encoder;  /* FLUX.2-dev text encoder */
     iris_vae_t *vae;
     iris_transformer_flux_t *transformer;
     zi_transformer_t *zi_transformer;
@@ -176,10 +181,12 @@ struct iris_ctx {
     int default_steps;
     float default_guidance;
     int is_distilled;  /* 1 = distilled (4-step), 0 = base (50-step CFG) */
+    int is_flux2_dev;  /* 1 = FLUX.2-dev (Mistral encoder, guidance-distilled) */
     int text_dim;      /* Text embedding dimension (7680 for 4B, varies for 9B) */
     int is_non_commercial; /* 1 if model has non-commercial license (9B) */
     int num_heads;     /* Transformer attention heads (24 for 4B, 32 for 9B) */
     int is_zimage;     /* 1 = Z-Image S3-DiT, 0 = Flux MMDiT */
+    float *pooled_emb_cache;  /* Cached pooled embedding from Mistral [hidden_size] */
 
     /* Z-Image specific config (from transformer/config.json) */
     int zi_dim;            /* Hidden dim (3840) */
@@ -299,6 +306,18 @@ iris_ctx *iris_load_dir(const char *model_dir) {
                 if ((p = strchr(p, ':'))) joint_dim = atoi(p + 1);
             }
             if (joint_dim > 0) ctx->text_dim = joint_dim;
+
+            /* FLUX.2-dev detection: guidance_embeds=true in transformer config */
+            if ((p = strstr(buf, "\"guidance_embeds\""))) {
+                char *colon = strchr(p, ':');
+                if (colon) {
+                    char *val = colon + 1;
+                    while (*val == ' ' || *val == '\t') val++;
+                    if (strncmp(val, "true", 4) == 0) {
+                        ctx->is_flux2_dev = 1;
+                    }
+                }
+            }
 
             /* Z-Image autodetection: look for Z-Image-specific fields */
             if ((p = strstr(buf, "\"cap_feat_dim\""))) {
@@ -429,6 +448,14 @@ iris_ctx *iris_load_dir(const char *model_dir) {
         ctx->is_distilled = 1;        /* Treat as distilled (no CFG) */
         snprintf(ctx->model_name, sizeof(ctx->model_name),
                  "Z-Image-Turbo-%s", size_label);
+    } else if (ctx->is_flux2_dev) {
+        /* FLUX.2-dev: 32B transformer, Mistral-Small-3.2-24B text encoder */
+        ctx->num_heads = num_heads;
+        ctx->is_non_commercial = 0;
+        ctx->is_distilled = 0;  /* Not distilled, but uses guidance embedding (not CFG) */
+        ctx->default_steps = 30;
+        ctx->default_guidance = 3.5f;
+        snprintf(ctx->model_name, sizeof(ctx->model_name), "FLUX.2-dev");
     } else {
         int hidden_size = num_heads * 128;  /* head_dim is always 128 */
         const char *size_label = (hidden_size > 3072) ? "9B" : "4B";
@@ -492,9 +519,11 @@ void iris_free(iris_ctx *ctx) {
 
     iris_tokenizer_free(ctx->tokenizer);
     qwen3_encoder_free(ctx->qwen3_encoder);
+    mistral_encoder_free(ctx->mistral_encoder);
     iris_vae_free(ctx->vae);
     iris_transformer_free_flux(ctx->transformer);
     iris_transformer_free_zimage(ctx->zi_transformer);
+    free(ctx->pooled_emb_cache);
 
     free(ctx);
 }
@@ -521,16 +550,27 @@ void iris_set_base_mode(iris_ctx *ctx) {
              "FLUX.2-klein-base-%s", size_label);
 }
 
-/* Free the Qwen3 text encoder (~4-8GB) to make room for the transformer.
+/* Free the text encoder (~4-48GB) to make room for the transformer.
  * The encoder and transformer can't coexist in memory on most machines,
  * so this is called after text encoding and before denoising. On Metal,
  * also resets all GPU state (weight caches, pools) to avoid stale data
  * when the transformer loads into the same memory regions. */
 void iris_release_text_encoder(iris_ctx *ctx) {
-    if (!ctx || !ctx->qwen3_encoder) return;
+    if (!ctx) return;
 
-    qwen3_encoder_free(ctx->qwen3_encoder);
-    ctx->qwen3_encoder = NULL;
+    int released = 0;
+    if (ctx->qwen3_encoder) {
+        qwen3_encoder_free(ctx->qwen3_encoder);
+        ctx->qwen3_encoder = NULL;
+        released = 1;
+    }
+    if (ctx->mistral_encoder) {
+        mistral_encoder_free(ctx->mistral_encoder);
+        ctx->mistral_encoder = NULL;
+        released = 1;
+    }
+
+    if (!released) return;
 
 #ifdef USE_METAL
     /* Reset all GPU state to ensure clean slate for transformer.
@@ -591,18 +631,51 @@ void *iris_get_transformer(iris_ctx *ctx) {
  * Text Encoding
  * ======================================================================== */
 
-/* Run the prompt through Qwen3 to produce text embeddings. For Flux models,
- * hidden states from layers 8, 17, 26 are concatenated to form [512, text_dim].
- * For Z-Image, takes hidden_states[-2] and reports the real (unpadded) token
- * count via out_seq_len. The returned embedding buffer is still max-seq padded;
- * Z-Image consumes only the first out_seq_len tokens. */
+/* Run the prompt through the text encoder to produce embeddings.
+ * FLUX.2-dev uses Mistral-Small-3.2-24B (layers 10/20/30 → [512, 15360] + pooled).
+ * FLUX.2-klein uses Qwen3 (layers 8/17/26 → [512, 7680]).
+ * Z-Image uses Qwen3 hidden_states[-2] with real token count. */
 float *iris_encode_text(iris_ctx *ctx, const char *prompt, int *out_seq_len) {
     if (!ctx || !prompt) {
         *out_seq_len = 0;
         return NULL;
     }
 
-    /* Load encoder if not already loaded */
+    /* FLUX.2-dev: use Mistral encoder */
+    if (ctx->is_flux2_dev) {
+        if (!ctx->mistral_encoder && ctx->model_dir[0]) {
+            if (iris_phase_callback) iris_phase_callback("Loading Mistral encoder", 0);
+            ctx->mistral_encoder = mistral_encoder_load(ctx->model_dir);
+            if (iris_phase_callback) iris_phase_callback("Loading Mistral encoder", 1);
+            if (!ctx->mistral_encoder) {
+                fprintf(stderr, "Warning: Failed to load Mistral text encoder\n");
+            }
+        }
+        if (!ctx->mistral_encoder) {
+            *out_seq_len = MISTRAL_MAX_SEQ_LEN;
+            return (float *)calloc(MISTRAL_MAX_SEQ_LEN * ctx->text_dim, sizeof(float));
+        }
+
+        if (iris_phase_callback) iris_phase_callback("encoding text", 0);
+        int num_tokens = 0;
+        float *embeddings = mistral_encode_text(ctx->mistral_encoder, prompt, &num_tokens);
+        if (iris_phase_callback) iris_phase_callback("encoding text", 1);
+
+        /* Cache pooled embedding for transformer conditioning */
+        const float *pooled = mistral_get_pooled(ctx->mistral_encoder->model);
+        if (pooled) {
+            /* Pooled is the raw hidden_size vector from last real token */
+            int hidden_size = 5120;  /* Mistral hidden_size, TODO: get from model */
+            free(ctx->pooled_emb_cache);
+            ctx->pooled_emb_cache = (float *)malloc(hidden_size * sizeof(float));
+            memcpy(ctx->pooled_emb_cache, pooled, hidden_size * sizeof(float));
+        }
+
+        *out_seq_len = MISTRAL_MAX_SEQ_LEN;
+        return embeddings;
+    }
+
+    /* Klein / Z-Image: use Qwen3 encoder */
     if (!ctx->qwen3_encoder && ctx->model_dir[0]) {
         if (iris_phase_callback) iris_phase_callback("Loading Qwen3 encoder", 0);
         ctx->qwen3_encoder = qwen3_encoder_load(ctx->model_dir, ctx->use_mmap);
@@ -614,12 +687,10 @@ float *iris_encode_text(iris_ctx *ctx, const char *prompt, int *out_seq_len) {
 
     if (!ctx->qwen3_encoder) {
         if (ctx->is_zimage) {
-            /* Z-Image requires a real (unpadded) token sequence length. */
             *out_seq_len = 0;
             set_error("Qwen3 text encoder unavailable for Z-Image");
             return NULL;
         }
-        /* Flux fallback: return zero padded embeddings. */
         *out_seq_len = QWEN3_MAX_SEQ_LEN;
         return (float *)calloc(QWEN3_MAX_SEQ_LEN * ctx->text_dim, sizeof(float));
     }
@@ -627,19 +698,15 @@ float *iris_encode_text(iris_ctx *ctx, const char *prompt, int *out_seq_len) {
     /* Set extraction mode: Z-Image uses single layer, Flux uses 3-layer concat */
     qwen3_set_extraction_mode(ctx->qwen3_encoder, ctx->is_zimage ? 1 : 0);
 
-    /* Encode text using Qwen3 */
     if (iris_phase_callback) iris_phase_callback("encoding text", 0);
-
     int num_real_tokens = 0;
     float *embeddings = qwen3_encode_text_ex(ctx->qwen3_encoder, prompt,
                                                &num_real_tokens);
     if (iris_phase_callback) iris_phase_callback("encoding text", 1);
 
     if (ctx->is_zimage) {
-        /* Z-Image: use only real tokens from the padded embedding buffer. */
         *out_seq_len = num_real_tokens;
     } else {
-        /* Flux: return full padded sequence (512) */
         *out_seq_len = QWEN3_MAX_SEQ_LEN;
     }
     return embeddings;
@@ -823,7 +890,9 @@ iris_image *iris_generate(iris_ctx *ctx, const char *prompt,
 
     float *text_emb_uncond = NULL;
     int text_seq_uncond = 0;
-    if (!ctx->is_distilled) {
+    if (!ctx->is_distilled && !ctx->is_flux2_dev) {
+        /* Only Klein base model uses true CFG (two forward passes).
+         * FLUX.2-dev uses guidance-distilled (single pass with embedded guidance). */
         text_emb_uncond = iris_encode_text(ctx, "", &text_seq_uncond);
         if (!text_emb_uncond) {
             free(text_emb);
@@ -832,7 +901,7 @@ iris_image *iris_generate(iris_ctx *ctx, const char *prompt,
         }
     }
 
-    /* Release text encoder to free ~8GB before loading transformer */
+    /* Release text encoder to free memory before loading transformer */
     iris_release_text_encoder(ctx);
 
     /* Load transformer now (after text encoder is freed to reduce peak memory) */
@@ -840,6 +909,12 @@ iris_image *iris_generate(iris_ctx *ctx, const char *prompt,
         free(text_emb);
         free(text_emb_uncond);
         return NULL;
+    }
+
+    /* FLUX.2-dev: set pooled embedding and guidance on transformer */
+    if (ctx->is_flux2_dev) {
+        iris_transformer_set_conditioning_flux(ctx->transformer,
+                                                ctx->pooled_emb_cache, guidance);
     }
 
     /* Compute latent dimensions */
@@ -856,15 +931,18 @@ iris_image *iris_generate(iris_ctx *ctx, const char *prompt,
 
     /* Sample */
     float *latent;
-    if (ctx->is_distilled) {
+    if (ctx->is_distilled || ctx->is_flux2_dev) {
+        /* Distilled Klein: 4 Euler steps, no CFG.
+         * FLUX.2-dev: 30 Euler steps, guidance-distilled (embedded in transformer). */
         latent = iris_sample_euler_flux(
-            ctx->transformer, ctx->qwen3_encoder,
+            ctx->transformer, NULL,
             z, 1, IRIS_LATENT_CHANNELS, latent_h, latent_w,
             text_emb, text_seq,
             schedule, p.num_steps,
             NULL
         );
     } else {
+        /* Klein base model: CFG with two forward passes per step */
         latent = iris_sample_euler_cfg_flux(
             ctx->transformer, ctx->qwen3_encoder,
             z, 1, IRIS_LATENT_CHANNELS, latent_h, latent_w,
@@ -876,10 +954,15 @@ iris_image *iris_generate(iris_ctx *ctx, const char *prompt,
         );
     }
 
+    /* Clear transformer conditioning */
+    iris_transformer_clear_conditioning_flux(ctx->transformer);
+
     free(z);
     free(schedule);
     free(text_emb);
     free(text_emb_uncond);
+    free(ctx->pooled_emb_cache);
+    ctx->pooled_emb_cache = NULL;
 
     if (!latent) {
         set_error("Sampling failed");
@@ -1103,9 +1186,14 @@ iris_image *iris_generate_with_embeddings_and_noise(iris_ctx *ctx,
 /* 4 GB — MPSTemporaryNDArray hard limit. */
 #define ATTENTION_MAX_BYTES ((size_t)4ULL << 30)
 
+/* Chunked attention parameters (must match iris_transformer_flux.c) */
+#define ATTN_CHUNK_SIZE       1024
+#define ATTN_CHUNK_THRESHOLD  4096
+
 /* Compute worst-case attention matrix size in bytes.
  * All image dimensions are in pixels (multiples of 16).
- * ref_dims is [h0, w0, h1, w1, ...] in pixels. */
+ * ref_dims is [h0, w0, h1, w1, ...] in pixels.
+ * With chunked attention, score matrix is [heads, min(chunk, total_seq), total_seq]. */
 static size_t attention_bytes(int num_heads,
                               int out_h, int out_w,
                               const int *ref_dims, int num_refs,
@@ -1115,7 +1203,8 @@ static size_t attention_bytes(int num_heads,
     for (int i = 0; i < num_refs; i++)
         total_seq += (size_t)(ref_dims[i*2] / 16) * (ref_dims[i*2+1] / 16);
     total_seq += txt_seq;
-    return (size_t)num_heads * total_seq * total_seq * sizeof(float);
+    size_t score_q = (total_seq > ATTN_CHUNK_THRESHOLD) ? ATTN_CHUNK_SIZE : total_seq;
+    return (size_t)num_heads * score_q * total_seq * sizeof(float);
 }
 
 /* Shrink reference pixel dimensions so attention fits under 4 GB.
@@ -1248,7 +1337,7 @@ iris_image *iris_img2img(iris_ctx *ctx, const char *prompt,
 
     float *text_emb_uncond = NULL;
     int text_seq_uncond = 0;
-    if (!ctx->is_distilled) {
+    if (!ctx->is_distilled && !ctx->is_flux2_dev) {
         text_emb_uncond = iris_encode_text(ctx, "", &text_seq_uncond);
         if (!text_emb_uncond) {
             free(text_emb);
@@ -1258,7 +1347,7 @@ iris_image *iris_img2img(iris_ctx *ctx, const char *prompt,
         }
     }
 
-    /* Release text encoder to free ~8GB before loading transformer */
+    /* Release text encoder to free memory before loading transformer */
     iris_release_text_encoder(ctx);
 
     /* Load transformer now (after text encoder is freed to reduce peak memory) */
@@ -1267,6 +1356,12 @@ iris_image *iris_img2img(iris_ctx *ctx, const char *prompt,
         free(text_emb_uncond);
         if (resized) iris_image_free(resized);
         return NULL;
+    }
+
+    /* FLUX.2-dev: set pooled embedding and guidance on transformer */
+    if (ctx->is_flux2_dev) {
+        iris_transformer_set_conditioning_flux(ctx->transformer,
+                                                ctx->pooled_emb_cache, guidance);
     }
 
     /* Encode image to latent */
@@ -1325,9 +1420,9 @@ iris_image *iris_img2img(iris_ctx *ctx, const char *prompt,
 
     /* Sample using in-context conditioning */
     float *latent;
-    if (ctx->is_distilled) {
+    if (ctx->is_distilled || ctx->is_flux2_dev) {
         latent = iris_sample_euler_refs_flux(
-            ctx->transformer, ctx->qwen3_encoder,
+            ctx->transformer, NULL,
             z, 1, IRIS_LATENT_CHANNELS, out_lat_h, out_lat_w,
             img_latent, latent_h, latent_w,
             t_offset,
@@ -1349,11 +1444,16 @@ iris_image *iris_img2img(iris_ctx *ctx, const char *prompt,
         );
     }
 
+    /* Clear transformer conditioning */
+    iris_transformer_clear_conditioning_flux(ctx->transformer);
+
     free(z);
     free(img_latent);
     free(schedule);
     free(text_emb);
     free(text_emb_uncond);
+    free(ctx->pooled_emb_cache);
+    ctx->pooled_emb_cache = NULL;
 
     if (!latent) {
         set_error("Sampling failed");
@@ -1439,7 +1539,7 @@ iris_image *iris_multiref(iris_ctx *ctx, const char *prompt,
 
     float *text_emb_uncond = NULL;
     int text_seq_uncond = 0;
-    if (!ctx->is_distilled) {
+    if (!ctx->is_distilled && !ctx->is_flux2_dev) {
         text_emb_uncond = iris_encode_text(ctx, "", &text_seq_uncond);
         if (!text_emb_uncond) {
             free(text_emb);
@@ -1454,6 +1554,12 @@ iris_image *iris_multiref(iris_ctx *ctx, const char *prompt,
         free(text_emb);
         free(text_emb_uncond);
         return NULL;
+    }
+
+    /* FLUX.2-dev: set pooled embedding and guidance on transformer */
+    if (ctx->is_flux2_dev) {
+        iris_transformer_set_conditioning_flux(ctx->transformer,
+                                                ctx->pooled_emb_cache, guidance);
     }
 
     /* Build reference pixel dimensions, clamped and rounded to 16. */
@@ -1556,9 +1662,9 @@ iris_image *iris_multiref(iris_ctx *ctx, const char *prompt,
 
     /* Sample with multi-reference conditioning */
     float *latent;
-    if (ctx->is_distilled) {
+    if (ctx->is_distilled || ctx->is_flux2_dev) {
         latent = iris_sample_euler_multirefs_flux(
-            ctx->transformer, ctx->qwen3_encoder,
+            ctx->transformer, NULL,
             z, 1, IRIS_LATENT_CHANNELS, latent_h, latent_w,
             ref_latents, num_refs,
             text_emb, text_seq,
@@ -1578,6 +1684,9 @@ iris_image *iris_multiref(iris_ctx *ctx, const char *prompt,
         );
     }
 
+    /* Clear transformer conditioning */
+    iris_transformer_clear_conditioning_flux(ctx->transformer);
+
     /* Cleanup */
     free(z);
     for (int i = 0; i < num_refs; i++) {
@@ -1588,6 +1697,8 @@ iris_image *iris_multiref(iris_ctx *ctx, const char *prompt,
     free(schedule);
     free(text_emb);
     free(text_emb_uncond);
+    free(ctx->pooled_emb_cache);
+    ctx->pooled_emb_cache = NULL;
 
     if (!latent) {
         set_error("Sampling failed");

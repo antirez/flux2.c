@@ -11,6 +11,8 @@ Supported model families:
   - **4B base** (50 steps for max quality, or less. Classifier-Free Diffusion Guidance, much slower but more generation variety).
   - **9B distilled** (4 steps, larger model, higher quality. Non-commercial license).
   - **9B base** (50 steps, CFG, highest quality. Non-commercial license).
+- **[FLUX.2-dev](https://bfl.ai/models/flux-2-dev)** (by [Black Forest Labs](https://bfl.ai/)):
+  - **32B** (30 steps, guidance-distilled with embedded guidance scale. Uses Mistral-Small-3.2-24B text encoder instead of Qwen3. Non-commercial license).
 - **[Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo)** (by Tongyi-MAI):
   - **6B** (8 NFE / 9 scheduler steps, no CFG, fast).
 
@@ -46,6 +48,15 @@ If you want to try the 9B model (higher quality, non-commercial license, ~30GB d
 # or: python download_model.py 9b --token YOUR_TOKEN
 # or: set HF_TOKEN env var
 ./iris -d flux-klein-9b -p "A woman wearing sunglasses" -o output.png
+```
+
+For FLUX.2-dev (32B transformer, highest quality, requires ~80GB+ RAM):
+```bash
+# FLUX.2-dev is a gated model - you need a HuggingFace token
+# 1. Accept the license at https://huggingface.co/black-forest-labs/FLUX.2-dev
+# 2. Get your token from https://huggingface.co/settings/tokens
+./download_model.sh flux-2-dev --token YOUR_TOKEN
+./iris -d flux-2-dev -p "A woman wearing sunglasses" -o output.png
 ```
 
 For Z-Image-Turbo:
@@ -350,6 +361,13 @@ Download model weights from HuggingFace using one of these methods:
 # You can also set the HF_TOKEN environment variable
 ```
 
+**FLUX.2-dev** (~65GB, gated model):
+```bash
+# Requires HuggingFace authentication (see 9B instructions above)
+./download_model.sh flux-2-dev --token YOUR_TOKEN
+# or: python download_model.py flux-2-dev --token YOUR_TOKEN
+```
+
 **Z-Image-Turbo** (~12GB):
 ```bash
 pip install huggingface_hub && python download_model.py zimage-turbo
@@ -361,6 +379,7 @@ pip install huggingface_hub && python download_model.py zimage-turbo
 | 4B base | `./flux-klein-4b-base` | ~16GB | VAE (~300MB), Transformer (~4GB), Qwen3-4B (~8GB) |
 | 9B distilled | `./flux-klein-9b` | ~30GB | VAE (~300MB), Transformer (~17GB), Qwen3-8B (~15GB) |
 | 9B base | `./flux-klein-9b-base` | ~30GB | VAE (~300MB), Transformer (~17GB), Qwen3-8B (~15GB) |
+| FLUX.2-dev | `./flux-2-dev` | ~65GB | VAE (~300MB), Transformer (~32GB), Mistral-Small-3.2-24B (~30GB) |
 | Z-Image-Turbo | `./zimage-turbo` | ~12GB | VAE, Transformer (~6B), Qwen3-4B |
 
 ## How Fast Is It?
@@ -434,6 +453,24 @@ The model type (distilled vs base, 4B vs 9B) is autodetected from the model dire
 
 **Classifier-Free Guidance (CFG)**: The base model runs the transformer twice per step -- once with an empty prompt (unconditioned) and once with the real prompt (conditioned). The final velocity is `v = v_uncond + guidance * (v_cond - v_uncond)`. This makes each step ~2x slower than the distilled model, and the base model needs ~12x more steps, making it roughly 25x slower overall.
 
+### FLUX.2-dev
+
+FLUX.2-dev is a much larger model (32B parameters) that uses a different text encoder and guidance mechanism:
+
+| Component | FLUX.2-dev |
+|-----------|-----------|
+| Transformer hidden | 3072 |
+| Attention heads | 24 |
+| Head dim | 128 |
+| Double blocks | 19 |
+| Single blocks | 38 |
+| Text Encoder | Mistral-Small-3.2-24B (layers 10/20/30 → 15360 hidden, + pooled embedding) |
+| VAE | Same as Klein (128 latent channels, 8x spatial compression) |
+
+Unlike Klein, FLUX.2-dev does not use Classifier-Free Guidance. Instead, it embeds the guidance scale directly into the transformer via a guidance embedding (guidance-distilled). Default guidance is 3.5 and default steps is 30.
+
+The model type is auto-detected from the transformer config (`guidance_embeds: true`).
+
 ### Z-Image-Turbo
 
 Z-Image-Turbo uses an S3-DiT single-stream architecture with noise and context refiners:
@@ -474,6 +511,21 @@ The shifted sigmoid can look extremely unbalanced at low step counts -- for exam
 
 # Power schedule with custom exponent
 ./iris -d flux-klein-4b-base -p "a cat" -o cat.png -s 10 --power-alpha 1.5
+```
+
+### FLUX.2-dev
+
+FLUX.2-dev uses the same shifted sigmoid schedule as the Klein models. Default is 30 steps with guidance scale 3.5. Since FLUX.2-dev is guidance-distilled (no CFG), it runs only one forward pass per step despite using 30 steps. The `--linear` and `--power` schedules can be used for experimentation.
+
+```bash
+# Default (30 steps, guidance 3.5)
+./iris -d flux-2-dev -p "a cat" -o cat.png
+
+# Fewer steps for faster preview
+./iris -d flux-2-dev -p "a cat" -o cat.png -s 15
+
+# Custom guidance scale
+./iris -d flux-2-dev -p "a cat" -o cat.png -g 5.0
 ```
 
 ### Z-Image-Turbo
@@ -547,6 +599,26 @@ With `--no-mmap` (all weights in RAM):
 | Text encoding | ~15GB (Qwen3-8B encoder weights) |
 | Diffusion | ~17GB (transformer ~17GB + VAE ~300MB + activations) |
 | Peak | ~32GB (if encoder not released) |
+
+### FLUX.2-dev
+
+With mmap (default):
+
+| Phase | Memory |
+|-------|--------|
+| Text encoding | ~5-8GB (Mistral-Small-3.2-24B layers loaded on-demand) |
+| Diffusion | ~4-6GB (larger transformer, blocks loaded on-demand) |
+| Peak | ~12-15GB |
+
+With `--no-mmap` (all weights in RAM):
+
+| Phase | Memory |
+|-------|--------|
+| Text encoding | ~30GB (Mistral-Small-3.2-24B encoder weights) |
+| Diffusion | ~32GB (transformer ~32GB + VAE ~300MB + activations) |
+| Peak | ~65GB (if encoder not released) |
+
+FLUX.2-dev requires significantly more memory than Klein due to its 32B transformer and 24B text encoder. Systems with 64GB+ RAM are recommended; 128GB for comfortable `--no-mmap` usage.
 
 The text encoder is automatically released after encoding, reducing peak memory during diffusion. If you generate multiple images with different prompts, the encoder reloads automatically.
 
