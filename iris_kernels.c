@@ -658,6 +658,7 @@ void iris_attention(float *out, const float *Q, const float *K, const float *V,
                     float scale) {
     /* Allocate attention scores */
     float *scores = (float *)malloc(seq_q * seq_k * sizeof(float));
+    if (!scores) return;
 
     for (int b = 0; b < batch; b++) {
         for (int h = 0; h < heads; h++) {
@@ -791,6 +792,11 @@ static void flash_attention_head_tiled(float *out,
     /* Per-query running statistics: max_score[seq_q], sum_exp[seq_q] */
     float *max_scores = (float *)malloc(seq_q * sizeof(float));
     float *sum_exps = (float *)malloc(seq_q * sizeof(float));
+    if (!max_scores || !sum_exps) {
+        free(max_scores);
+        free(sum_exps);
+        return;
+    }
 
     /* Initialize */
     for (int i = 0; i < seq_q; i++) {
@@ -904,6 +910,7 @@ void iris_flash_attention(float *out, const float *Q, const float *K, const floa
 
     /* Allocate tile scratch buffer */
     float *tile_scores = (float *)malloc(q_tile_size * k_tile_size * sizeof(float));
+    if (!tile_scores) return;
 
     /* Process each head */
     for (int h = 0; h < heads; h++) {
@@ -922,6 +929,10 @@ void iris_flash_attention(float *out, const float *Q, const float *K, const floa
             float *K_contig = (float *)malloc(seq_k * head_dim * sizeof(float));
             float *V_contig = (float *)malloc(seq_k * head_dim * sizeof(float));
             float *out_contig = (float *)malloc(seq_q * head_dim * sizeof(float));
+            if (!Q_contig || !K_contig || !V_contig || !out_contig) {
+                free(Q_contig); free(K_contig); free(V_contig); free(out_contig);
+                break;
+            }
 
             for (int i = 0; i < seq_q; i++) {
                 for (int d = 0; d < head_dim; d++) {
@@ -956,6 +967,10 @@ void iris_flash_attention(float *out, const float *Q, const float *K, const floa
             float *K_contig = (float *)malloc(seq_k * head_dim * sizeof(float));
             float *V_contig = (float *)malloc(seq_k * head_dim * sizeof(float));
             float *out_contig = (float *)malloc(seq_q * head_dim * sizeof(float));
+            if (!Q_contig || !K_contig || !V_contig || !out_contig) {
+                free(Q_contig); free(K_contig); free(V_contig); free(out_contig);
+                break;
+            }
 
             for (int i = 0; i < seq_q; i++) {
                 for (int d = 0; d < head_dim; d++) {

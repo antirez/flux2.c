@@ -753,6 +753,7 @@ static token_node_t *bpe_encode_word(qwen3_tokenizer_t *tok, const char *word) {
             int len1 = strlen(best_node->text);
             int len2 = strlen(best_node->next->text);
             char *merged = malloc(len1 + len2 + 1);
+            if (!merged) break;
             memcpy(merged, best_node->text, len1);
             memcpy(merged + len1, best_node->next->text, len2);
             merged[len1 + len2] = '\0';
@@ -876,12 +877,15 @@ static char **pretokenize(const char *text, int *num_chunks) {
         if (p > start) {
             int len = p - start;
             char *chunk = malloc(len + 1);
+            if (!chunk) break;
             memcpy(chunk, start, len);
             chunk[len] = '\0';
 
             if (count >= capacity) {
                 capacity *= 2;
-                chunks = realloc(chunks, capacity * sizeof(char *));
+                char **new_chunks = realloc(chunks, capacity * sizeof(char *));
+                if (!new_chunks) { free(chunk); break; }
+                chunks = new_chunks;
             }
             chunks[count++] = chunk;
         }
@@ -926,7 +930,16 @@ int *qwen3_tokenize(qwen3_tokenizer_t *tok, const char *text,
             if (id >= 0) {
                 if (total >= capacity) {
                     capacity *= 2;
-                    tokens = realloc(tokens, capacity * sizeof(int));
+                    int *new_tokens = realloc(tokens, capacity * sizeof(int));
+                    if (!new_tokens) {
+                        free_token_list(bpe_tokens);
+                        free(byte_text);
+                        for (int i = c + 1; i < num_chunks; i++) free(chunks[i]);
+                        free(chunks);
+                        *num_tokens = total;
+                        return tokens;
+                    }
+                    tokens = new_tokens;
                 }
                 tokens[total++] = id;
             }

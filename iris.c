@@ -737,6 +737,11 @@ static iris_image *iris_generate_zimage_with_embeddings(iris_ctx *ctx,
      * where latent_ch = in_ch * ps * ps = 64 */
     int latent_ch = in_ch * ps * ps;
     float *latent = (float *)malloc(latent_ch * post_h * post_w * sizeof(float));
+    if (!latent) {
+        free(denoised);
+        set_error("Out of memory allocating latent");
+        return NULL;
+    }
     iris_patchify(latent, denoised, 1, in_ch, pre_h, pre_w, ps);
     free(denoised);
 
@@ -1058,6 +1063,10 @@ iris_image *iris_generate_with_embeddings_and_noise(iris_ctx *ctx,
 
     /* Copy external noise */
     float *z = (float *)malloc(expected_noise_size * sizeof(float));
+    if (!z) {
+        set_error("Out of memory allocating noise buffer");
+        return NULL;
+    }
     memcpy(z, noise, expected_noise_size * sizeof(float));
 
     /* Get schedule */
