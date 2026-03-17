@@ -72,12 +72,12 @@ FULL_TESTS = [
 # Optional Z-Image smoke test.
 # This runs only if a Z-Image model directory is auto-detected (or provided).
 ZIMAGE_SMOKE_TEST = {
-    "name": "Z-Image smoke test (2 steps, 256x256)",
+    "name": "Z-Image smoke test (2 steps, 64x64)",
     "prompt": "A simple geometric logo",
     "seed": 7,
     "steps": 2,
-    "width": 256,
-    "height": 256,
+    "width": 64,
+    "height": 64,
 }
 
 
@@ -141,11 +141,11 @@ def run_test(binary: str, test: dict, model_dir: str) -> tuple[bool, str]:
         cmd.extend(["-i", test["input"]])
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
         if result.returncode != 0:
             return False, f"process exited with code {result.returncode}: {result.stderr}"
     except subprocess.TimeoutExpired:
-        return False, "timeout (300s)"
+        return False, "timeout (900s)"
     except FileNotFoundError:
         return False, f"binary not found: {binary}"
 

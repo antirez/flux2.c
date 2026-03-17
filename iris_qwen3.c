@@ -1832,7 +1832,7 @@ float *qwen3_encode_text_ex(qwen3_encoder_t *enc, const char *prompt,
                               int *out_num_tokens) {
     if (!enc || !enc->tokenizer || !enc->model || !prompt) return NULL;
 
-    int skip_think_tags = (enc->model->extraction_mode == 1);
+    int skip_think_tags = 0;  /* Both Flux and Z-Image use thinking template */
 
     /* Tokenize with chat template */
     int num_tokens;

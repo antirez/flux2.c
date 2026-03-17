@@ -66,7 +66,7 @@ blas: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DACCELERATE_NEW_LAPACK
 blas: LDFLAGS += -framework Accelerate
 else
 blas: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_OPENBLAS -I/usr/include/openblas
-blas: LDFLAGS += -lopenblas
+blas: LDFLAGS += -lopenblas -pthread
 endif
 blas: clean $(TARGET)
 	@echo ""

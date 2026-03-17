@@ -707,9 +707,18 @@ static iris_image *iris_generate_zimage_with_embeddings(iris_ctx *ctx,
     int post_w = pre_w / ps;
     int image_seq_len = post_h * post_w;
 
-    /* Initialize noise at pre-patchification dimensions: [in_ch, H/8, W/8] */
+    /* Initialize noise at pre-patchification dimensions: [in_ch, H/8, W/8].
+     * Generate directly at the target size rather than using iris_init_noise
+     * (which subsamples from a larger reference field). The subsampling step
+     * creates periodic artifacts in the latent: for a 512x512 image the
+     * 112->64 subsampling uses a 7/4 step ratio producing a period-4 column
+     * pattern that becomes 64px bands in the output image. Z-Image has no
+     * cross-resolution seed-consistency requirement, so direct generation
+     * matches the Python reference (torch.randn at target shape). */
     int64_t seed = (p.seed < 0) ? (int64_t)time(NULL) : p.seed;
-    float *z = iris_init_noise(1, in_ch, pre_h, pre_w, seed);
+    float *z = (float *)malloc(in_ch * pre_h * pre_w * sizeof(float));
+    iris_rng_seed((uint64_t)seed);
+    iris_randn(z, in_ch * pre_h * pre_w);
 
     /* Get Z-Image schedule (default FlowMatch; linear/power if explicitly requested). */
     float *schedule = iris_selected_zimage_schedule(&p, image_seq_len);

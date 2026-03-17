@@ -183,9 +183,10 @@ float *iris_schedule_flux(int num_steps, int image_seq_len) {
  * for use_dynamic_shifting=False, invert_sigmas=False.
  *
  * Diffusers behavior (with num_train_timesteps=1000, shift=3.0):
- * 1) Build training sigmas from [1.0 .. 1/1000], then shift once.
- * 2) For inference, linspace from sigma_max to sigma_min (already shifted).
- * 3) Shift again.
+ * 1) Pipeline overrides scheduler.sigma_min = 0.0 before set_timesteps.
+ * 2) set_timesteps: linspace(sigma_max=1.0, sigma_min=0.0, num_steps+1)[:-1]
+ *    i.e. i/num_steps for i in [0..num_steps-1], giving raw = 1 - i/num_steps
+ * 3) Apply static shift: sigma = shift*raw / (1 + (shift-1)*raw)
  * 4) Append terminal sigma=0.
  *
  * Returns array of num_steps+1 sigma values.
@@ -197,19 +198,14 @@ float *iris_schedule_zimage(int num_steps, int image_seq_len) {
     (void)image_seq_len;  /* Not used for static shift */
     float *schedule = (float *)malloc((num_steps + 1) * sizeof(float));
     const float shift = 3.0f;
-    const float sigma_max = 1.0f;
-    const float sigma_train_min = 1.0f / 1000.0f;  /* num_train_timesteps=1000 */
-    const float sigma_min = shift * sigma_train_min /
-                            (1.0f + (shift - 1.0f) * sigma_train_min);
 
-    /* Diffusers set_timesteps(): linspace(sigma_max, sigma_min, num_steps),
-     * then apply static shift one more time. */
+    /* Pipeline sets sigma_min=0.0, so raw linspace goes from 1.0 to 0.0.
+     * linspace(1, 0, num_steps+1)[:-1] => raw[i] = 1 - i/num_steps */
     for (int i = 0; i < num_steps; i++) {
-        float u = (num_steps > 1) ? (float)i / (float)(num_steps - 1) : 0.0f;
-        float raw = sigma_max + (sigma_min - sigma_max) * u;
+        float raw = 1.0f - (float)i / (float)num_steps;
         schedule[i] = shift * raw / (1.0f + (shift - 1.0f) * raw);
     }
-    /* Diffusers appends terminal sigma=0 (invert_sigmas=False). */
+    /* Diffusers appends terminal sigma=0. */
     schedule[num_steps] = 0.0f;
 
     return schedule;
@@ -405,7 +401,7 @@ float *iris_sample_euler_zimage(void *transformer,
 
         /* The transformer timestep is (1 - sigma), matching the Python pipeline:
          * pipeline: timestep = (1000 - t_scheduler) / 1000 = 1 - sigma
-         * transformer: t = timestep * t_scale (1000) -> sinusoidal_input */
+         * zi_timestep_embed scales this by t_scale=1000 internally before sinusoidal. */
         float timestep = 1.0f - sigma;
 
         double step_start = get_time_ms();
