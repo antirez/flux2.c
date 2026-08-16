@@ -2193,7 +2193,7 @@ zi_transformer_t *zi_transformer_load_safetensors(const char *model_dir,
 
     /* Try index file first for sharded models */
     snprintf(path, sizeof(path), "%s/transformer/diffusion_pytorch_model.safetensors.index.json", model_dir);
-    FILE *idx_f = fopen(path, "r");
+    FILE *idx_f = fopen(path, "rb");
 
     safetensors_file_t *files[ZI_MAX_SHARDS] = {0};
     int n_files = 0;

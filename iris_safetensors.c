@@ -6,10 +6,26 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#endif
+
+/* Release a read-only file mapping created in safetensors_open(). */
+static void iris_unmap(void *data, size_t size) {
+#ifdef _WIN32
+    (void)size;  /* Windows tracks the view size internally */
+    UnmapViewOfFile(data);
+#else
+    munmap(data, size);
+#endif
+}
 
 /* Minimal JSON parser for safetensors header */
 
@@ -205,6 +221,49 @@ static int parse_header(safetensors_file_t *sf) {
  * OS page in tensor data on demand, avoiding upfront reads of multi-GB model
  * files -- only the weights actually used get loaded into RAM. */
 safetensors_file_t *safetensors_open(const char *path) {
+#ifdef _WIN32
+    HANDLE fh = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (fh == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "safetensors_open: cannot open %s (error %lu)\n",
+                path, (unsigned long)GetLastError());
+        return NULL;
+    }
+
+    LARGE_INTEGER fsize;
+    if (!GetFileSizeEx(fh, &fsize)) {
+        fprintf(stderr, "safetensors_open: cannot stat %s (error %lu)\n",
+                path, (unsigned long)GetLastError());
+        CloseHandle(fh);
+        return NULL;
+    }
+
+    size_t file_size = (size_t)fsize.QuadPart;
+    if (file_size < 8) {
+        fprintf(stderr, "safetensors_open: file too small\n");
+        CloseHandle(fh);
+        return NULL;
+    }
+
+    HANDLE mapping = CreateFileMappingA(fh, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!mapping) {
+        fprintf(stderr, "safetensors_open: CreateFileMapping failed (error %lu)\n",
+                (unsigned long)GetLastError());
+        CloseHandle(fh);
+        return NULL;
+    }
+
+    void *data = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+    /* The view holds its own references, so both handles can go now. */
+    CloseHandle(mapping);
+    CloseHandle(fh);
+
+    if (!data) {
+        fprintf(stderr, "safetensors_open: MapViewOfFile failed (error %lu)\n",
+                (unsigned long)GetLastError());
+        return NULL;
+    }
+#else
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
         perror("safetensors_open: open failed");
@@ -232,6 +291,7 @@ safetensors_file_t *safetensors_open(const char *path) {
         perror("safetensors_open: mmap failed");
         return NULL;
     }
+#endif
 
     /* Read header size (8-byte little-endian) */
     uint64_t header_size = 0;
@@ -239,13 +299,13 @@ safetensors_file_t *safetensors_open(const char *path) {
 
     if (header_size > file_size - 8) {
         fprintf(stderr, "safetensors_open: invalid header size\n");
-        munmap(data, file_size);
+        iris_unmap(data, file_size);
         return NULL;
     }
 
     safetensors_file_t *sf = calloc(1, sizeof(safetensors_file_t));
     if (!sf) {
-        munmap(data, file_size);
+        iris_unmap(data, file_size);
         return NULL;
     }
 
@@ -294,7 +354,7 @@ safetensors_file_t *safetensors_open(const char *path) {
 
 void safetensors_close(safetensors_file_t *sf) {
     if (!sf) return;
-    if (sf->data) munmap(sf->data, sf->file_size);
+    if (sf->data) iris_unmap(sf->data, sf->file_size);
     free(sf->path);
     free(sf->header_json);
     free(sf);

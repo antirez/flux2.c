@@ -3,6 +3,8 @@
 
 # Compiled binaries
 flux
+iris
+iris.exe
 
 # Model weights (large files)
 flux-klein-*/

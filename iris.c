@@ -260,7 +260,7 @@ iris_ctx *iris_load_dir(const char *model_dir) {
     ctx->is_zimage = 0;
     snprintf(path, sizeof(path), "%s/model_index.json", model_dir);
     if (file_exists(path)) {
-        FILE *f = fopen(path, "r");
+        FILE *f = fopen(path, "rb");
         if (f) {
             char buf[4096];
             size_t n = fread(buf, 1, sizeof(buf) - 1, f);
@@ -284,7 +284,7 @@ iris_ctx *iris_load_dir(const char *model_dir) {
     ctx->text_dim = 7680;  /* default 4B: 3 * 2560 */
     snprintf(path, sizeof(path), "%s/transformer/config.json", model_dir);
     if (file_exists(path)) {
-        FILE *f = fopen(path, "r");
+        FILE *f = fopen(path, "rb");
         if (f) {
             char buf[8192];
             size_t n = fread(buf, 1, sizeof(buf) - 1, f);
@@ -390,7 +390,7 @@ iris_ctx *iris_load_dir(const char *model_dir) {
     ctx->vae_shift = 0.0f;
     snprintf(path, sizeof(path), "%s/vae/config.json", model_dir);
     if (file_exists(path)) {
-        FILE *f = fopen(path, "r");
+        FILE *f = fopen(path, "rb");
         if (f) {
             char buf[4096];
             size_t n = fread(buf, 1, sizeof(buf) - 1, f);
