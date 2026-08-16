@@ -19,7 +19,7 @@ Supported model families:
 ```bash
 # Build (choose your backend)
 make mps       # Apple Silicon (fastest)
-# or: make blas    # Intel Mac / Linux with OpenBLAS
+# or: make blas    # Intel Mac / Linux / Windows (MSYS2) with OpenBLAS
 # or: make generic # Pure C, no dependencies
 
 # Download a model (~16GB) - pick one:
@@ -281,6 +281,7 @@ make mps        # Apple Silicon Metal GPU (fastest, macOS only)
 - macOS Intel: `make blas`
 - Linux with OpenBLAS: `make blas`
 - Linux without OpenBLAS: `make generic`
+- Windows: `make blas` from an MSYS2 UCRT64 shell
 
 For `make blas` on Linux, install OpenBLAS first:
 ```bash
@@ -290,6 +291,17 @@ sudo apt install libopenblas-dev
 # Fedora
 sudo dnf install openblas-devel
 ```
+
+On Windows, build from an [MSYS2](https://www.msys2.org/) **UCRT64** shell:
+```bash
+pacman -S mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-openblas make
+make blas
+```
+
+The resulting `iris.exe` needs the UCRT64 DLLs, so run it from that shell
+or copy the DLLs next to the binary. The interactive REPL is not built on
+Windows (linenoise needs termios), and terminal image previews do not
+render there.
 
 Other targets:
 ```bash

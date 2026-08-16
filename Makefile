@@ -13,7 +13,12 @@ UNAME_M := $(shell uname -m)
 # Source files
 SRCS = iris.c iris_kernels.c iris_tokenizer.c iris_vae.c iris_transformer_flux.c iris_transformer_zimage.c iris_sample.c iris_image.c jpeg.c iris_safetensors.c iris_qwen3.c iris_qwen3_tokenizer.c terminals.c
 OBJS = $(SRCS:.c=.o)
+# The interactive REPL needs termios/linenoise: not available on Windows.
+ifneq (,$(filter MINGW% MSYS%,$(UNAME_S)))
+CLI_SRCS =
+else
 CLI_SRCS = iris_cli.c linenoise.c embcache.c
+endif
 CLI_OBJS = $(CLI_SRCS:.c=.o)
 MAIN = main.c
 TARGET = iris
@@ -65,8 +70,14 @@ ifeq ($(UNAME_S),Darwin)
 blas: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DACCELERATE_NEW_LAPACK
 blas: LDFLAGS += -framework Accelerate
 else
+ifneq (,$(filter MINGW% MSYS%,$(UNAME_S)))
+MINGW_PREFIX ?= /ucrt64
+blas: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_OPENBLAS -DIRIS_NO_REPL -I$(MINGW_PREFIX)/include/openblas
+blas: LDFLAGS += -lopenblas
+else
 blas: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_OPENBLAS -I/usr/include/openblas
 blas: LDFLAGS += -lopenblas
+endif
 endif
 blas: clean $(TARGET)
 	@echo ""
@@ -139,10 +150,10 @@ test-quick:
 
 pngtest:
 	@echo "Running PNG compression compare test..."
-	@$(CC) $(CFLAGS_BASE) -I. png_compare.c iris_image.c -lm -o /tmp/iris_png_compare
+	@$(CC) $(CFLAGS_BASE) -I. png_compare.c iris_image.c jpeg.c -lm -o /tmp/iris_png_compare
 	@/tmp/iris_png_compare images/woman_with_sunglasses.png images/woman_with_sunglasses_compressed2.png
 	@/tmp/iris_png_compare images/cat_uncompressed.png images/cat_compressed.png
-	@rm -f /tmp/iris_png_compare
+	@rm -f /tmp/iris_png_compare /tmp/iris_png_compare.exe
 	@echo "PNG TEST PASSED"
 
 install: $(TARGET) $(LIB)
@@ -170,7 +181,11 @@ ifeq ($(UNAME_M),arm64)
 	@echo "  mps     - Metal GPU (recommended)"
 endif
 else
+ifneq (,$(filter MINGW% MSYS%,$(UNAME_S)))
+	@echo "  blas    - OpenBLAS (MSYS2 UCRT64; REPL not built)"
+else
 	@echo "  blas    - OpenBLAS (requires libopenblas-dev)"
+endif
 endif
 
 # =============================================================================

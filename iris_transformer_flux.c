@@ -84,6 +84,11 @@ static double tf_get_time_ms(void) {
 #endif
 #include <pthread.h>
 #include <unistd.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>  /* GetSystemInfo: MinGW has unistd.h but not sysconf */
+#endif
 #endif
 
 /* Use Metal for GPU acceleration when available */
@@ -337,7 +342,7 @@ static int parse_transformer_config(const char *model_dir, iris_transformer_flux
     char path[1024];
     snprintf(path, sizeof(path), "%s/transformer/config.json", model_dir);
 
-    FILE *f = fopen(path, "r");
+    FILE *f = fopen(path, "rb");
     if (!f) return -1;
 
     char buf[4096];
@@ -407,7 +412,7 @@ static int open_transformer_shards(const char *model_dir,
     /* Try to read index JSON for sharded models */
     snprintf(path, sizeof(path), "%s/transformer/diffusion_pytorch_model.safetensors.index.json",
              model_dir);
-    FILE *fp = fopen(path, "r");
+    FILE *fp = fopen(path, "rb");
     if (fp) {
         fseek(fp, 0, SEEK_END);
         long len = ftell(fp);
@@ -1562,7 +1567,13 @@ static void *joint_attn_thread_worker(void *arg) {
 static int get_attn_num_threads(int heads) {
     static int cached = 0;
     if (cached) return cached;
+#ifdef _WIN32
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    int ncpu = (int)si.dwNumberOfProcessors;
+#else
     int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
+#endif
     if (ncpu < 2) { cached = 1; return 1; }
     if (ncpu > heads) ncpu = heads;
     /* Round down to divide heads evenly */

@@ -302,6 +302,12 @@ int iterm2_display_png(const char *path) {
 int iterm2_display_image(const iris_image *img) {
     if (!img || !img->data) return -1;
 
+#ifdef _WIN32
+    /* iTerm2 is macOS-only, so this protocol is never detected here, and
+     * MinGW has no mkstemps(). Fail instead of carrying a dead temp-file
+     * implementation that nothing on Windows can reach. */
+    return -1;
+#else
     /* Create temp file for PNG */
     char tmppath[] = "/tmp/iris_iterm_XXXXXX.png";
     int fd = mkstemps(tmppath, 4);
@@ -323,6 +329,7 @@ int iterm2_display_image(const iris_image *img) {
     /* Clean up */
     unlink(tmppath);
     return result;
+#endif
 }
 
 /* ======================================================================

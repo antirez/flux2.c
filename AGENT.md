@@ -64,8 +64,78 @@ main.c                    - CLI entry point
 
 This project implements three targets:
 - MPS: Apple Silicon GPU path.
-- BLAS: optimized CPU inference via BLAS/OpenBLAS.
+- BLAS: optimized CPU inference via BLAS/OpenBLAS. On Windows (MSYS2
+  UCRT64) this is the only supported target; it builds without the
+  interactive REPL.
 - generic: pure C fallback, very slow.
+
+# Windows Notes
+
+Build from an MSYS2 UCRT64 shell:
+
+    pacman -S mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-openblas make
+    make blas
+
+Platform shims, all guarded by `#ifdef _WIN32`:
+- `iris_safetensors.c`: file mapping via CreateFileMapping/MapViewOfFile
+  instead of mmap. The view keeps its own references, so the file and
+  mapping handles are closed right after mapping, mirroring the POSIX
+  code that closes the fd after mmap. Release goes through the
+  `iris_unmap()` helper.
+- `iris_transformer_flux.c`: GetSystemInfo instead of sysconf for the CPU
+  count. MinGW ships unistd.h but not sysconf.
+- `terminals.c`: the iTerm2 temp-file path returns -1. MinGW has no
+  mkstemps(), and iTerm2 is never detected on Windows anyway.
+- Config, tokenizer and index files are opened in binary mode ("rb"):
+  text mode would translate CRLF and break sized reads.
+
+Not built on Windows: the interactive REPL (`iris_cli.c`, `linenoise.c`,
+`embcache.c` need termios). Requesting interactive mode prints an error
+and exits. Terminal image previews do not render.
+
+Note that `make pngtest` still fails on its first image pair: upstream
+compares `woman_with_sunglasses.png` (512x512) against
+`woman_with_sunglasses_compressed2.png` (256x256). The `cat_*` pair is
+correctly matched and passes.
+
+## Windows performance
+
+Measured on a Xeon W-2125 (4 cores / 8 threads, 32 GB), flux-klein-4b,
+512x512 at 4 steps. **Use the mmap default and cap BLAS at one thread per
+physical core** -- that combination is 2.7x faster than the opposite one:
+
+    ./iris.exe -d flux-klein-4b --blas-threads 4 -p "..." -o out.png
+
+| Config                    | 512x512 | 256x256 |
+|---------------------------|---------|---------|
+| mmap + 4 threads          | 219s    | 138s    |
+| --no-mmap + 4 threads     |         | 238s    |
+| --no-mmap + 8 threads     | 592s    | 293s    |
+
+Two results worth keeping:
+- **`--no-mmap` is slower here**, unlike what the README suggests for
+  machines with spare RAM. Copying ~15 GB of weights into RAM costs 26s
+  for the transformer alone and doubles text encoding; a single
+  generation never earns that back. It may still pay off in a long
+  interactive session, which this build does not have.
+- **8 threads lose to 4.** The 4 physical cores already saturate the
+  vector units, so hyperthreading only adds contention with the
+  head-parallel attention threads.
+
+Neither switch changes the output: mmap vs --no-mmap and 4 vs 8 threads
+produce bit-identical images (mean_diff 0.000000).
+
+## Windows test results
+
+`run_test.py` cannot be used as-is on hardware this slow: it kills each
+test after 300s, and the 512x512 case needs more. The three cases were
+run by hand instead, all passing well inside the threshold of 20:
+
+| Test                          | mean_diff | upstream expects |
+|-------------------------------|-----------|------------------|
+| 64x64, 2 steps, seed 42       | 1.14      | ~3.4             |
+| 512x512, 4 steps, seed 123    | 2.12      | ~1.7             |
+| img2img 256x256, seed 456     | 8.29      | 6-17             |
 
 # Development Rules
 
@@ -90,6 +160,10 @@ Flux examples:
 Z-Image example:
 
     ./iris -d zimage-turbo -p "a fish" -o /tmp/zimage.png
+
+On Windows the binary is `iris.exe`:
+
+    ./iris.exe -d flux-klein-4b -p "a cat and a dog playing" -o test.png
 
 If model weights are missing, use the download script only after user approval.
 

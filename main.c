@@ -22,7 +22,9 @@
 
 #include "iris.h"
 #include "iris_kernels.h"
+#ifndef IRIS_NO_REPL
 #include "iris_cli.h"
+#endif
 #include "terminals.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -529,9 +531,19 @@ int main(int argc, char *argv[]) {
 
     /* Interactive mode: start REPL */
     if (interactive_mode) {
+#ifdef IRIS_NO_REPL
+        fprintf(stderr,
+            "Interactive mode is not available in this build.\n"
+            "Give a prompt and an output path instead, for example:\n"
+            "  %s -d %s -p \"a cat\" -o out.png\n",
+            argv[0], model_dir);
+        iris_free(ctx);
+        return 1;
+#else
         int rc = iris_cli_run(ctx, model_dir);
         iris_free(ctx);
         return rc;
+#endif
     }
 
     /* Set up progress callbacks (for normal and verbose modes) */

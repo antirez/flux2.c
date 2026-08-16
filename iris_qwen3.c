@@ -1379,7 +1379,7 @@ static int parse_qwen3_config(const char *model_dir, qwen3_model_t *model) {
     char path[1024];
     snprintf(path, sizeof(path), "%s/config.json", model_dir);
 
-    FILE *f = fopen(path, "r");
+    FILE *f = fopen(path, "rb");
     if (!f) return -1;
 
     char buf[8192];
@@ -1453,7 +1453,7 @@ static int open_safetensors_shards(const char *model_dir,
 
     /* First try: read the index JSON to discover shard filenames */
     snprintf(path, sizeof(path), "%s/model.safetensors.index.json", model_dir);
-    FILE *f = fopen(path, "r");
+    FILE *f = fopen(path, "rb");
     if (f) {
         /* Read the whole index file */
         fseek(f, 0, SEEK_END);
