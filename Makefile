@@ -139,10 +139,10 @@ test-quick:
 
 pngtest:
 	@echo "Running PNG compression compare test..."
-	@$(CC) $(CFLAGS_BASE) -I. png_compare.c iris_image.c -lm -o /tmp/iris_png_compare
+	@$(CC) $(CFLAGS_BASE) -I. png_compare.c iris_image.c jpeg.c -lm -o /tmp/iris_png_compare
 	@/tmp/iris_png_compare images/woman_with_sunglasses.png images/woman_with_sunglasses_compressed2.png
 	@/tmp/iris_png_compare images/cat_uncompressed.png images/cat_compressed.png
-	@rm -f /tmp/iris_png_compare
+	@rm -f /tmp/iris_png_compare /tmp/iris_png_compare.exe
 	@echo "PNG TEST PASSED"
 
 install: $(TARGET) $(LIB)
